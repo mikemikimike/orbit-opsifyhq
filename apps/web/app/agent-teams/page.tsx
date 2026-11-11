@@ -212,11 +212,7 @@ export default function AgentTeamsPage() {
                   <div className="flex flex-wrap gap-1">
                     {steps.map((step, index) => (
                       <Badge key={`${step.agentId}-${index}`} variant={index === 0 ? "default" : "secondary"}>
-                        {index === 0
-                          ? "primary · "
-                          : (team.definition.mode ?? "pipeline") === "native"
-                            ? "subagent · "
-                            : ""}
+                        {index === 0 ? "Primary · " : "Subagent · "}
                         {agentLabel(step.agentId)}
                       </Badge>
                     ))}
@@ -398,7 +394,7 @@ export default function AgentTeamsPage() {
               {steps.map((step, index) => (
                 <div key={index} className="flex items-center gap-2">
                   <span className="w-16 text-[11px] text-muted-foreground">
-                    {index === 0 ? "primary" : mode === "native" ? "subagent" : `step ${index + 1}`}
+                    {index === 0 ? "Primary" : "Subagent"}
                   </span>
                   <select
                     className="flex h-9 flex-1 rounded-lg border border-input bg-card px-3 text-sm"
@@ -487,7 +483,7 @@ export default function AgentTeamsPage() {
               <div key={step.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3">
                 <div>
                   <p className="text-sm font-medium">
-                    {step.stepIndex === 0 ? "primary · " : ""}
+                    {step.stepIndex === 0 ? "Primary · " : "Subagent · "}
                     {step.name}
                   </p>
                   <p className="text-[11px] text-muted-foreground">
