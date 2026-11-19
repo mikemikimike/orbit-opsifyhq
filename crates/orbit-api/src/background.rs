@@ -550,32 +550,33 @@ pub async fn runtime_tick(state: &AppState) -> anyhow::Result<()> {
     for runtime in state.store.list_running_agent_runtimes().await? {
         let (runtime_id, org_id) = (runtime.id, runtime.org_id);
         let interval = runtime.interval_seconds;
-        let last_execution_id = runtime.last_execution_id;
         let Err(failure) = advance_runtime(state, runtime).await else {
             continue;
         };
-        let (status, message, next_run_at) = match &failure {
+        // Never moves `stopping`/`stopped` runtimes: both writes are conditional on
+        // `status = 'running'`.
+        let result = match &failure {
             RuntimeTickError::Permanent(message) => {
-                ("stopped", message.clone(), chrono::Utc::now())
+                tracing::warn!(%runtime_id, %org_id, error = %message, "agent runtime stopped after permanent error");
+                state
+                    .store
+                    .halt_running_agent_runtime(runtime_id, message)
+                    .await
             }
-            RuntimeTickError::Transient(error) => (
-                "running",
-                error.to_string(),
-                chrono::Utc::now() + runtime_failure_backoff(interval.max(60), 1),
-            ),
+            RuntimeTickError::Transient(error) => {
+                let message = error.to_string();
+                tracing::warn!(%runtime_id, %org_id, error = %message, "agent runtime tick failed");
+                state
+                    .store
+                    .advance_agent_runtime(
+                        runtime_id,
+                        Some(&message),
+                        chrono::Utc::now() + runtime_failure_backoff(interval.max(60), 1),
+                    )
+                    .await
+            }
         };
-        tracing::warn!(%runtime_id, %org_id, status, error = %message, "agent runtime tick failed");
-        if let Err(error) = state
-            .store
-            .update_agent_runtime(
-                runtime_id,
-                status,
-                last_execution_id,
-                Some(&message),
-                next_run_at,
-            )
-            .await
-        {
+        if let Err(error) = result {
             tracing::error!(%runtime_id, %org_id, %error, "could not record runtime failure");
         }
     }
@@ -596,13 +597,7 @@ async fn advance_runtime(
         Err(_) => {
             let _ = state
                 .store
-                .update_agent_runtime(
-                    runtime.id,
-                    "stopped",
-                    runtime.last_execution_id,
-                    Some("agent no longer exists"),
-                    chrono::Utc::now(),
-                )
+                .halt_agent_runtime(runtime.id, "agent no longer exists")
                 .await;
             return Ok(());
         }
@@ -610,13 +605,7 @@ async fn advance_runtime(
     if agent.status != "active" {
         let _ = state
             .store
-            .update_agent_runtime(
-                runtime.id,
-                "stopped",
-                runtime.last_execution_id,
-                Some("agent is not active"),
-                chrono::Utc::now(),
-            )
+            .halt_agent_runtime(runtime.id, "agent is not active")
             .await;
         return Ok(());
     }
@@ -633,15 +622,13 @@ async fn advance_runtime(
     });
     if runtime.status == "stopping" {
         if last_terminal {
+            let _ = state.store.finish_agent_runtime_stop(runtime.id).await;
+        } else if let Some(id) = runtime.last_execution_id {
+            // An execution launched by a tick that raced the Stop is not covered by the
+            // handler's cancel; cancel it here so Stop does not wait for a full run.
             let _ = state
                 .store
-                .update_agent_runtime(
-                    runtime.id,
-                    "stopped",
-                    runtime.last_execution_id,
-                    runtime.last_error.as_deref(),
-                    chrono::Utc::now(),
-                )
+                .request_execution_cancel(runtime.org_id, id)
                 .await;
         }
         return Ok(());
@@ -673,15 +660,15 @@ async fn advance_runtime(
                 .as_ref()
                 .map(|error| error.to_string())
                 .unwrap_or_else(|| "execution failed".into());
-            let (status, message, next_run_at) = if failures >= RUNTIME_MAX_CONSECUTIVE_FAILURES {
+            let (stop, message, next_run_at) = if failures >= RUNTIME_MAX_CONSECUTIVE_FAILURES {
                 (
-                    "stopped",
+                    true,
                     format!("stopped after {failures} consecutive failed executions: {reason}"),
                     chrono::Utc::now(),
                 )
             } else {
                 (
-                    "running",
+                    false,
                     reason,
                     chrono::Utc::now()
                         + runtime_failure_backoff(runtime.interval_seconds, failures),
@@ -691,7 +678,7 @@ async fn advance_runtime(
                 .store
                 .record_agent_runtime_failure(
                     runtime.id,
-                    status,
+                    stop,
                     failed.id,
                     failures,
                     &message,
@@ -765,7 +752,9 @@ async fn advance_runtime(
         })
         .await
         .map_err(|error| RuntimeTickError::Transient(error.into()))?;
-    state
+    // Does not touch `status`. If the runtime was stopped while this tick was in flight
+    // the write is refused: cancel the execution so nothing keeps running for it.
+    let recorded = state
         .store
         .record_agent_runtime_launch(
             runtime.id,
@@ -774,6 +763,12 @@ async fn advance_runtime(
             chrono::Utc::now() + chrono::Duration::seconds(runtime.interval_seconds as i64),
         )
         .await?;
+    if recorded.is_none() {
+        let _ = state
+            .store
+            .request_execution_cancel(runtime.org_id, execution.id)
+            .await;
+    }
 
     Ok(())
 }

@@ -4,7 +4,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::{Store, StoreError, StoreResult};
+use crate::{Store, StoreResult};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -112,93 +112,193 @@ impl Store {
         .await?)
     }
 
-    pub async fn update_agent_runtime(
+    // ---- Status transitions -------------------------------------------------------
+    //
+    // `status` is only ever changed by the explicit, conditional transitions below, so a
+    // concurrent writer (an operator pressing Stop, a tick finishing late) can never
+    // revive a runtime:
+    //
+    //   running  -> stopping   request_agent_runtime_stop   (WHERE status IN running|stopping)
+    //   stopping -> stopped    finish_agent_runtime_stop    (WHERE status = 'stopping')
+    //   running|stopping -> stopped
+    //                          halt_agent_runtime           (agent gone/inactive)
+    //   running  -> stopped    halt_running_agent_runtime   (permanent tick error)
+    //   running  -> stopped    record_agent_runtime_failure (stop = true; max failures)
+    //
+    // Tick bookkeeping (`advance_*`, `record_*`) never writes `status` except the last
+    // row above. There is deliberately no unconditional "set status" function.
+
+    /// Operator Stop: `running -> stopping` (idempotent for `stopping`). Returns `None`
+    /// when the runtime is already stopped.
+    pub async fn request_agent_runtime_stop(
         &self,
         runtime_id: Uuid,
-        status: &str,
-        last_execution_id: Option<Uuid>,
-        last_error: Option<&str>,
-        next_run_at: DateTime<Utc>,
-    ) -> StoreResult<AgentRuntime> {
-        sqlx::query_as::<_, AgentRuntime>(
+    ) -> StoreResult<Option<AgentRuntime>> {
+        Ok(sqlx::query_as::<_, AgentRuntime>(
             r#"
             UPDATE agent_runtimes
-            SET status = $2,
-                last_execution_id = COALESCE($3, last_execution_id),
-                last_error = $4,
-                next_run_at = $5,
-                updated_at = now(),
-                stopped_at = CASE WHEN $2 = 'stopped' THEN now() ELSE stopped_at END
-            WHERE id = $1
+            SET status = 'stopping', updated_at = now()
+            WHERE id = $1 AND status IN ('running','stopping')
             RETURNING *
             "#,
         )
         .bind(runtime_id)
-        .bind(status)
-        .bind(last_execution_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// `stopping -> stopped`, once the last execution is terminal. Never touches a
+    /// runtime in any other state.
+    pub async fn finish_agent_runtime_stop(
+        &self,
+        runtime_id: Uuid,
+    ) -> StoreResult<Option<AgentRuntime>> {
+        Ok(sqlx::query_as::<_, AgentRuntime>(
+            r#"
+            UPDATE agent_runtimes
+            SET status = 'stopped', stopped_at = now(), updated_at = now(), next_run_at = now()
+            WHERE id = $1 AND status = 'stopping'
+            RETURNING *
+            "#,
+        )
+        .bind(runtime_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Platform-initiated stop (`running|stopping -> stopped`) with a reason, used when
+    /// the agent no longer exists or is inactive. Cannot move a stopped runtime.
+    pub async fn halt_agent_runtime(
+        &self,
+        runtime_id: Uuid,
+        reason: &str,
+    ) -> StoreResult<Option<AgentRuntime>> {
+        Ok(sqlx::query_as::<_, AgentRuntime>(
+            r#"
+            UPDATE agent_runtimes
+            SET status = 'stopped', last_error = $2, stopped_at = now(), updated_at = now(),
+                next_run_at = now()
+            WHERE id = $1 AND status IN ('running','stopping')
+            RETURNING *
+            "#,
+        )
+        .bind(runtime_id)
+        .bind(reason)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Permanent tick error (`running -> stopped`). A `stopping` runtime is left for the
+    /// stopping branch to finish.
+    pub async fn halt_running_agent_runtime(
+        &self,
+        runtime_id: Uuid,
+        reason: &str,
+    ) -> StoreResult<Option<AgentRuntime>> {
+        Ok(sqlx::query_as::<_, AgentRuntime>(
+            r#"
+            UPDATE agent_runtimes
+            SET status = 'stopped', last_error = $2, stopped_at = now(), updated_at = now(),
+                next_run_at = now()
+            WHERE id = $1 AND status = 'running'
+            RETURNING *
+            "#,
+        )
+        .bind(runtime_id)
+        .bind(reason)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    // ---- Tick bookkeeping (never changes status) ----------------------------------
+
+    /// Record an error and the next attempt time without touching `status`. Applies only
+    /// to a `running` runtime: a `stopping`/`stopped` runtime keeps its state and
+    /// schedule. Returns `None` if the runtime is not running any more.
+    pub async fn advance_agent_runtime(
+        &self,
+        runtime_id: Uuid,
+        last_error: Option<&str>,
+        next_run_at: DateTime<Utc>,
+    ) -> StoreResult<Option<AgentRuntime>> {
+        Ok(sqlx::query_as::<_, AgentRuntime>(
+            r#"
+            UPDATE agent_runtimes
+            SET last_error = $2, next_run_at = $3, updated_at = now()
+            WHERE id = $1 AND status = 'running'
+            RETURNING *
+            "#,
+        )
+        .bind(runtime_id)
         .bind(last_error)
         .bind(next_run_at)
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("agent runtime".into()))
+        .await?)
     }
 
     /// Record a failed execution: bump the counter, remember which execution it was and
-    /// schedule the next attempt (or stop the runtime) in one statement.
+    /// back off. With `stop = true` (failure limit reached) the runtime moves
+    /// `running -> stopped` in the same statement. Applies only to a `running` runtime;
+    /// returns `None` otherwise, so a concurrent Stop is never overwritten.
     pub async fn record_agent_runtime_failure(
         &self,
         runtime_id: Uuid,
-        status: &str,
+        stop: bool,
         failed_execution_id: Uuid,
         consecutive_failures: i32,
         last_error: &str,
         next_run_at: DateTime<Utc>,
-    ) -> StoreResult<AgentRuntime> {
-        sqlx::query_as::<_, AgentRuntime>(
+    ) -> StoreResult<Option<AgentRuntime>> {
+        Ok(sqlx::query_as::<_, AgentRuntime>(
             r#"
             UPDATE agent_runtimes
-            SET status = $2,
+            SET status = CASE WHEN $2 THEN 'stopped' ELSE status END,
                 failed_execution_id = $3,
                 consecutive_failures = $4,
                 last_error = $5,
                 next_run_at = $6,
                 updated_at = now(),
-                stopped_at = CASE WHEN $2 = 'stopped' THEN now() ELSE stopped_at END
-            WHERE id = $1
+                stopped_at = CASE WHEN $2 THEN now() ELSE stopped_at END
+            WHERE id = $1 AND status = 'running'
             RETURNING *
             "#,
         )
         .bind(runtime_id)
-        .bind(status)
+        .bind(stop)
         .bind(failed_execution_id)
         .bind(consecutive_failures)
         .bind(last_error)
         .bind(next_run_at)
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("agent runtime".into()))
+        .await?)
     }
 
-    /// Record a newly created execution. `reset_failures` clears the failure counter and
-    /// is set when the previous execution did not fail.
+    /// Record a newly created execution; never changes `status`. `reset_failures` clears
+    /// the failure counter and is set when the previous execution did not fail.
+    ///
+    /// The tick claimed the runtime while it was `running`, but an operator may have
+    /// pressed Stop since. So `last_execution_id` is recorded for `running` and
+    /// `stopping` runtimes (the stopping branch waits on, and cancels, that execution),
+    /// while the schedule/error/failure fields only change while `running`. Returns
+    /// `None` if the runtime is already `stopped`; the caller must then cancel the
+    /// orphaned execution.
     pub async fn record_agent_runtime_launch(
         &self,
         runtime_id: Uuid,
         execution_id: Uuid,
         reset_failures: bool,
         next_run_at: DateTime<Utc>,
-    ) -> StoreResult<AgentRuntime> {
-        sqlx::query_as::<_, AgentRuntime>(
+    ) -> StoreResult<Option<AgentRuntime>> {
+        Ok(sqlx::query_as::<_, AgentRuntime>(
             r#"
             UPDATE agent_runtimes
-            SET status = 'running',
-                last_execution_id = $2,
-                last_error = NULL,
-                consecutive_failures = CASE WHEN $3 THEN 0 ELSE consecutive_failures END,
-                failed_execution_id = CASE WHEN $3 THEN NULL ELSE failed_execution_id END,
-                next_run_at = $4,
+            SET last_execution_id = $2,
+                last_error = CASE WHEN status = 'running' THEN NULL ELSE last_error END,
+                consecutive_failures = CASE WHEN status = 'running' AND $3 THEN 0 ELSE consecutive_failures END,
+                failed_execution_id = CASE WHEN status = 'running' AND $3 THEN NULL ELSE failed_execution_id END,
+                next_run_at = CASE WHEN status = 'running' THEN $4 ELSE next_run_at END,
                 updated_at = now()
-            WHERE id = $1
+            WHERE id = $1 AND status IN ('running','stopping')
             RETURNING *
             "#,
         )
@@ -207,7 +307,6 @@ impl Store {
         .bind(reset_failures)
         .bind(next_run_at)
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("agent runtime".into()))
+        .await?)
     }
 }
