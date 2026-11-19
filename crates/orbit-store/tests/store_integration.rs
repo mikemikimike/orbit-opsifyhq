@@ -8,7 +8,7 @@ use orbit_domain::{
 };
 use orbit_security::{SecretCipher, SecretValue};
 use orbit_store::executions::NewExecution;
-use orbit_store::Store;
+use orbit_store::{Store, WorkerProfile};
 
 async fn test_store() -> Option<Store> {
     let url = std::env::var("ORBIT_TEST_DATABASE_URL").ok()?;
@@ -1385,4 +1385,240 @@ async fn agent_spec_triggers_are_reconciled() {
         .await
         .unwrap()
         .is_empty());
+}
+
+async fn launch_profile_fixture(store: &Store, org: uuid::Uuid, name: &str) -> WorkerProfile {
+    store
+        .create_worker_profile(
+            org,
+            name,
+            "pi",
+            "docker",
+            "process",
+            "orbit-worker-pi",
+            "0.3.0",
+            "all",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            false,
+            false,
+            false,
+            false,
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap()
+}
+
+async fn new_launch(
+    store: &Store,
+    org: uuid::Uuid,
+    profile: &WorkerProfile,
+    single: bool,
+) -> orbit_store::WorkerLaunch {
+    store
+        .create_worker_launch(
+            org,
+            profile.id,
+            &profile.name,
+            "docker",
+            "img:1",
+            None,
+            None,
+            single,
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn live_launch_lookup_is_exact_beyond_the_newest_hundred() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let target = launch_profile_fixture(&store, org, "Target").await;
+    let other = launch_profile_fixture(&store, org, "Other").await;
+    let live = new_launch(&store, org, &target, false).await;
+    // 150 newer launches of another profile (single-execution, so they may coexist).
+    for _ in 0..150 {
+        new_launch(&store, org, &other, true).await;
+    }
+    assert!(!store
+        .list_worker_launches(org, None)
+        .await
+        .unwrap()
+        .iter()
+        .any(|l| l.id == live.id));
+    let found = store
+        .find_live_launch_for_profile(org, target.id)
+        .await
+        .unwrap()
+        .expect("live launch found");
+    assert_eq!(found.id, live.id);
+    let active = store
+        .active_launches_for_profile(org, other.id)
+        .await
+        .unwrap();
+    assert_eq!(active.len(), 150);
+}
+
+#[tokio::test]
+async fn unique_index_blocks_second_live_long_lived_launch() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let profile = launch_profile_fixture(&store, org, "Unique").await;
+    let first = new_launch(&store, org, &profile, false).await;
+    let dup = store
+        .create_worker_launch(
+            org, profile.id, "Unique", "docker", "img:1", None, None, false,
+        )
+        .await
+        .expect_err("second live long-lived launch must be rejected");
+    assert!(dup.is_unique_violation());
+    // Single-execution launches may coexist with it.
+    new_launch(&store, org, &profile, true).await;
+    new_launch(&store, org, &profile, true).await;
+    // Once the first is stopped a new long-lived launch is allowed again.
+    store
+        .update_worker_launch(org, first.id, "stopped", None, None, None, false, true)
+        .await
+        .unwrap();
+    new_launch(&store, org, &profile, false).await;
+}
+
+#[tokio::test]
+async fn aborted_unclaimed_launch_is_not_live_and_token_is_revoked() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let profile = launch_profile_fixture(&store, org, "Abort").await;
+    let token = store
+        .create_worker_token(
+            org,
+            Some(profile.id),
+            "t",
+            "pfx",
+            "hash-abort",
+            &["pi".into()],
+        )
+        .await
+        .unwrap();
+    let launch = store
+        .create_worker_launch(
+            org,
+            profile.id,
+            "Abort",
+            "docker",
+            "img:1",
+            Some(token.id),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    // Same sequence the handler runs when claim_execution returns None.
+    store.revoke_worker_token(org, token.id).await.unwrap();
+    let failed = store
+        .update_worker_launch(
+            org,
+            launch.id,
+            "failed",
+            None,
+            None,
+            Some("not queued"),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.status, "failed");
+    assert!(failed.stopped_at.is_some());
+    assert!(store
+        .active_launches_for_profile(org, profile.id)
+        .await
+        .unwrap()
+        .is_empty());
+    // Revoking again reports NotFound: the token is already revoked.
+    assert!(store.revoke_worker_token(org, token.id).await.is_err());
+}
+
+#[tokio::test]
+async fn terminal_launch_cannot_regress_and_error_is_kept() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let profile = launch_profile_fixture(&store, org, "Guard").await;
+    let launch = new_launch(&store, org, &profile, false).await;
+    store
+        .update_worker_launch(
+            org,
+            launch.id,
+            "starting",
+            None,
+            None,
+            Some("warn"),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    // A status-only update must not clear the error.
+    let running = store
+        .update_worker_launch(
+            org,
+            launch.id,
+            "running",
+            Some("rt"),
+            None,
+            None,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(running.status, "running");
+    assert_eq!(running.error.as_deref(), Some("warn"));
+    let stopped = store
+        .update_worker_launch(org, launch.id, "stopped", None, None, None, false, true)
+        .await
+        .unwrap();
+    assert_eq!(stopped.status, "stopped");
+    // A racing poll refresh reporting running must not revive it.
+    let after = store
+        .update_worker_launch(org, launch.id, "running", None, None, None, true, false)
+        .await
+        .unwrap();
+    assert_eq!(after.status, "stopped");
+    assert_eq!(after.stopped_at, stopped.stopped_at);
+    // Idempotent terminal re-write is allowed and keeps the first stop time.
+    let again = store
+        .update_worker_launch(org, launch.id, "stopped", None, None, None, false, true)
+        .await
+        .unwrap();
+    assert_eq!(again.stopped_at, stopped.stopped_at);
+    // Missing launches are still NotFound.
+    assert!(store
+        .update_worker_launch(
+            org,
+            uuid::Uuid::now_v7(),
+            "running",
+            None,
+            None,
+            None,
+            false,
+            false
+        )
+        .await
+        .is_err());
 }

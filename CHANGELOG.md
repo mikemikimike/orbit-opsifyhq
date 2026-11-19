@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Worker launch reuse and platform-version relaunch now use an exact per-profile live-launch
+  query instead of an org-wide list capped at 100 rows, and a partial unique index (migration
+  0045) prevents two live long-lived launches per profile; a lost create race reuses the
+  winner (#121).
+- A claim conflict on a single-execution launch no longer leaves a phantom `pending` launch
+  or an active worker token behind; the launch is marked failed and the token revoked (#121).
+- Launch status updates no longer regress `stopped`/`failed` launches to `running` when a poll
+  refresh races a stop, and no longer clear the recorded error on status-only updates (#121).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
