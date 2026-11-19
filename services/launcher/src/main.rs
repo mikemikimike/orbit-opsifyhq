@@ -150,8 +150,98 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Workload name for a launch: `orbit-worker-` plus the full UUID without hyphens
+/// (45 chars, DNS-1123 safe, well under the 63 char label/name limit even with the
+/// suffixes Kubernetes appends to pod names).
+///
+/// Earlier launchers used only the first 8 hex chars of the UUIDv7, which are timestamp
+/// bits and identical for every launch within ~65 s (issue #106).
 fn pod_name(launch_id: Uuid) -> String {
+    format!("orbit-worker-{}", launch_id.simple())
+}
+
+/// Pre-fix name. Only used to find workloads started by an older launcher, and only
+/// acted on when the workload's `orbit.launch-id` label proves it belongs to this launch.
+fn legacy_pod_name(launch_id: Uuid) -> String {
     format!("orbit-worker-{}", &launch_id.to_string()[..8])
+}
+
+/// True when a label value read from a workload identifies `launch_id`.
+fn label_matches_launch(label: &str, launch_id: Uuid) -> bool {
+    label.trim() == launch_id.to_string()
+}
+
+async fn docker_launch_label(state: &AppState, name: &str) -> Option<String> {
+    let output = Command::new(&state.docker)
+        .args([
+            "inspect",
+            "-f",
+            "{{index .Config.Labels \"orbit.launch-id\"}}",
+            name,
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Container name for a launch: the unique name, or the legacy short name if a container
+/// from an older launcher with that name carries this launch's label.
+async fn docker_workload_name(state: &AppState, launch_id: Uuid) -> String {
+    let name = pod_name(launch_id);
+    if docker_exists(state, &name).await {
+        return name;
+    }
+    let legacy = legacy_pod_name(launch_id);
+    match docker_launch_label(state, &legacy).await {
+        Some(label) if label_matches_launch(&label, launch_id) => legacy,
+        _ => name,
+    }
+}
+
+async fn kubernetes_launch_label(state: &AppState, kind: &str, name: &str) -> Option<String> {
+    let output = Command::new(&state.kubectl)
+        .args([
+            "-n",
+            &state.namespace,
+            "get",
+            kind,
+            name,
+            "-o",
+            "jsonpath={.metadata.labels.orbit\\.launch-id}",
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Workload name for a launch on Kubernetes (Deployment, Job or legacy Pod), falling back
+/// to the legacy short name only when that workload carries this launch's label.
+async fn kubernetes_workload_name(state: &AppState, launch_id: Uuid) -> String {
+    let name = pod_name(launch_id);
+    let legacy = legacy_pod_name(launch_id);
+    for kind in ["deployment", "job", "pod"] {
+        if kubernetes_launch_label(state, kind, &name).await.is_some() {
+            return name;
+        }
+    }
+    for kind in ["deployment", "job", "pod"] {
+        if let Some(label) = kubernetes_launch_label(state, kind, &legacy).await {
+            if label_matches_launch(&label, launch_id) {
+                return legacy;
+            }
+        }
+    }
+    name
 }
 
 fn rewrite_api(url: &str) -> String {
@@ -874,15 +964,20 @@ async fn status(
             Json(json!({ "error": "unauthorized" })),
         ));
     }
-    let name = pod_name(launch_id);
     let status = if docker_target(query.target.as_deref()) {
+        let name = docker_workload_name(&state, launch_id).await;
         docker_status(&state, &name).await
     } else if query.target.as_deref() == Some("kubernetes") {
+        let name = kubernetes_workload_name(&state, launch_id).await;
         kubernetes_status(&state, &name, launch_id).await
-    } else if docker_exists(&state, &name).await {
-        docker_status(&state, &name).await
     } else {
-        kubernetes_status(&state, &name, launch_id).await
+        let name = docker_workload_name(&state, launch_id).await;
+        if docker_exists(&state, &name).await {
+            docker_status(&state, &name).await
+        } else {
+            let name = kubernetes_workload_name(&state, launch_id).await;
+            kubernetes_status(&state, &name, launch_id).await
+        }
     };
     Ok(Json(status))
 }
@@ -899,8 +994,13 @@ async fn stop(
             Json(json!({ "error": "unauthorized" })),
         ));
     }
-    let name = pod_name(launch_id);
-    if query.target.as_deref() == Some("kubernetes") {
+    let kubernetes = query.target.as_deref() == Some("kubernetes");
+    let name = if kubernetes {
+        kubernetes_workload_name(&state, launch_id).await
+    } else {
+        docker_workload_name(&state, launch_id).await
+    };
+    if kubernetes {
         for resource_type in ["deployment", "job", "pod"] {
             let _ = Command::new(&state.kubectl)
                 .args([
@@ -942,8 +1042,13 @@ async fn logs(
             Json(json!({ "error": "unauthorized" })),
         ));
     }
-    let name = pod_name(launch_id);
-    let output = if query.target.as_deref() == Some("kubernetes") {
+    let kubernetes = query.target.as_deref() == Some("kubernetes");
+    let name = if kubernetes {
+        kubernetes_workload_name(&state, launch_id).await
+    } else {
+        docker_workload_name(&state, launch_id).await
+    };
+    let output = if kubernetes {
         let by_label = Command::new(&state.kubectl)
             .args([
                 "-n",
@@ -981,4 +1086,43 @@ async fn logs(
         Err(error) => format!("could not read logs: {error}"),
     };
     Ok(Json(Logs { logs }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dns_label_safe(name: &str) -> bool {
+        name.len() <= 63
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && name.ends_with(|c: char| c.is_ascii_alphanumeric())
+    }
+
+    #[test]
+    fn back_to_back_launches_get_distinct_names() {
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        assert_ne!(pod_name(a), pod_name(b));
+    }
+
+    #[test]
+    fn names_are_dns_safe_and_short_enough_for_pod_suffixes() {
+        let name = pod_name(Uuid::now_v7());
+        assert!(dns_label_safe(&name), "{name}");
+        // Deployment pods append `-<10 char hash>-<5 char suffix>`.
+        assert!(name.len() + 17 <= 63, "{name}");
+        assert!(dns_label_safe(&legacy_pod_name(Uuid::now_v7())));
+    }
+
+    #[test]
+    fn legacy_label_must_match_exact_launch() {
+        let id = Uuid::now_v7();
+        assert!(label_matches_launch(&format!("{id}\n"), id));
+        assert!(!label_matches_launch(&Uuid::now_v7().to_string(), id));
+        assert!(!label_matches_launch("", id));
+        assert_ne!(legacy_pod_name(id), pod_name(id));
+    }
 }

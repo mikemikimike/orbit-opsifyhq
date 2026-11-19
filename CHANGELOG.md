@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Launcher workload names, worker ids and bootstrap deployment names now use the full launch/profile UUID instead of its first 8 hex chars, so launches started within ~65 s no longer replace each other's container/Job or share a worker id; workloads from older launchers stay stoppable via a label-verified legacy-name fallback (#106).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
