@@ -584,7 +584,7 @@ impl std::fmt::Display for HarnessError {
 
 impl std::error::Error for HarnessError {}
 
-/// Adapter contract. See `docs/architecture/harness-contract.md`.
+/// Adapter contract. See `docs/architecture/runtime-contract.md`.
 #[async_trait::async_trait]
 pub trait HarnessAdapter: Send + Sync {
     fn kind(&self) -> HarnessKind;

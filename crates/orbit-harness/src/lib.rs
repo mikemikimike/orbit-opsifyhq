@@ -1,6 +1,6 @@
 //! Harness adapters and the harness registry.
 //!
-//! See `docs/architecture/harness-contract.md`. Adapters never touch PostgreSQL, HTTP or
+//! See `docs/architecture/runtime-contract.md`. Adapters never touch PostgreSQL, HTTP or
 //! the frontend. The control plane only stores their descriptors and capabilities; the
 //! worker executes them.
 

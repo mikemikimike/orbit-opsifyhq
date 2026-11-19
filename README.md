@@ -195,7 +195,7 @@ docs/                     Architecture, ADRs, development and deployment guides
 
 - `docs/architecture/overview.md` — layers, modules, flows
 - `docs/architecture/domain-model.md` — entities and invariants
-- `docs/architecture/harness-contract.md` — adapter contract and implementation status
+- `docs/architecture/runtime-contract.md` — adapter contract and implementation status
 - `docs/architecture/provider-connector-contract.md`
 - `docs/architecture/api.md` — REST/OpenAPI/SSE/auth conventions
 - `docs/architecture/events.md` — event bus, durability, triggers
