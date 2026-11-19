@@ -285,6 +285,10 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::import::import_markdown),
         )
         .route(
+            "/api/v1/import",
+            post(handlers::import_portable::import_portable),
+        )
+        .route(
             "/api/v1/export/{resource}/{resource_id}",
             get(handlers::export::export_resource),
         )
