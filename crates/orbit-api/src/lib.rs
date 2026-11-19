@@ -11,6 +11,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod connectors;
 pub mod dispatcher;
+pub mod docs;
 pub mod dto;
 pub mod error;
 pub mod extract;

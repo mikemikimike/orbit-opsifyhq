@@ -1305,3 +1305,164 @@ async fn same_agent_queues_on_different_harnesses() {
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(second["harnessKind"], "pi");
 }
+
+async fn send_raw(
+    router: &axum::Router,
+    request: Request<Body>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let response = router.clone().oneshot(request).await.expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn docs_index_lists_categories_and_excludes_planning() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(&app.router, get("/api/v1/docs")).await;
+    assert_eq!(status, StatusCode::OK);
+    let categories = body["categories"].as_array().expect("categories");
+    assert!(categories.len() >= 4);
+    let ids: Vec<&str> = categories.iter().filter_map(|c| c["id"].as_str()).collect();
+    assert!(ids.contains(&"guide") && ids.contains(&"architecture"));
+    let slugs: Vec<&str> = categories
+        .iter()
+        .flat_map(|c| c["pages"].as_array().unwrap())
+        .filter_map(|p| p["slug"].as_str())
+        .collect();
+    assert!(slugs.contains(&"architecture/overview"));
+    assert!(!slugs.iter().any(|s| s.starts_with("planning")));
+    let first = &categories[0]["pages"][0];
+    assert!(first["title"].as_str().is_some_and(|t| !t.is_empty()));
+    assert!(first["url"].as_str().unwrap().starts_with("/api/v1/docs/"));
+
+    let (status, headers, bytes) = send_raw(&app.router, get("/api/v1/docs?format=html")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert!(String::from_utf8_lossy(&bytes).contains("architecture/overview"));
+}
+
+#[tokio::test]
+async fn docs_page_rewrites_links_and_supports_html() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(&app.router, get("/api/v1/docs/index")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["slug"], "index");
+    let markdown = body["markdown"].as_str().unwrap();
+    assert!(
+        markdown.contains("](/api/v1/docs/architecture/overview)"),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("overview.md)"));
+
+    let (status, headers, bytes) = send_raw(
+        &app.router,
+        get("/api/v1/docs/architecture/overview?format=markdown"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/markdown"));
+    assert!(String::from_utf8_lossy(&bytes).starts_with("# "));
+
+    let request = Request::builder()
+        .uri("/api/v1/docs/index")
+        .header("accept", "text/html")
+        .body(Body::empty())
+        .unwrap();
+    let (status, headers, bytes) = send_raw(&app.router, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert!(headers.contains_key("content-security-policy"));
+    let html = String::from_utf8_lossy(&bytes);
+    assert!(html.contains("<h1 id="));
+    assert!(html.contains("href=\"/api/v1/docs/"));
+}
+
+#[tokio::test]
+async fn docs_assets_are_served_with_content_type() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, headers, bytes) = send_raw(
+        &app.router,
+        get("/api/v1/docs/assets/architecture/orbit-overview.png"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/png");
+    assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+
+    let (status, headers, _) = send_raw(
+        &app.router,
+        get("/api/v1/docs/assets/architecture/orbit-overview.svg"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/svg+xml");
+
+    // A page whose slug starts with `assets/` is still reachable.
+    let (status, body) = send(&app.router, get("/api/v1/docs/assets/brand")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["slug"], "assets/brand");
+}
+
+#[tokio::test]
+async fn docs_reject_traversal_unknown_and_planning() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    for path in [
+        "/api/v1/docs/../Cargo.toml",
+        "/api/v1/docs/..%2F..%2FCargo.toml",
+        "/api/v1/docs/%2e%2e/%2e%2e/Cargo.toml",
+        "/api/v1/docs/assets/../../Cargo.toml",
+        "/api/v1/docs/assets/..%2F..%2FCargo.toml",
+        "/api/v1/docs/does/not/exist",
+        "/api/v1/docs/planning/provider-ux-and-harness-decoupling",
+        "/api/v1/docs/assets/planning/provider-ux-and-harness-decoupling.md",
+        "/api/v1/docs/assets/nope.png",
+    ] {
+        let (status, body) = send(&app.router, get(path)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(body["error"]["code"], "not_found", "{path}");
+        assert!(!body["error"]["requestId"].as_str().unwrap_or("").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn docs_require_authentication_but_swagger_stays_public() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    for path in [
+        "/api/v1/docs",
+        "/api/v1/docs/index",
+        "/api/v1/docs/assets/architecture/orbit-overview.png",
+    ] {
+        let (status, body) = send(&app.router, get(path)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(body["error"]["code"], "unauthorized");
+    }
+    let (status, _) = send(&app.router, auth_get("/api/v1/docs", "test-token")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&app.router, get("/api/v1/openapi.json")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(&app.router, get("/api/v1/meta")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["docsUrl"], "/api/v1/docs");
+}

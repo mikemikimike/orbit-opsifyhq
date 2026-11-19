@@ -5,6 +5,7 @@ pub mod approvals;
 pub mod auth_oidc;
 pub mod catalog;
 pub mod dashboard;
+pub mod docs;
 pub mod env_mappings;
 pub mod executions;
 pub mod export;

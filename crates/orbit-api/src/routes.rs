@@ -16,6 +16,8 @@ pub fn build_router(state: AppState) -> Router {
     let cors = build_cors(&state);
 
     let protected = Router::new()
+        .route("/api/v1/docs", get(handlers::docs::index))
+        .route("/api/v1/docs/{*path}", get(handlers::docs::get_doc))
         .route("/api/v1/me", get(handlers::account::me))
         .route(
             "/api/v1/organizations/current",

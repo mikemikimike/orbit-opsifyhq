@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Added
+
+- Embedded documentation: the `docs/` handbook is compiled into the API binary and served
+  (authenticated, air-gapped friendly) from `GET /api/v1/docs`, `/api/v1/docs/{slug}` (JSON,
+  Markdown or HTML) and `/api/v1/docs/assets/{path}`, with relative links, anchors and image
+  paths rewritten to documentation routes. `docs/planning` is excluded. (#44)
+- Web `/documentation` page with a categorised sidebar and an in-app reader, a Documentation
+  navigation entry, and `docsUrl` on `GET /api/v1/meta`. (#44)
+- CI link check over the embedded docs; stale links in `docs/` and references to the
+  removed `harness-contract.md` were fixed. (#44)
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
