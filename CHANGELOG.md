@@ -6,6 +6,32 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- Provider credentials no longer follow an edited endpoint: changing a provider's
+  `baseUrl` now requires re-entering the API key in the same request (422 otherwise).
+  Probing/testing a provider uses its stored credential and persists the model catalog, so
+  it now requires manage rights (not just read + view). (#142)
+- Outbound requests to tenant-supplied URLs (provider probe/test, connection test, output
+  webhooks, work-source `baseUrl`) are checked against an address policy: loopback,
+  link-local, cloud-metadata, unspecified, multicast and reserved addresses are blocked;
+  private ranges stay allowed by default for self-hosted endpoints. Configure with
+  `ORBIT_OUTBOUND_ALLOW_PRIVATE` / `ORBIT_OUTBOUND_ALLOWED_HOSTS` (Helm `outbound.*`).
+  Redirects to a different host are no longer followed, and probe failures return a
+  generic category (dns/connect/tls/status N) instead of raw error text. (#142)
+- Worker tokens and worker-profile env values are no longer passed in `docker run` argv
+  (launcher: 0600 env-file removed after start; worker per-execution containers: `-e NAME`
+  with the value in the child environment) and no longer appear as plain `value` in
+  Kubernetes Job/Deployment specs: the launcher creates a per-launch Secret referenced with
+  `secretKeyRef` and owner-referenced to the workload. The launcher Role gains
+  `create`/`patch`/`delete` on `secrets` (no read). (#142)
+- Worker pods set `automountServiceAccountToken: false`. New optional NetworkPolicy
+  (`networkPolicy.enabled`, off by default) limits launcher ingress to the API pods. (#142)
+- Launch tokens for single-execution workers are revoked once their execution reaches a
+  terminal state (new `worker_launches.single_execution_id`, migration 0046). (#142)
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

@@ -321,6 +321,11 @@ pub(crate) async fn launch_profile_internal(
         .await?;
     let worker_id = format!("worker-{}", &launch.id.to_string()[..8]);
     if let Some(execution_id) = single_execution_id {
+        // Lets the background reaper revoke this launch's token when the execution ends.
+        state
+            .store
+            .set_worker_launch_single_execution(launch.id, execution_id)
+            .await?;
         state
             .store
             .claim_execution(execution_id, &worker_id)

@@ -55,6 +55,7 @@ pub fn spawn(state: AppState) {
         loop {
             ticker.tick().await;
             reap(&reaper_state).await;
+            revoke_finished_launch_tokens(&reaper_state).await;
         }
     });
 
@@ -324,6 +325,21 @@ const HEARTBEAT_STALE_SECONDS: i64 = 90;
 const UNSTARTED_SILENT_SECONDS: i64 = 600;
 /// How long a claimed, never-started run may ignore a cancel request.
 const UNSTARTED_CANCEL_SECONDS: i64 = 60;
+
+/// A single-execution launch's worker token has no use once its execution is terminal;
+/// revoke it so a leaked token cannot be replayed.
+async fn revoke_finished_launch_tokens(state: &AppState) {
+    match state.store.revoke_finished_single_execution_tokens().await {
+        Ok(ids) if !ids.is_empty() => {
+            tracing::info!(
+                count = ids.len(),
+                "revoked worker tokens of finished single-execution launches"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "single-execution token revocation failed"),
+    }
+}
 
 async fn reap(state: &AppState) {
     match state

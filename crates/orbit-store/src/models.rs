@@ -490,6 +490,11 @@ pub struct WorkerLaunch {
     pub error: Option<String>,
     #[sqlx(default)]
     pub relaunch_required: bool,
+    /// Set for launches that exist for exactly one execution; internal, not serialized.
+    #[sqlx(default)]
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub single_execution_id: Option<Uuid>,
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

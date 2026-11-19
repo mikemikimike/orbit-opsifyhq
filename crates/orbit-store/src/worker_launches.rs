@@ -39,6 +39,39 @@ impl Store {
         .map_err(Into::into)
     }
 
+    /// Mark a launch as existing for exactly one execution.
+    pub async fn set_worker_launch_single_execution(
+        &self,
+        launch_id: Uuid,
+        execution_id: Uuid,
+    ) -> StoreResult<()> {
+        sqlx::query("UPDATE worker_launches SET single_execution_id = $2 WHERE id = $1")
+            .bind(launch_id)
+            .bind(execution_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Revoke the worker tokens of single-execution launches whose execution is terminal.
+    /// Returns the revoked token ids.
+    pub async fn revoke_finished_single_execution_tokens(&self) -> StoreResult<Vec<Uuid>> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            r#"
+            UPDATE worker_tokens t
+            SET revoked_at = now()
+            FROM worker_launches l
+            JOIN executions e ON e.id = l.single_execution_id
+            WHERE l.worker_token_id = t.id
+              AND t.revoked_at IS NULL
+              AND e.status IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'rejected')
+            RETURNING t.id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     pub async fn get_worker_launch(
         &self,
         org_id: Uuid,
