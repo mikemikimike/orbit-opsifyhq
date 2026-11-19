@@ -15,6 +15,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 struct TestApp {
+    state: AppState,
     router: axum::Router,
     store: Store,
     org_id: Uuid,
@@ -112,7 +113,8 @@ async fn test_app(allow_anonymous: bool) -> Option<TestApp> {
 
     let created = create_demo_agent(&store, org.id, user.id).await;
     Some(TestApp {
-        router: build_router(state),
+        router: build_router(state.clone()),
+        state,
         store,
         org_id: org.id,
         agent_id: created,
@@ -1304,4 +1306,146 @@ async fn same_agent_queues_on_different_harnesses() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(second["harnessKind"], "pi");
+}
+
+async fn raw_pool() -> sqlx::PgPool {
+    sqlx::PgPool::connect(&std::env::var("ORBIT_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn poisoned_runtimes_do_not_block_healthy_ones() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let pool = raw_pool().await;
+
+    // Oldest runtime: unknown harness (permanent error).
+    let bad_harness = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let rt_harness = app
+        .store
+        .create_agent_runtime(app.org_id, bad_harness, "t", "bogus", 60, None)
+        .await
+        .unwrap();
+    // Second: current spec that no longer deserialises (transient, backs off).
+    let bad_spec = create_demo_agent(&app.store, app.org_id, user.id).await;
+    sqlx::query("UPDATE agent_versions SET spec = '{\"bogus\": true}'::jsonb WHERE agent_id = $1")
+        .bind(bad_spec)
+        .execute(&pool)
+        .await
+        .unwrap();
+    app.store
+        .create_agent_runtime(app.org_id, bad_spec, "t", "mock", 10, None)
+        .await
+        .unwrap();
+    // Healthy runtime created last.
+    let healthy = create_demo_agent(&app.store, app.org_id, user.id).await;
+    app.store
+        .create_agent_runtime(app.org_id, healthy, "t", "mock", 60, None)
+        .await
+        .unwrap();
+
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+
+    let ok = app
+        .store
+        .get_agent_runtime(app.org_id, healthy)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        ok.last_execution_id.is_some(),
+        "healthy runtime must advance"
+    );
+    assert!(ok.last_error.is_none());
+
+    let spec = app
+        .store
+        .get_agent_runtime(app.org_id, bad_spec)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(spec.status, "running");
+    assert!(spec.last_error.as_deref().unwrap().contains("invalid"));
+    assert!(spec.next_run_at > chrono::Utc::now() + chrono::Duration::seconds(30));
+    assert!(spec.last_execution_id.is_none());
+
+    let (status, error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM agent_runtimes WHERE id = $1")
+            .bind(rt_harness.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "stopped");
+    assert!(error.unwrap().contains("unknown harness"));
+}
+
+#[tokio::test]
+async fn runtime_tick_retry_reuses_execution() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let runtime = app
+        .store
+        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
+        .await
+        .unwrap();
+    let pool = raw_pool().await;
+
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let first = app
+        .store
+        .get_agent_runtime(app.org_id, agent_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_execution_id
+        .unwrap();
+
+    // Simulate a crash between create_execution and update_agent_runtime: the execution
+    // exists but the runtime row still points at nothing and is due again.
+    sqlx::query("UPDATE agent_runtimes SET last_execution_id = NULL, next_run_at = now() - interval '1 second' WHERE id = $1")
+        .bind(runtime.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+
+    let retried = app
+        .store
+        .get_agent_runtime(app.org_id, agent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retried.last_execution_id,
+        Some(first),
+        "retry reuses the execution"
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM executions WHERE org_id = $1 AND agent_id = $2")
+            .bind(app.org_id)
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "no duplicate execution");
 }
