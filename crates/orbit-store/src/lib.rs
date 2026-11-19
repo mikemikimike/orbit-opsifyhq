@@ -29,6 +29,7 @@ pub mod identity;
 pub mod models;
 pub mod outputs;
 pub mod platform_settings;
+pub mod portable;
 pub mod secrets;
 pub mod sharing;
 pub mod skills;
