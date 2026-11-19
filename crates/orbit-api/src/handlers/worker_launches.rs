@@ -187,7 +187,7 @@ async fn fail_worker_executions(state: &AppState, launch: &WorkerLaunch) {
             .error
             .clone()
             .unwrap_or_else(|| "worker container was OOMKilled".into());
-        let _ = state
+        if let Err(err) = state
             .store
             .append_execution_event(
                 launch.org_id,
@@ -203,7 +203,10 @@ async fn fail_worker_executions(state: &AppState, launch: &WorkerLaunch) {
                     "error": message,
                 }),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(execution_id = %execution.id, error = %err, "failed to append execution event");
+        }
         let _ = state
             .store
             .finish_execution(

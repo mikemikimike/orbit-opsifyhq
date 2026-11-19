@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Concurrent execution event appends no longer collide on `seq` and get dropped; sequence allocation is serialized per execution, and callers that ignored append errors now log them (#114).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

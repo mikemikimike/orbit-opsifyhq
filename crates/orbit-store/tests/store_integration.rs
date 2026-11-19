@@ -1386,3 +1386,72 @@ async fn agent_spec_triggers_are_reconciled() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_event_appends_get_dense_unique_seq() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, version) = store
+        .create_agent(org, Some(user), &definition("Concurrent Events Agent"))
+        .await
+        .unwrap();
+    let execution = store
+        .create_execution(NewExecution {
+            org_id: org,
+            agent_id: agent.id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: HarnessKind::Mock,
+            trigger_source: TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: serde_json::json!({ "task": "concurrent" }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: Some(user),
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+
+    const N: i64 = 50;
+    let mut tasks = Vec::new();
+    for i in 0..N {
+        let store = store.clone();
+        let execution_id = execution.id;
+        tasks.push(tokio::spawn(async move {
+            store
+                .append_execution_event(
+                    org,
+                    execution_id,
+                    "log",
+                    LogLevel::Info,
+                    &format!("event {i}"),
+                    &serde_json::json!({ "i": i }),
+                )
+                .await
+        }));
+    }
+    let mut returned = Vec::new();
+    for task in tasks {
+        let event = task
+            .await
+            .unwrap()
+            .expect("concurrent append must not fail");
+        returned.push(event.seq);
+    }
+    returned.sort_unstable();
+    assert_eq!(returned, (1..=N).collect::<Vec<_>>());
+
+    let stored = store
+        .list_execution_events(org, execution.id, 0, 1000)
+        .await
+        .unwrap();
+    let seqs: Vec<i64> = stored.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, (1..=N).collect::<Vec<_>>());
+}

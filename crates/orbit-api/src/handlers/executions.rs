@@ -374,7 +374,7 @@ pub async fn execute_agent(
     }
 
     // Make the queued state observable even before a worker claims the execution.
-    let _ = state
+    if let Err(err) = state
         .store
         .append_execution_event(
             auth.org_id,
@@ -390,7 +390,10 @@ pub async fn execute_agent(
                 "placement": placement,
             }),
         )
-        .await;
+        .await
+    {
+        tracing::warn!(execution_id = %execution.id, error = %err, "failed to append execution event");
+    }
 
     state.metrics.inc_executions();
     audit::record(
@@ -623,7 +626,7 @@ pub async fn rerun_execution(
     if let Err(err) = state.bus.publish(event).await {
         tracing::warn!(error = %err, "rerun event publish failed; worker polling will pick up the execution");
     }
-    let _ = state
+    if let Err(err) = state
         .store
         .append_execution_event(
             auth.org_id,
@@ -636,7 +639,10 @@ pub async fn rerun_execution(
             ),
             &serde_json::json!({ "rerunOf": original.id, "harness": execution.harness_kind }),
         )
-        .await;
+        .await
+    {
+        tracing::warn!(execution_id = %execution.id, error = %err, "failed to append execution event");
+    }
     audit::record(
         &state,
         &auth,

@@ -670,8 +670,11 @@ async fn fail_claimed(state: &AppState, execution: &ExecutionRecord, message: &s
             &serde_json::json!({ "error": message }),
         )
         .await;
-    if let Ok(event) = &event {
-        publish_event(state, execution, event).await;
+    match &event {
+        Ok(event) => publish_event(state, execution, event).await,
+        Err(err) => {
+            tracing::warn!(execution_id = %execution.id, error = %err, "failed to append execution event");
+        }
     }
     if let Ok(Some(record)) = state
         .store

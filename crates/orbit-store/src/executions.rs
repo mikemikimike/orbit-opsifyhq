@@ -375,7 +375,19 @@ impl Store {
         message: &str,
         data: &Value,
     ) -> StoreResult<ExecutionEventRecord> {
-        sqlx::query_as::<_, ExecutionEventRecord>(
+        // seq is MAX+1 per execution. Under READ COMMITTED concurrent appends would read the
+        // same MAX and collide on UNIQUE (execution_id, seq), so serialize allocation per
+        // execution with a transaction-scoped advisory lock. An advisory lock (rather than
+        // `SELECT ... FOR UPDATE` on the execution row) never blocks claim/finish/cancel
+        // updates, and it is released automatically on commit/rollback.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('execution_events:' || $1::text, 0))",
+        )
+        .bind(execution_id)
+        .execute(&mut *tx)
+        .await?;
+        let record = sqlx::query_as::<_, ExecutionEventRecord>(
             r#"
             WITH next_seq AS (
                 SELECT COALESCE(MAX(seq), 0) + 1 AS seq
@@ -393,9 +405,10 @@ impl Store {
         .bind(level.as_str())
         .bind(message)
         .bind(data)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(Into::into)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     pub async fn list_execution_events(
