@@ -55,6 +55,7 @@ import { Section } from "@/components/ui/section";
 import { Segmented } from "@/components/ui/segmented";
 import { Select } from "@/components/ui/select";
 import { exportResource } from "@/components/export-resource-button";
+import { ImportPortableButton } from "@/components/import-portable-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Status, type StatusMeta } from "@/components/ui/status";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -717,9 +718,12 @@ function WorkersPageInner() {
         description="Workers run agent executions. A profile fixes the image, target, agents, skills and harness auth; launch it from here or bootstrap it yourself with Docker, Compose or Kubernetes."
         meta={summary.length ? summary : undefined}
         actions={
+          <div className="flex flex-wrap gap-2">
+            <ImportPortableButton />
           <Button onClick={openCreate}>
             <Plus /> New profile
           </Button>
+          </div>
         }
       />
 
@@ -957,7 +961,7 @@ function WorkersPageInner() {
                               <Copy /> Copy profile ID
                             </DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => void exportResource("worker_profiles", profile.id, profile.name)}>
-                              <Download /> Export as JSON
+                              <Download /> Export as YAML
                             </DropdownMenuItem>
                             <DropdownMenuItem
                               onSelect={() =>

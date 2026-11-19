@@ -13,6 +13,7 @@ import { useConfirm } from "@/components/ui/confirm";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
+import { ImportPortableButton } from "@/components/import-portable-dialog";
 import { ImportOpenCodeButton } from "@/components/import-opencode-button";
 import { Segmented } from "@/components/ui/segmented";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -92,6 +93,7 @@ export default function AgentsPage() {
         description="Each agent is a versioned definition: instructions, harness, model, connectors, triggers and how much it may do on its own."
         actions={
           <div className="flex flex-wrap gap-2">
+            <ImportPortableButton />
             <ImportOpenCodeButton kind="agent" />
             <Button asChild>
               <Link href="/agents/new">
