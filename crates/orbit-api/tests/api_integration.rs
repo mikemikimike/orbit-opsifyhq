@@ -1449,3 +1449,148 @@ async fn runtime_tick_retry_reuses_execution() {
             .unwrap();
     assert_eq!(count, 1, "no duplicate execution");
 }
+
+async fn fail_execution(pool: &sqlx::PgPool, execution_id: uuid::Uuid) {
+    sqlx::query("UPDATE executions SET status = 'failed', error = '\"boom\"'::jsonb, finished_at = now() WHERE id = $1")
+        .bind(execution_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn make_runtime_due(pool: &sqlx::PgPool, runtime_id: uuid::Uuid) {
+    sqlx::query(
+        "UPDATE agent_runtimes SET next_run_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(runtime_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn runtime_row(
+    app: &TestApp,
+    agent_id: uuid::Uuid,
+) -> orbit_store::agent_runtimes::AgentRuntime {
+    sqlx::query_as("SELECT * FROM agent_runtimes WHERE org_id = $1 AND agent_id = $2")
+        .bind(app.org_id)
+        .bind(agent_id)
+        .fetch_one(&raw_pool().await)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn runtime_backs_off_then_continues_after_failed_execution() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let runtime = app
+        .store
+        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
+        .await
+        .unwrap();
+    let pool = raw_pool().await;
+
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let first = runtime_row(&app, agent_id).await.last_execution_id.unwrap();
+    fail_execution(&pool, first).await;
+    make_runtime_due(&pool, runtime.id).await;
+
+    // Failure is accounted for and delays the next run; no new execution yet.
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.status, "running");
+    assert_eq!(row.consecutive_failures, 1);
+    assert_eq!(row.failed_execution_id, Some(first));
+    assert_eq!(row.last_execution_id, Some(first));
+    assert!(row.last_error.as_deref().unwrap().contains("boom"));
+    assert!(row.next_run_at > chrono::Utc::now() + chrono::Duration::seconds(30));
+
+    // Not yet due: still nothing new, and the failure is not double counted.
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.consecutive_failures, 1);
+    assert_eq!(row.last_execution_id, Some(first));
+
+    // Backoff elapsed: the next tick creates a new execution.
+    make_runtime_due(&pool, runtime.id).await;
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    let second = row.last_execution_id.unwrap();
+    assert_ne!(second, first, "runtime must continue after a failure");
+    assert_eq!(row.consecutive_failures, 1, "reset only after a success");
+    assert!(row.last_error.is_none());
+
+    // A successful execution resets the counter on the following launch.
+    sqlx::query("UPDATE executions SET status = 'succeeded', finished_at = now() WHERE id = $1")
+        .bind(second)
+        .execute(&pool)
+        .await
+        .unwrap();
+    make_runtime_due(&pool, runtime.id).await;
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    assert_ne!(row.last_execution_id, Some(second));
+    assert_eq!(row.consecutive_failures, 0);
+    assert!(row.failed_execution_id.is_none());
+}
+
+#[tokio::test]
+async fn runtime_stops_after_consecutive_failures() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let runtime = app
+        .store
+        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
+        .await
+        .unwrap();
+    let pool = raw_pool().await;
+    let limit = orbit_api::background::RUNTIME_MAX_CONSECUTIVE_FAILURES;
+
+    for round in 1..=limit {
+        make_runtime_due(&pool, runtime.id).await;
+        orbit_api::background::runtime_tick(&app.state)
+            .await
+            .unwrap();
+        let id = runtime_row(&app, agent_id).await.last_execution_id.unwrap();
+        fail_execution(&pool, id).await;
+        make_runtime_due(&pool, runtime.id).await;
+        orbit_api::background::runtime_tick(&app.state)
+            .await
+            .unwrap();
+        let row = runtime_row(&app, agent_id).await;
+        assert_eq!(row.consecutive_failures, round);
+        if round < limit {
+            assert_eq!(row.status, "running");
+        }
+    }
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.status, "stopped");
+    assert!(row.last_error.as_deref().unwrap().contains(&format!(
+        "stopped after {limit} consecutive failed executions"
+    )));
+}

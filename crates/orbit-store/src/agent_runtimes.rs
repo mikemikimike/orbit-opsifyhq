@@ -19,6 +19,10 @@ pub struct AgentRuntime {
     pub last_error: Option<String>,
     pub next_run_at: DateTime<Utc>,
     pub interval_seconds: i32,
+    /// Failed executions in a row; reset when an execution succeeds.
+    pub consecutive_failures: i32,
+    /// Last failed execution already counted and backed off from.
+    pub failed_execution_id: Option<Uuid>,
     pub last_heartbeat_at: DateTime<Utc>,
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
@@ -133,6 +137,74 @@ impl Store {
         .bind(status)
         .bind(last_execution_id)
         .bind(last_error)
+        .bind(next_run_at)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound("agent runtime".into()))
+    }
+
+    /// Record a failed execution: bump the counter, remember which execution it was and
+    /// schedule the next attempt (or stop the runtime) in one statement.
+    pub async fn record_agent_runtime_failure(
+        &self,
+        runtime_id: Uuid,
+        status: &str,
+        failed_execution_id: Uuid,
+        consecutive_failures: i32,
+        last_error: &str,
+        next_run_at: DateTime<Utc>,
+    ) -> StoreResult<AgentRuntime> {
+        sqlx::query_as::<_, AgentRuntime>(
+            r#"
+            UPDATE agent_runtimes
+            SET status = $2,
+                failed_execution_id = $3,
+                consecutive_failures = $4,
+                last_error = $5,
+                next_run_at = $6,
+                updated_at = now(),
+                stopped_at = CASE WHEN $2 = 'stopped' THEN now() ELSE stopped_at END
+            WHERE id = $1
+            RETURNING *
+            "#,
+        )
+        .bind(runtime_id)
+        .bind(status)
+        .bind(failed_execution_id)
+        .bind(consecutive_failures)
+        .bind(last_error)
+        .bind(next_run_at)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound("agent runtime".into()))
+    }
+
+    /// Record a newly created execution. `reset_failures` clears the failure counter and
+    /// is set when the previous execution did not fail.
+    pub async fn record_agent_runtime_launch(
+        &self,
+        runtime_id: Uuid,
+        execution_id: Uuid,
+        reset_failures: bool,
+        next_run_at: DateTime<Utc>,
+    ) -> StoreResult<AgentRuntime> {
+        sqlx::query_as::<_, AgentRuntime>(
+            r#"
+            UPDATE agent_runtimes
+            SET status = 'running',
+                last_execution_id = $2,
+                last_error = NULL,
+                consecutive_failures = CASE WHEN $3 THEN 0 ELSE consecutive_failures END,
+                failed_execution_id = CASE WHEN $3 THEN NULL ELSE failed_execution_id END,
+                next_run_at = $4,
+                updated_at = now()
+            WHERE id = $1
+            RETURNING *
+            "#,
+        )
+        .bind(runtime_id)
+        .bind(execution_id)
+        .bind(reset_failures)
         .bind(next_run_at)
         .fetch_optional(&self.pool)
         .await?

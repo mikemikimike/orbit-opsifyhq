@@ -11,6 +11,7 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 ### Fixed
 
 - A failing continuous runtime no longer stops every other runtime from advancing: tick errors are isolated per runtime, recorded as `last_error` with backoff (an unknown harness stops the runtime), and tick executions use a deterministic idempotency key so retries do not duplicate (#108).
+- A continuous runtime whose last execution failed now backs off exponentially (from its interval, 30s minimum, capped at 15 minutes) and then continues with a new execution instead of stalling forever; consecutive failures are tracked in `agent_runtimes` (migration 0040), reset on success, and stop the runtime after 5 in a row with an explanatory `last_error` (#150).
 
 ## [0.21.0] - 2026-11-19
 

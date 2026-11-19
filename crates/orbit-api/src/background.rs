@@ -517,10 +517,21 @@ impl From<orbit_store::StoreError> for RuntimeTickError {
     }
 }
 
+const RUNTIME_MIN_BACKOFF_SECONDS: i64 = 30;
 const RUNTIME_MAX_BACKOFF_SECONDS: i64 = 900;
+/// A runtime stops after this many failed executions in a row.
+#[doc(hidden)]
+pub const RUNTIME_MAX_CONSECUTIVE_FAILURES: i32 = 5;
 
-fn runtime_failure_backoff(interval_seconds: i32) -> chrono::Duration {
-    chrono::Duration::seconds((interval_seconds.max(60) as i64).min(RUNTIME_MAX_BACKOFF_SECONDS))
+/// Exponential backoff from the runtime interval (at least 30s), doubling per
+/// consecutive failure and capped at 15 minutes.
+fn runtime_failure_backoff(interval_seconds: i32, failures: i32) -> chrono::Duration {
+    let base = (interval_seconds as i64).max(RUNTIME_MIN_BACKOFF_SECONDS);
+    let doublings = (failures.max(1) - 1).min(16) as u32;
+    chrono::Duration::seconds(
+        base.saturating_mul(1i64 << doublings)
+            .min(RUNTIME_MAX_BACKOFF_SECONDS),
+    )
 }
 
 fn runtime_tick_key(runtime_id: uuid::Uuid, last_execution_id: Option<uuid::Uuid>) -> String {
@@ -550,7 +561,7 @@ pub async fn runtime_tick(state: &AppState) -> anyhow::Result<()> {
             RuntimeTickError::Transient(error) => (
                 "running",
                 error.to_string(),
-                chrono::Utc::now() + runtime_failure_backoff(interval),
+                chrono::Utc::now() + runtime_failure_backoff(interval.max(60), 1),
             ),
         };
         tracing::warn!(%runtime_id, %org_id, status, error = %message, "agent runtime tick failed");
@@ -649,25 +660,46 @@ async fn advance_runtime(
     else {
         return Ok(());
     };
-    if last
+    let last_failed = last
         .as_ref()
-        .is_some_and(|execution| execution.status == "failed")
-    {
-        let _ = state
-            .store
-            .update_agent_runtime(
-                runtime.id,
-                "running",
-                runtime.last_execution_id,
-                last.as_ref()
-                    .and_then(|execution| execution.error.as_ref())
-                    .map(|error| error.to_string())
-                    .as_deref(),
-                chrono::Utc::now()
-                    + chrono::Duration::seconds(runtime.interval_seconds.max(30) as i64),
-            )
-            .await;
-        return Ok(());
+        .filter(|execution| execution.status == "failed");
+    if let Some(failed) = last_failed {
+        // First time this failure is seen: count it and back off. Once accounted for, the
+        // next due tick falls through and creates a new execution.
+        if runtime.failed_execution_id != Some(failed.id) {
+            let failures = runtime.consecutive_failures.saturating_add(1);
+            let reason = failed
+                .error
+                .as_ref()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "execution failed".into());
+            let (status, message, next_run_at) = if failures >= RUNTIME_MAX_CONSECUTIVE_FAILURES {
+                (
+                    "stopped",
+                    format!("stopped after {failures} consecutive failed executions: {reason}"),
+                    chrono::Utc::now(),
+                )
+            } else {
+                (
+                    "running",
+                    reason,
+                    chrono::Utc::now()
+                        + runtime_failure_backoff(runtime.interval_seconds, failures),
+                )
+            };
+            state
+                .store
+                .record_agent_runtime_failure(
+                    runtime.id,
+                    status,
+                    failed.id,
+                    failures,
+                    &message,
+                    next_run_at,
+                )
+                .await?;
+            return Ok(());
+        }
     }
 
     // An unknown harness is a property of the runtime row itself and can never heal:
@@ -735,11 +767,10 @@ async fn advance_runtime(
         .map_err(|error| RuntimeTickError::Transient(error.into()))?;
     state
         .store
-        .update_agent_runtime(
+        .record_agent_runtime_launch(
             runtime.id,
-            "running",
-            Some(execution.id),
-            None,
+            execution.id,
+            last_failed.is_none(),
             chrono::Utc::now() + chrono::Duration::seconds(runtime.interval_seconds as i64),
         )
         .await?;
