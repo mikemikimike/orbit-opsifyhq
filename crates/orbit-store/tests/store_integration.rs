@@ -1386,3 +1386,44 @@ async fn agent_spec_triggers_are_reconciled() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn prune_audit_logs_removes_only_rows_older_than_cutoff() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let append = |action: &'static str| {
+        store.append_audit_log(
+            org,
+            "system",
+            None,
+            None,
+            action,
+            None,
+            None,
+            serde_json::json!({}),
+            None,
+            None,
+        )
+    };
+    append("test.old").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let cutoff = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    append("test.recent").await.unwrap();
+
+    // A cutoff in the past (retention window not yet elapsed) removes nothing of ours.
+    store
+        .prune_audit_logs(chrono::Utc::now() - chrono::Duration::days(365))
+        .await
+        .unwrap();
+    let (rows, _) = store.list_audit_logs(org, 10, None, None).await.unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let removed = store.prune_audit_logs(cutoff).await.unwrap();
+    assert!(removed >= 1);
+    let (rows, _) = store.list_audit_logs(org, 10, None, None).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "test.recent");
+}

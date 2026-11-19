@@ -300,6 +300,8 @@ platform:
   # Archive terminal executions/team runs/worker launches older than this many days.
   # History is retained; the default list just stops showing old runs. 0 disables.
   archiveAfterDays: "30"
+  # Delete audit log entries older than this many days. 0 keeps them forever.
+  auditRetentionDays: "365"
 
 # Optional Vault wiring (secret retrieval is Phase 2; values are injected as env so
 # Vault Agent / CSI can be used without chart changes).
