@@ -441,6 +441,23 @@ async fn exports_for_every_kind_contain_no_secret_values_or_refs() {
             );
         }
     }
+    // The dedicated agent.yaml route serves the same secret-free document.
+    let agent_id = &seeded.ids[3].1;
+    let reply = call(
+        &env,
+        get(&org, &format!("/api/v1/agents/{agent_id}/export")),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    for secret in SECRET_VALUES {
+        assert!(!reply.text.contains(secret), "agent.yaml leaks {secret}");
+    }
+    assert!(!reply.text.contains("connectionId"));
+    assert!(
+        reply.text.contains("connection: github/gh-a"),
+        "{}",
+        reply.text
+    );
     // Credential-bearing kinds say so; non-secret model params survive.
     let connection = &documents[2];
     assert!(connection.contains("credentials:"), "{connection}");
