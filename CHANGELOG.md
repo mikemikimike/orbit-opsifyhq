@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Changed
+
+- **Behaviour change:** autonomy levels 1 (Observe) and 2 (Recommend) now deny write and
+  external-side-effect capabilities outright instead of creating approvals, matching the
+  documented semantics (#131). Agents at level 1/2 that relied on approvals for writes must
+  be raised to level 3 (Prepare).
+
+### Fixed
+
+- Network egress policy (`spec.resources.network`) is labelled as recorded but not yet
+  enforced in the API schema descriptions and docs; `allowedHosts` now rejects `*`, empty,
+  whitespace and malformed hosts (#131). Re-run `pnpm api:generate` for the updated
+  descriptions.
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

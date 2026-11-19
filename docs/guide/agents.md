@@ -15,7 +15,7 @@ contain an execution loop; a worker runs it through a harness adapter.
 | `spec.connectors` | Connector bindings and the capabilities the agent may request |
 | `spec.triggers` | Manual, schedule (cron), event or webhook |
 | `spec.autonomy` | Level 1–4, approval mode and per-hour quota |
-| `spec.resources` | Execution timeout, concurrency, max output tokens. Worker CPU/memory live on the worker profile |
+| `spec.resources` | Execution timeout, concurrency, max output tokens. Worker CPU/memory live on the worker profile. `network` (egress mode and allowed hosts) is validated and recorded but **not yet enforced** (see below) |
 | `spec.memory` | Whether the agent reads/writes durable memory |
 | `spec.skills` | SKILL.md bundles materialized into the workspace |
 
@@ -23,14 +23,27 @@ contain an execution loop; a worker runs it through a harness adapter.
 
 | Level | Behaviour |
 |---|---|
-| 1 Observe | Read-only capabilities |
-| 2 Recommend | Analyse and propose; writes denied |
+| 1 Observe | Read-only capabilities; writes and side effects are denied |
+| 2 Recommend | Analyse and propose; writes and side effects are denied (no approval path) |
 | 3 Prepare | Writes/side effects require approval |
 | 4 Autonomous | Allowlisted writes execute without approval |
+
+Levels 1 and 2 deny writes regardless of approval mode; an approver cannot override that.
+To allow approval-gated writes, raise the agent to level 3 (Prepare). Reads that are on the
+connector allowlist are allowed at every level.
 
 Approval is enforced by the platform (`evaluate_capability`), never by the prompt. The
 tool policy layer can add argument-level restrictions and approvals on top
 ([tool-policies.md](tool-policies.md)).
+
+## Network egress (not enforced yet)
+
+`spec.resources.network` (`mode`: `default`, `allowlist`, `denied`; `allowedHosts`) is
+validated and stored with the agent version, but **the platform does not enforce it**: no
+worker or harness adapter reads it. Do not rely on it for isolation. Restrict outbound
+traffic at the network layer instead, for example with a Kubernetes NetworkPolicy for the
+worker or Job pods. `allowedHosts` accepts hostnames and `*.domain` patterns; a bare `*`,
+empty or malformed entries are rejected.
 
 ## Lifecycle
 
