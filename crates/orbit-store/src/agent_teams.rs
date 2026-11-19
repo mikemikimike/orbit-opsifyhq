@@ -236,6 +236,62 @@ impl Store {
         .await?)
     }
 
+    /// Take the advance lease for a running run. Only one caller (replica) holds it at a
+    /// time; an expired lease (crashed holder) can be taken over.
+    pub async fn claim_team_run_advance(
+        &self,
+        run_id: Uuid,
+        lease_secs: i64,
+    ) -> StoreResult<Option<TeamRun>> {
+        Ok(sqlx::query_as::<_, TeamRun>(
+            r#"
+            UPDATE team_runs
+            SET advance_claimed_at = now()
+            WHERE id = $1 AND status = 'running'
+              AND (advance_claimed_at IS NULL
+                   OR advance_claimed_at < now() - make_interval(secs => $2::double precision))
+            RETURNING *
+            "#,
+        )
+        .bind(run_id)
+        .bind(lease_secs as f64)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn release_team_run_advance(&self, run_id: Uuid) -> StoreResult<()> {
+        sqlx::query("UPDATE team_runs SET advance_claimed_at = NULL WHERE id = $1")
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Move a `running` run to a terminal status. `None` when it was no longer running.
+    pub async fn finish_team_run(
+        &self,
+        run_id: Uuid,
+        status: &str,
+        output: Option<&Value>,
+        error: Option<&str>,
+    ) -> StoreResult<Option<TeamRun>> {
+        Ok(sqlx::query_as::<_, TeamRun>(
+            r#"
+            UPDATE team_runs
+            SET status = $2, output = COALESCE($3, output), error = $4,
+                finished_at = now(), updated_at = now()
+            WHERE id = $1 AND status = 'running'
+            RETURNING *
+            "#,
+        )
+        .bind(run_id)
+        .bind(status)
+        .bind(output)
+        .bind(error)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn update_team_run(
         &self,
         run_id: Uuid,
@@ -319,19 +375,20 @@ impl Store {
         .await?)
     }
 
+    /// Conditional on `status = 'running'`; `None` means another caller already finished it.
     pub async fn finish_team_step(
         &self,
         step_id: Uuid,
         status: &str,
         output: Option<&Value>,
         error: Option<&str>,
-    ) -> StoreResult<TeamStep> {
-        sqlx::query_as::<_, TeamStep>(
+    ) -> StoreResult<Option<TeamStep>> {
+        Ok(sqlx::query_as::<_, TeamStep>(
             r#"
             UPDATE team_steps
             SET status = $2, output = $3, error = $4,
                 finished_at = now(), updated_at = now()
-            WHERE id = $1
+            WHERE id = $1 AND status = 'running'
             RETURNING *
             "#,
         )
@@ -339,9 +396,8 @@ impl Store {
         .bind(status)
         .bind(output)
         .bind(error)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(Into::into)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     pub async fn set_team_step_execution(

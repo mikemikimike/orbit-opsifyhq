@@ -6,6 +6,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Team runs: `advance` is safe to run on every API replica. A per-run lease makes concurrent callers a no-op, step finish is conditional (`WHERE status = 'running'`), and the state machine resumes from "step succeeded, next step missing" instead of stranding the run; a next step that cannot start for 5 minutes fails the run with a clear error (#113).
+- Team queue: queue outcomes are retried. A terminal run whose queue item is still `running` (e.g. the source connection errored) is reconciled on later ticks; source label/comment side effects are idempotent and applied before the item is closed (#113).
+- Team queue: starting an item claims it atomically first (`pending|failed -> running`), so double clicks, manual run vs auto-run and multiple replicas start exactly one run. A failed launch cancels the run and its execution and leaves the item `failed` (#113).
+- Team queue: `retry`/`requeue`/`cancel` are conditional and can no longer revive or touch `succeeded` items; `retry` respects `max_attempts`; stale claims without a run are released after 10 minutes (#113).
+- Work-source dispatcher enqueues before claiming the provider issue, so a database error no longer loses the issue (#113).
+- Team queue queries are bounded and have a stable `(created_at, id)` order; new unique index on `team_queue_items(team_run_id)` and a status CHECK constraint (migration 0041) (#113).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

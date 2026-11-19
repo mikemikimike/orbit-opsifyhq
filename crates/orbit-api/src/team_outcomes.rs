@@ -20,6 +20,18 @@ struct WorkSourceConnector {
     client: reqwest::Client,
 }
 
+/// After this long, give up retrying source-side side effects (labels/comments) and just
+/// close the queue item, so a permanently broken connection cannot pin it `running`.
+const OUTCOME_RETRY_WINDOW_SECS: i64 = 3600;
+
+/// Apply a terminal run's outcome to the queue item and its source issue.
+///
+/// Ordering is what makes this retryable: the source-side side effects run first and the
+/// queue item is only closed (status leaves `running`) once they succeeded. Any error is
+/// returned with the item still `running` and the run terminal, which is exactly the
+/// marker `list_team_runs_pending_outcome` selects, so a later tick retries. Side effects
+/// are idempotent (labels are recomputed from the issue's current labels, and an issue that
+/// already carries the done label is not commented on again).
 pub(crate) async fn close_queue_loop(
     state: &AppState,
     run: &TeamRun,
@@ -30,63 +42,88 @@ pub(crate) async fn close_queue_loop(
     let Some(item) = state.store.get_team_queue_item_by_run(run.id).await? else {
         return Ok(());
     };
+    if item.status != "running" {
+        return Ok(());
+    }
+    let expired = run
+        .finished_at
+        .map(|at| (chrono::Utc::now() - at).num_seconds() > OUTCOME_RETRY_WINDOW_SECS)
+        .unwrap_or(false);
     let definition = definition_for_run(state, run).await;
     let source = definition
         .as_ref()
         .and_then(|definition| definition.work_source.clone());
     let connector = match source {
-        Some(source) => connector_for_work_source(state, run.org_id, &source).await?,
+        Some(source) => match connector_for_work_source(state, run.org_id, &source).await {
+            Ok(connector) => connector,
+            // A deleted connection can never come back: skip side effects, close the item.
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<orbit_store::StoreError>(),
+                    Some(orbit_store::StoreError::NotFound(_))
+                ) =>
+            {
+                tracing::warn!(%error, queue_item = %item.id, "work source connection is gone; skipping outcome side effects");
+                None
+            }
+            Err(error) if expired => {
+                tracing::warn!(%error, queue_item = %item.id, "giving up on outcome side effects");
+                None
+            }
+            Err(error) => return Err(error),
+        },
         None => None,
     };
 
+    let retry = status == "failed" && item.max_attempts > item.attempts + 1;
+    let outcome = match status {
+        "succeeded" => "done",
+        "failed" if retry => "retry",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => return Ok(()),
+    };
+    if let Some(connector) = &connector {
+        let applied = apply_outcome(
+            connector,
+            &item,
+            outcome,
+            if outcome == "done" { output } else { None },
+        )
+        .await;
+        match applied {
+            Ok(()) => {}
+            Err(error) if expired => {
+                tracing::warn!(%error, queue_item = %item.id, "giving up on outcome side effects");
+            }
+            Err(error) => return Err(error),
+        }
+    }
     match status {
         "succeeded" => {
             state
                 .store
-                .set_team_queue_status_by_run(run.id, "succeeded", None)
+                .close_team_queue_item_by_run(run.id, "succeeded", None)
                 .await?;
-            if let Some(connector) = &connector {
-                if let Err(error) = apply_outcome(connector, &item, "done", output).await {
-                    tracing::warn!(%error, queue_item = %item.id, "failed to apply done outcome to issue");
-                }
-            }
         }
-        "failed" => {
-            let retry = item.max_attempts > item.attempts + 1;
-            if retry {
-                state
-                    .store
-                    .retry_team_queue_item(run.org_id, item.id, error)
-                    .await?;
-                if let Some(connector) = &connector {
-                    if let Err(error) = apply_outcome(connector, &item, "retry", None).await {
-                        tracing::warn!(%error, queue_item = %item.id, "failed to release claim for retry");
-                    }
-                }
-            } else {
-                state
-                    .store
-                    .set_team_queue_status_by_run(run.id, "failed", error)
-                    .await?;
-                if let Some(connector) = &connector {
-                    if let Err(error) = apply_outcome(connector, &item, "failed", None).await {
-                        tracing::warn!(%error, queue_item = %item.id, "failed to apply failed outcome to issue");
-                    }
-                }
-            }
-        }
-        "cancelled" => {
+        "failed" if retry => {
             state
                 .store
-                .set_team_queue_status_by_run(run.id, "cancelled", error)
+                .release_team_queue_item_for_retry(run.id, error)
                 .await?;
-            if let Some(connector) = &connector {
-                if let Err(error) = apply_outcome(connector, &item, "cancelled", None).await {
-                    tracing::warn!(%error, queue_item = %item.id, "failed to release claim on cancel");
-                }
-            }
         }
-        _ => {}
+        "failed" => {
+            state
+                .store
+                .close_team_queue_item_by_run(run.id, "failed", error)
+                .await?;
+        }
+        _ => {
+            state
+                .store
+                .close_team_queue_item_by_run(run.id, "cancelled", error)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -165,16 +202,12 @@ async fn apply_outcome(
                 .or_else(|| connector.source.repository.clone())
                 .ok_or_else(|| anyhow::anyhow!("queue item has no repository"))?;
             let current = current_labels(connector, &repository, number, None).await?;
+            // The done label is written last, so its presence means the outcome (comment
+            // included) was fully applied by an earlier attempt.
+            if outcome == "done" && current.contains(&connector.source.done_label) {
+                return Ok(());
+            }
             let labels = github_outcome_labels(&connector.source, &current, outcome);
-            work_sources::update_github_labels(
-                &connector.client,
-                &connector.base_url,
-                connector.token.as_deref(),
-                &repository,
-                number,
-                &labels,
-            )
-            .await?;
             if outcome == "done" {
                 let body = success_comment(output);
                 work_sources::comment_github(
@@ -187,6 +220,15 @@ async fn apply_outcome(
                 )
                 .await?;
             }
+            work_sources::update_github_labels(
+                &connector.client,
+                &connector.base_url,
+                connector.token.as_deref(),
+                &repository,
+                number,
+                &labels,
+            )
+            .await?;
         }
         "gitlab" => {
             let project = item
@@ -195,17 +237,12 @@ async fn apply_outcome(
                 .or_else(|| connector.source.project.clone())
                 .ok_or_else(|| anyhow::anyhow!("queue item has no GitLab project"))?;
             let current = current_labels(connector, &project, number, Some(&project)).await?;
+            // The done label is written last, so its presence means the outcome (comment
+            // included) was fully applied by an earlier attempt.
+            if outcome == "done" && current.contains(&connector.source.done_label) {
+                return Ok(());
+            }
             let (add, remove) = gitlab_outcome_labels(&connector.source, &current, outcome);
-            work_sources::update_gitlab_labels(
-                &connector.client,
-                &connector.base_url,
-                connector.token.as_deref(),
-                &project,
-                number,
-                &add,
-                &remove,
-            )
-            .await?;
             if outcome == "done" {
                 let body = success_comment(output);
                 work_sources::comment_gitlab(
@@ -218,6 +255,16 @@ async fn apply_outcome(
                 )
                 .await?;
             }
+            work_sources::update_gitlab_labels(
+                &connector.client,
+                &connector.base_url,
+                connector.token.as_deref(),
+                &project,
+                number,
+                &add,
+                &remove,
+            )
+            .await?;
         }
         other => anyhow::bail!("unsupported work source provider '{other}'"),
     }

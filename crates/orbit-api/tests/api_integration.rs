@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 struct TestApp {
     router: axum::Router,
+    state: AppState,
     store: Store,
     org_id: Uuid,
     agent_id: Uuid,
@@ -112,7 +113,8 @@ async fn test_app(allow_anonymous: bool) -> Option<TestApp> {
 
     let created = create_demo_agent(&store, org.id, user.id).await;
     Some(TestApp {
-        router: build_router(state),
+        router: build_router(state.clone()),
+        state,
         store,
         org_id: org.id,
         agent_id: created,
@@ -1304,4 +1306,470 @@ async fn same_agent_queues_on_different_harnesses() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(second["harnessKind"], "pi");
+}
+
+// ---------------------------------------------------------------------------
+// #113: team run / queue state transitions
+// ---------------------------------------------------------------------------
+
+async fn pool() -> sqlx::PgPool {
+    sqlx::PgPool::connect(&std::env::var("ORBIT_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap()
+}
+
+async fn make_team(app: &TestApp, steps: Vec<Uuid>, extra: Value) -> Uuid {
+    let mut definition = json!({
+        "mode": "pipeline",
+        "instructions": "do the work",
+        "steps": steps.iter().map(|id| json!({ "agentId": id })).collect::<Vec<_>>(),
+    });
+    for (key, value) in extra.as_object().cloned().unwrap_or_default() {
+        definition[key] = value;
+    }
+    app.store
+        .create_agent_team(app.org_id, "T", "", &definition, None)
+        .await
+        .unwrap()
+        .id
+}
+
+async fn start_run(app: &TestApp, team_id: Uuid) -> Uuid {
+    let (status, body) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/agent-teams/{team_id}/runs"),
+            json!({ "task": "go" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["run"]["id"].as_str().unwrap().parse().unwrap()
+}
+
+async fn succeed_current_step(app: &TestApp, run_id: Uuid) {
+    let step = app.store.current_team_step(run_id).await.unwrap().unwrap();
+    app.store
+        .finish_execution(
+            step.execution_id.unwrap(),
+            orbit_domain::ExecutionStatus::Succeeded,
+            Some(&json!({ "summary": "ok" })),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+async fn advance_concurrently(
+    state: &AppState,
+    run: &orbit_store::TeamRun,
+    n: usize,
+) -> Vec<anyhow::Result<()>> {
+    let mut tasks = Vec::new();
+    for _ in 0..n {
+        let state = state.clone();
+        let run = run.clone();
+        tasks.push(tokio::spawn(async move {
+            orbit_api::handlers::teams::advance(&state, run).await
+        }));
+    }
+    let mut out = Vec::new();
+    for task in tasks {
+        out.push(task.await.unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn concurrent_advance_creates_one_execution_per_step() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let team = make_team(&app, vec![app.agent_id, app.agent_id], json!({})).await;
+    let run_id = start_run(&app, team).await;
+    succeed_current_step(&app, run_id).await;
+    let run = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    let results = advance_concurrently(&app.state, &run, 4).await;
+    assert!(results.iter().all(|result| result.is_ok()), "{results:?}");
+    let steps = app.store.list_team_steps(run_id).await.unwrap();
+    assert_eq!(steps.len(), 2);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM executions WHERE team_run_id = $1 AND team_step_index = 1",
+    )
+    .bind(run_id)
+    .fetch_one(&pool().await)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "exactly one execution for step 1");
+
+    // Finishing the last step succeeds the run exactly once, even when raced.
+    succeed_current_step(&app, run_id).await;
+    let run = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    advance_concurrently(&app.state, &run, 4).await;
+    let run = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    assert_eq!(run.status, "succeeded");
+}
+
+#[tokio::test]
+async fn advance_resumes_after_step_finished_without_next_step() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let team = make_team(&app, vec![app.agent_id, app.agent_id], json!({})).await;
+    let run_id = start_run(&app, team).await;
+    // Simulate a tick that died right after finishing step 0.
+    let step = app.store.current_team_step(run_id).await.unwrap().unwrap();
+    app.store
+        .finish_team_step(step.id, "succeeded", Some(&json!({ "x": 1 })), None)
+        .await
+        .unwrap()
+        .unwrap();
+    // A second finish is a no-op instead of overwriting.
+    assert!(app
+        .store
+        .finish_team_step(step.id, "failed", None, Some("late"))
+        .await
+        .unwrap()
+        .is_none());
+    let run = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    orbit_api::handlers::teams::advance(&app.state, run)
+        .await
+        .unwrap();
+    assert_eq!(app.store.list_team_steps(run_id).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn failed_next_step_start_is_retried_then_fails_the_run() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    // Second step references an agent that does not exist: start_step fails.
+    let team = make_team(&app, vec![app.agent_id, Uuid::now_v7()], json!({})).await;
+    let run_id = start_run(&app, team).await;
+    succeed_current_step(&app, run_id).await;
+    let run = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+
+    // Within the retry window: error, run stays running, step stays succeeded (retryable).
+    assert!(orbit_api::handlers::teams::advance(&app.state, run.clone())
+        .await
+        .is_err());
+    let run_now = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    assert_eq!(run_now.status, "running");
+    let step = app.store.current_team_step(run_id).await.unwrap().unwrap();
+    assert_eq!(step.status, "succeeded");
+    // The lease was released, so the next tick retries.
+    assert!(orbit_api::handlers::teams::advance(&app.state, run.clone())
+        .await
+        .is_err());
+
+    // Past the window: the run fails with a clear error instead of retrying forever.
+    sqlx::query("UPDATE team_steps SET finished_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(step.id)
+        .execute(&pool().await)
+        .await
+        .unwrap();
+    orbit_api::handlers::teams::advance(&app.state, run)
+        .await
+        .unwrap();
+    let run_now = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    assert_eq!(run_now.status, "failed");
+    assert!(run_now.error.unwrap().contains("could not start step 2"));
+}
+
+async fn queue_item(app: &TestApp, team: Uuid, key: &str, max_attempts: i32) -> Uuid {
+    app.store
+        .try_enqueue_team_item(
+            app.org_id,
+            team,
+            key,
+            None,
+            &json!({ "task": key }),
+            max_attempts,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn concurrent_queue_start_creates_exactly_one_run() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let team = make_team(&app, vec![app.agent_id], json!({})).await;
+    let item = queue_item(&app, team, "gh#1", 1).await;
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        let router = app.router.clone();
+        tasks.push(tokio::spawn(async move {
+            send(
+                &router,
+                post(
+                    &format!("/api/v1/agent-teams/{team}/queue/{item}/run"),
+                    json!({}),
+                ),
+            )
+            .await
+            .0
+        }));
+    }
+    let mut created = 0;
+    for task in tasks {
+        let status = task.await.unwrap();
+        if status == StatusCode::CREATED {
+            created += 1;
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT);
+        }
+    }
+    assert_eq!(created, 1);
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM team_runs WHERE team_id = $1")
+        .bind(team)
+        .fetch_one(&pool().await)
+        .await
+        .unwrap();
+    assert_eq!(runs, 1);
+    let stored = app
+        .store
+        .get_team_queue_item(app.org_id, item)
+        .await
+        .unwrap();
+    assert_eq!(stored.status, "running");
+    assert!(stored.team_run_id.is_some());
+}
+
+#[tokio::test]
+async fn failed_launch_leaves_no_running_orphan() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    // auto_launch with a worker profile that does not exist: launch fails after the run
+    // and its step/execution were created.
+    let team = make_team(
+        &app,
+        vec![app.agent_id],
+        json!({ "autoLaunch": true, "workerProfileId": Uuid::now_v7() }),
+    )
+    .await;
+    let item = queue_item(&app, team, "gh#2", 3).await;
+    let (status, _) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/agent-teams/{team}/queue/{item}/run"),
+            json!({}),
+        ),
+    )
+    .await;
+    assert!(!status.is_success(), "{status}");
+    let stored = app
+        .store
+        .get_team_queue_item(app.org_id, item)
+        .await
+        .unwrap();
+    assert_eq!(stored.status, "failed");
+    assert!(stored.team_run_id.is_none());
+    assert!(stored.error.is_some());
+    let running: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM team_runs WHERE team_id = $1 AND status = 'running'",
+    )
+    .bind(team)
+    .fetch_one(&pool().await)
+    .await
+    .unwrap();
+    assert_eq!(running, 0);
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM executions e JOIN team_runs r ON r.id = e.team_run_id
+         WHERE r.team_id = $1
+           AND e.status NOT IN ('cancelled','failed','succeeded','timed_out','rejected')",
+    )
+    .bind(team)
+    .fetch_one(&pool().await)
+    .await
+    .unwrap();
+    assert_eq!(live, 0, "no executable orphan execution");
+    // The failed item is retryable.
+    assert!(app
+        .store
+        .claim_team_queue_item(app.org_id, item)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn retry_and_requeue_cannot_revive_succeeded_and_retry_respects_max_attempts() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let team = make_team(&app, vec![app.agent_id], json!({})).await;
+    let done = queue_item(&app, team, "gh#3", 3).await;
+    app.store
+        .set_team_queue_status(app.org_id, done, "succeeded", None)
+        .await
+        .unwrap();
+    for action in ["retry", "requeue", "cancel"] {
+        let (status, _) = send(
+            &app.router,
+            post(
+                &format!("/api/v1/agent-teams/{team}/queue/{done}/{action}"),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{action}");
+    }
+    assert_eq!(
+        app.store
+            .get_team_queue_item(app.org_id, done)
+            .await
+            .unwrap()
+            .status,
+        "succeeded"
+    );
+
+    // max_attempts = 1: the first manual retry is allowed, the next is refused.
+    let failed = queue_item(&app, team, "gh#4", 1).await;
+    app.store
+        .set_team_queue_status(app.org_id, failed, "failed", Some("boom"))
+        .await
+        .unwrap();
+    let url = format!("/api/v1/agent-teams/{team}/queue/{failed}/retry");
+    let (status, body) = send(&app.router, post(&url, json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "pending");
+    assert_eq!(body["attempts"], 1);
+    app.store
+        .set_team_queue_status(app.org_id, failed, "failed", Some("boom"))
+        .await
+        .unwrap();
+    let (status, _) = send(&app.router, post(&url, json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // requeue is the explicit reset.
+    let (status, _) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/agent-teams/{team}/queue/{failed}/requeue"),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn terminal_run_with_unclosed_queue_item_is_reconciled() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let team = make_team(&app, vec![app.agent_id], json!({})).await;
+    let item = queue_item(&app, team, "gh#5", 1).await;
+    app.store
+        .claim_team_queue_item(app.org_id, item)
+        .await
+        .unwrap()
+        .unwrap();
+    let run = app
+        .store
+        .create_team_run(app.org_id, team, &json!({}), None)
+        .await
+        .unwrap();
+    assert!(app
+        .store
+        .attach_team_run_to_queue_item(app.org_id, item, run.id)
+        .await
+        .unwrap());
+    // Run reached a terminal state but close_queue_loop never completed.
+    app.store
+        .finish_team_run(run.id, "failed", None, Some("boom"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        app.store
+            .get_team_queue_item(app.org_id, item)
+            .await
+            .unwrap()
+            .status,
+        "running"
+    );
+    orbit_api::handlers::teams::reconcile_team_outcomes(&app.state)
+        .await
+        .unwrap();
+    let stored = app
+        .store
+        .get_team_queue_item(app.org_id, item)
+        .await
+        .unwrap();
+    assert_eq!(stored.status, "failed");
+    assert_eq!(stored.error.as_deref(), Some("boom"));
+}
+
+#[tokio::test]
+async fn enqueue_happens_before_claim_and_claim_failure_withdraws_the_item() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    use orbit_api::dispatcher::{enqueue_then_claim, EnqueueOutcome};
+    let team_id = make_team(&app, vec![app.agent_id], json!({})).await;
+    let team = app.store.get_agent_team(app.org_id, team_id).await.unwrap();
+    let payload = json!({ "task": "t" });
+
+    // Claim only runs after the item is durable.
+    let store = app.store.clone();
+    let outcome = enqueue_then_claim(
+        &app.store,
+        &team,
+        "gh#6",
+        None,
+        &payload,
+        1,
+        || async move {
+            let keys = store.list_team_queue_external_keys(team_id, 10).await?;
+            anyhow::ensure!(
+                keys.contains(&"gh#6".to_string()),
+                "item not enqueued before claim"
+            );
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, EnqueueOutcome::Enqueued);
+
+    // Already queued: no claim attempted.
+    let outcome = enqueue_then_claim(&app.store, &team, "gh#6", None, &payload, 1, || async {
+        anyhow::bail!("must not claim")
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome, EnqueueOutcome::AlreadyQueued);
+
+    // Claim failure withdraws the item so the next poll retries.
+    let outcome = enqueue_then_claim(&app.store, &team, "gh#7", None, &payload, 1, || async {
+        anyhow::bail!("label update failed")
+    })
+    .await
+    .unwrap();
+    assert!(matches!(outcome, EnqueueOutcome::ClaimFailed(_)));
+    let keys = app
+        .store
+        .list_team_queue_external_keys(team_id, 10)
+        .await
+        .unwrap();
+    assert!(!keys.contains(&"gh#7".to_string()));
+
+    // Enqueue (database) failure: the claim is never attempted, so the issue keeps its labels.
+    let mut broken = team.clone();
+    broken.id = Uuid::now_v7();
+    let claimed = std::sync::atomic::AtomicBool::new(false);
+    let result = enqueue_then_claim(&app.store, &broken, "gh#8", None, &payload, 1, || async {
+        claimed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    })
+    .await;
+    assert!(result.is_err());
+    assert!(!claimed.load(std::sync::atomic::Ordering::SeqCst));
 }
