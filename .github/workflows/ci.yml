@@ -155,7 +155,11 @@ jobs:
         run: helm lint deploy/helm/orbit
 
       - name: helm template
-        run: helm template orbit deploy/helm/orbit -n orbit -f deploy/helm/orbit/values.yaml > /dev/null
+        # Default values use dev auth behind the ingress; acknowledge it so the render check
+        # works with the production guardrails from #128 (ignored by charts without them).
+        run: >-
+          helm template orbit deploy/helm/orbit -n orbit -f deploy/helm/orbit/values.yaml
+          --set auth.acknowledgeInsecureDev=true > /dev/null
 
   # ---------------------------------------------------------------- image build check
   # PR-time proof that the Dockerfiles still build. Nothing is pushed or logged in, so it
