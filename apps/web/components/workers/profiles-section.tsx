@@ -10,6 +10,7 @@ import type { useWorkerProfiles } from "@/lib/queries";
 import type { WorkerLaunch, WorkerProfile } from "@/lib/types";
 import { errorMessage } from "@orbit/api-client";
 
+import type { SectionId } from "./editor-sections";
 import { isActive } from "./shared";
 import { WorkerCard } from "./worker-card";
 
@@ -39,7 +40,7 @@ export function ProfilesSection({
   onLaunch: (profile: WorkerProfile) => void;
   onRelaunch: (profile: WorkerProfile) => void;
   onBootstrap: (profile: WorkerProfile) => void;
-  onEdit: (profile: WorkerProfile) => void;
+  onEdit: (profile: WorkerProfile, section?: SectionId) => void;
   onToggle: (profile: WorkerProfile) => void;
   onDelete: (profile: WorkerProfile) => void;
 }) {
@@ -89,7 +90,7 @@ export function ProfilesSection({
                 onLaunch={() => onLaunch(profile)}
                 onRelaunch={() => onRelaunch(profile)}
                 onBootstrap={() => onBootstrap(profile)}
-                onEdit={() => onEdit(profile)}
+                onEdit={(section) => onEdit(profile, section)}
                 onToggle={() => onToggle(profile)}
                 onDelete={() => onDelete(profile)}
               />

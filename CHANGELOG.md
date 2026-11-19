@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Changed
+
+- Worker profile editor (#79): one section at a time (Runtime, Model and auth, Agents and
+  skills, Permissions, Environment, Resources, Sharing), with a section nav that shows
+  current values and marks problems, Save always in view, Back/Next, step pills on phones
+  and the section in the URL hash. Saving with a problem opens the first section that has one.
+- Worker profile image version is an explicit choice between following the platform and
+  pinning a tag; pinned tags that differ from the platform show an "Update available" badge.
+- Workers list (#79): denser profile rows with a run-state glyph, the image tag state and
+  one primary Launch/Relaunch action; Bootstrap moved into the overflow menu. Profiles now
+  come first, then Launches, then Live workers.
+- Worker profile page split into components under `apps/web/components/workers/` (#79);
+  no API change.
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

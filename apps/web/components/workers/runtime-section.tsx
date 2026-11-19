@@ -1,3 +1,9 @@
+import { useState } from "react";
+
+import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
+import { ChoiceCard } from "@/components/ui/choice-card";
+import { Disclosure } from "@/components/ui/disclosure";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -56,16 +62,10 @@ export function BasicsFields({ form, providers }: { form: WorkerFormApi; provide
   );
 }
 
-/** Execution driver, image and tag. */
-export function ImageFields({
-  form,
-  platformVersion,
-}: {
-  form: WorkerFormApi;
-  platformVersion: string | undefined;
-}) {
+/** Execution driver and image. The image is rarely changed, so it sits in a disclosure. */
+export function ImageFields({ form }: { form: WorkerFormApi }) {
   const { values, set } = form;
-  const { tag } = values;
+  const defaultImage = DEFAULT_IMAGES[values.harness];
   return (
     <>
       <Field
@@ -78,8 +78,16 @@ export function ImageFields({
           <option value="docker">Docker (container per execution)</option>
         </Select>
       </Field>
-      <div className="grid gap-3 sm:grid-cols-2">
-        <Field label="Image" htmlFor="wp-image">
+      <Disclosure
+        title="Image"
+        summary={<span className="font-mono text-xs">{values.image || "Not set"}</span>}
+        defaultOpen={Boolean(values.image) && values.image !== defaultImage}
+      >
+        <Field
+          label="Image"
+          htmlFor="wp-image"
+          hint="Changing the harness resets this to that harness's published image."
+        >
           <Input
             id="wp-image"
             className="font-mono text-[13px]"
@@ -87,37 +95,85 @@ export function ImageFields({
             onChange={(event) => set({ image: event.target.value })}
           />
         </Field>
-        <Field
-          label="Tag"
-          htmlFor="wp-tag"
-          hint={
-            <>
-              Leave empty to follow the platform&apos;s version; the worker is then relaunched
-              automatically after an upgrade.
-              {platformVersion && tag && tag !== platformVersion ? (
-                <>
-                  {" "}
-                  <button
-                    type="button"
-                    className="text-primary underline-offset-2 hover:underline"
-                    onClick={() => set({ tag: "" })}
-                  >
-                    Follow the platform ({platformVersion})
-                  </button>
-                </>
-              ) : null}
-            </>
+      </Disclosure>
+    </>
+  );
+}
+
+/**
+ * Which image tag the worker runs: the platform's own version (relaunched automatically
+ * after an upgrade) or a pinned one. Pinning an old tag says so.
+ */
+export function VersionFields({
+  form,
+  platformVersion,
+}: {
+  form: WorkerFormApi;
+  platformVersion: string | undefined;
+}) {
+  const { values, set } = form;
+  const { tag } = values;
+  // "Pin a tag" with nothing typed yet is still pinning, so it needs its own state.
+  const [pinning, setPinning] = useState(Boolean(tag));
+  const outdated = Boolean(platformVersion && tag && tag !== platformVersion);
+  return (
+    <div className="space-y-2">
+      <p id="wp-version-label" className="text-sm font-medium">
+        Image version
+      </p>
+      <div role="radiogroup" aria-labelledby="wp-version-label" className="grid gap-2 sm:grid-cols-2">
+        <ChoiceCard
+          selected={!pinning}
+          onSelect={() => {
+            setPinning(false);
+            set({ tag: "" });
+          }}
+          title="Follow the platform"
+          description={
+            platformVersion
+              ? `Runs ${platformVersion} and relaunches automatically after an upgrade.`
+              : "Relaunches automatically after an upgrade."
           }
-        >
+        />
+        <ChoiceCard
+          selected={pinning}
+          onSelect={() => setPinning(true)}
+          title="Pin a tag"
+          description="Stays on one version until you change it."
+        />
+      </div>
+      {pinning ? (
+        <Field label="Tag" htmlFor="wp-tag">
           <Input
             id="wp-tag"
             className="font-mono text-[13px]"
             value={tag}
-            placeholder={platformVersion ? `${platformVersion} (follows the platform)` : "Follows the platform"}
+            placeholder={platformVersion ?? "0.21.0"}
             onChange={(event) => set({ tag: event.target.value })}
           />
         </Field>
-      </div>
-    </>
+      ) : null}
+      {pinning && outdated ? (
+        <Callout
+          tone="warning"
+          title="This tag is not the platform's version"
+          action={
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                setPinning(false);
+                set({ tag: "" });
+              }}
+            >
+              Follow the platform
+            </Button>
+          }
+        >
+          The platform is on {platformVersion}. A worker on {tag} may not match it.
+        </Callout>
+      ) : null}
+    </div>
   );
 }

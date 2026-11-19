@@ -34,23 +34,24 @@ function LaunchRow({
   const active = isActive(item);
   const relaunchRequired = (item as WorkerLaunch & { relaunchRequired?: boolean }).relaunchRequired;
   return (
-    <li className="border-b px-4 py-3.5 last:border-b-0 sm:px-5">
-      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between md:gap-6">
-        <div className="min-w-0 space-y-1">
+    <li className="border-b px-4 py-3 last:border-b-0 sm:px-5">
+      <div className="flex flex-col gap-2.5 md:flex-row md:items-center md:justify-between md:gap-6">
+        <div className="min-w-0 flex-1 space-y-0.5">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <Status meta={launchStatusMeta(item.status)} />
             <p className="min-w-0 truncate text-sm font-semibold">{item.name}</p>
             {relaunchRequired ? <Badge variant="warning">Relaunch required</Badge> : null}
           </div>
           <p className="text-[13px] text-muted-foreground">
-            {targetLabel(item.target)} target.{" "}
+            {targetLabel(item.target)} ·{" "}
             {item.workerId ? (
               <>
-                Worker <span className="break-all font-mono text-xs">{item.workerId}</span>
+                worker <span className="break-all font-mono text-xs">{item.workerId}</span>
               </>
             ) : (
-              "No worker connected from this launch."
-            )}
+              "no worker connected yet"
+            )}{" "}
+            · updated {relativeTime(item.updatedAt)}
           </p>
           <p className="truncate font-mono text-xs text-muted-foreground" title={item.image}>
             {item.image}
@@ -60,19 +61,18 @@ function LaunchRow({
               {launchErrorText(item.error)}
             </p>
           ) : null}
-          <p className="text-xs text-muted-foreground">Updated {relativeTime(item.updatedAt)}</p>
         </div>
-        <div className="flex flex-wrap items-center gap-2 md:shrink-0">
+        <div className="flex items-center gap-2 md:shrink-0">
           {active ? (
-            <Button size="sm" variant="outline" loading={stopping} onClick={onStop}>
+            <Button size="sm" variant="outline" className="max-md:flex-1" loading={stopping} onClick={onStop}>
               <Square /> Stop
             </Button>
           ) : (
-            <Button size="sm" variant="outline" loading={relaunching} onClick={onRelaunch}>
+            <Button size="sm" variant="outline" className="max-md:flex-1" loading={relaunching} onClick={onRelaunch}>
               <Rocket /> Launch again
             </Button>
           )}
-          <Button size="sm" variant="outline" onClick={onLogs}>
+          <Button size="sm" variant="ghost" className="max-md:flex-1" onClick={onLogs}>
             <ScrollText /> Logs
           </Button>
         </div>

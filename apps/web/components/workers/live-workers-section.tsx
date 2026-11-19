@@ -37,7 +37,7 @@ export function LiveWorkersSection({ workers }: { workers: ReturnType<typeof use
         <EmptyState
           icon={<Server />}
           title="No workers are connected"
-          description="Launch a profile below, or bootstrap one yourself. A worker appears here after its first heartbeat."
+          description="Launch a profile above, or bootstrap one yourself. A worker appears here after its first heartbeat."
         />
       ) : (
         <Card className="overflow-hidden">

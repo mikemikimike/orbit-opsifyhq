@@ -24,15 +24,23 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Status } from "@/components/ui/status";
+import { Status, type StatusMeta } from "@/components/ui/status";
 import { copyText } from "@/lib/browser";
 import { brandName } from "@/lib/presentation";
 import type { WorkerProfile } from "@/lib/types";
 import { relativeTime } from "@/lib/utils";
 
+import type { SectionId } from "./editor-sections";
 import { targetLabel } from "./shared";
 
-/** One worker profile in the Profiles list. */
+/** Whether the profile is running, idle or switched off. Always a glyph plus a word. */
+function runState(runningCount: number, enabled: boolean): StatusMeta {
+  if (runningCount) return { label: `${runningCount} running`, tone: "success", shape: "orbiting" };
+  if (!enabled) return { label: "Disabled", tone: "neutral", shape: "slash" };
+  return { label: "Not running", tone: "neutral", shape: "dashed" };
+}
+
+/** One worker profile in the Profiles list: state, what it runs, and the next action. */
 export function WorkerCard({
   profile,
   runningCount,
@@ -56,80 +64,91 @@ export function WorkerCard({
   onLaunch: () => void;
   onRelaunch: () => void;
   onBootstrap: () => void;
-  onEdit: () => void;
+  onEdit: (section?: SectionId) => void;
   onToggle: () => void;
   onDelete: () => void;
 }) {
   const scoped = (profile as WorkerProfile & { agentScope?: string }).agentScope === "selected";
-  const outdated = platformVersion && profile.imageTag && profile.imageTag !== platformVersion;
+  const following = !profile.imageTag;
+  const updateAvailable = Boolean(platformVersion && profile.imageTag && profile.imageTag !== platformVersion);
+  const shownTag = profile.imageTag || platformVersion || "platform tag";
+  const modelLabel = [profile.provider, profile.model].filter(Boolean).join(" · ");
+
   return (
-    <li className="border-b px-4 py-4 last:border-b-0 sm:px-5">
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between lg:gap-6">
-        <div className="min-w-0 space-y-1.5">
+    <li className="border-b px-4 py-3.5 last:border-b-0 sm:px-5">
+      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between md:gap-6">
+        <div className="min-w-0 flex-1 space-y-1">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-            <p className="min-w-0 break-words text-sm font-semibold">{profile.name}</p>
-            <Badge variant={profile.enabled ? "success" : "outline"}>
-              {profile.enabled ? "Enabled" : "Disabled"}
-            </Badge>
-            {runningCount ? (
-              <Status
-                meta={{
-                  label: `${runningCount} running`,
-                  tone: "success",
-                  shape: "orbiting",
-                }}
-              />
-            ) : null}
+            <h3 className="min-w-0 break-words text-sm font-semibold">{profile.name}</h3>
+            <Status meta={runState(runningCount, profile.enabled)} />
+            {runningCount && !profile.enabled ? <Badge variant="outline">Disabled</Badge> : null}
           </div>
           <p className="text-[13px] text-muted-foreground">
-            {brandName(profile.harnessKind)} worker on {targetLabel(profile.target)}.{" "}
-            {profile.executionDriver === "docker"
-              ? "Starts a container per execution."
-              : "Runs as a long-lived process."}
+            {brandName(profile.harnessKind)} · {targetLabel(profile.target)} ·{" "}
+            {profile.executionDriver === "docker" ? "container per execution" : "long-lived process"}
+            <span className="hidden sm:inline"> · Updated {relativeTime(profile.updatedAt)}</span>
           </p>
-          <p
-            className="truncate font-mono text-xs text-muted-foreground"
-            title={`${profile.image}:${profile.imageTag || platformVersion || "platform tag"}`}
-          >
-            {profile.image}:
-            {profile.imageTag || `${platformVersion ?? "platform tag"} (follows the platform)`}
-          </p>
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+            <p
+              className="min-w-0 max-w-full truncate font-mono text-xs text-muted-foreground"
+              title={`${profile.image}:${shownTag}`}
+            >
+              {profile.image}:{shownTag}
+            </p>
+            {updateAvailable ? (
+              <button
+                type="button"
+                onClick={() => onEdit("runtime")}
+                aria-label={`Update available for ${profile.name}: pinned to ${profile.imageTag}, platform is ${platformVersion}. Open runtime settings.`}
+                title={`Pinned to ${profile.imageTag}; the platform is ${platformVersion}. Edit to follow the platform.`}
+                className="rounded-md"
+              >
+                <Badge variant="warning">Update available</Badge>
+              </button>
+            ) : following ? (
+              <Badge variant="secondary" title="Relaunched automatically after a platform upgrade">
+                Follows platform
+              </Badge>
+            ) : (
+              <Badge variant="outline">Pinned</Badge>
+            )}
+          </div>
           <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
             <Badge variant="secondary">{scoped ? `${profile.agentIds.length} agents` : "All agents"}</Badge>
             <Badge variant="secondary">
               {profile.skillSlugs.length} {profile.skillSlugs.length === 1 ? "skill" : "skills"}
             </Badge>
-            {profile.authSecretName ? (
-              <Badge variant="outline" className="font-mono">
-                <span className="truncate">{profile.authSecretName}</span>
+            {modelLabel ? (
+              <Badge variant="outline" title={modelLabel}>
+                <span className="max-w-[16rem] truncate">{modelLabel}</span>
               </Badge>
             ) : null}
-            {outdated ? (
-              <Badge
-                variant="warning"
-                title={`Profile uses ${profile.imageTag}; platform is ${platformVersion}. Edit and relaunch to update.`}
-              >
-                Image {profile.imageTag}, platform {platformVersion}
-              </Badge>
-            ) : null}
-            <span className="text-xs text-muted-foreground">Updated {relativeTime(profile.updatedAt)}</span>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2 lg:shrink-0 lg:justify-end">
+        <div className="flex items-center gap-2 md:shrink-0">
           {runningCount ? (
-            <Button size="sm" variant="outline" loading={relaunching} onClick={onRelaunch}>
+            <Button
+              size="sm"
+              variant="outline"
+              className="max-md:flex-1"
+              loading={relaunching}
+              onClick={onRelaunch}
+            >
               <RotateCw /> Relaunch
             </Button>
           ) : (
-            <Button size="sm" loading={launching} disabled={launchDisabled} onClick={onLaunch}>
+            <Button
+              size="sm"
+              className="max-md:flex-1"
+              loading={launching}
+              disabled={launchDisabled}
+              onClick={onLaunch}
+            >
               <Rocket /> Launch
             </Button>
           )}
-          <Button size="sm" variant="outline" onClick={onBootstrap}>
-            <Boxes /> Bootstrap
-          </Button>
-          <Button size="sm" variant="outline" onClick={onEdit}>
+          <Button size="sm" variant="outline" className="max-md:flex-1" onClick={() => onEdit()}>
             <Pencil /> Edit
           </Button>
           <DropdownMenu>
@@ -139,6 +158,9 @@ export function WorkerCard({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={onBootstrap}>
+                <Boxes /> Bootstrap by hand
+              </DropdownMenuItem>
               <DropdownMenuItem
                 onSelect={async () => {
                   if (await copyText(profile.id)) toast.success("Profile ID copied");

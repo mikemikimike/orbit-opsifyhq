@@ -86,6 +86,35 @@ export function WorkersView() {
     failedLaunches,
   });
 
+  // The editor takes the whole page; the dialogs below stay available either way.
+  const dialogs = (
+    <>
+      <BootstrapDialog profile={bootstrapProfile} onClose={() => setBootstrapProfile(null)} />
+      <LogsDialog
+        open={actions.logsDialog.open}
+        onOpenChange={actions.logsDialog.onOpenChange}
+        name={actions.logsDialog.launch?.name}
+        logs={actions.logsDialog.logs}
+        loading={actions.logsDialog.loading}
+      />
+    </>
+  );
+
+  if (editor) {
+    return (
+      <>
+        <WorkerEditor
+          key={editorKey}
+          editor={editor}
+          launches={launchList}
+          onClose={() => setEditor(null)}
+          onCreated={setBootstrapProfile}
+        />
+        {dialogs}
+      </>
+    );
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -117,8 +146,6 @@ export function WorkersView() {
         </Callout>
       ) : null}
 
-      <LiveWorkersSection workers={liveWorkers} />
-
       <ProfilesSection
         profiles={profiles}
         launches={launchList}
@@ -130,7 +157,7 @@ export function WorkersView() {
         onLaunch={(profile) => actions.launch.mutate(profile.id)}
         onRelaunch={(profile) => void actions.confirmRelaunchProfile(profile)}
         onBootstrap={setBootstrapProfile}
-        onEdit={(profile) => openEditor({ profile })}
+        onEdit={(profile, section) => openEditor({ profile, section })}
         onToggle={(profile) => actions.toggle.mutate({ id: profile.id, enabled: !profile.enabled })}
         onDelete={(profile) => void actions.confirmDeleteProfile(profile)}
       />
@@ -146,25 +173,9 @@ export function WorkersView() {
         onRelaunch={(item) => actions.launch.mutate(item.profileId)}
       />
 
-      <BootstrapDialog profile={bootstrapProfile} onClose={() => setBootstrapProfile(null)} />
+      <LiveWorkersSection workers={liveWorkers} />
 
-      <LogsDialog
-        open={actions.logsDialog.open}
-        onOpenChange={actions.logsDialog.onOpenChange}
-        name={actions.logsDialog.launch?.name}
-        logs={actions.logsDialog.logs}
-        loading={actions.logsDialog.loading}
-      />
-
-      {editor ? (
-        <WorkerEditor
-          key={editorKey}
-          editor={editor}
-          launches={launchList}
-          onClose={() => setEditor(null)}
-          onCreated={setBootstrapProfile}
-        />
-      ) : null}
+      {dialogs}
     </div>
   );
 }
