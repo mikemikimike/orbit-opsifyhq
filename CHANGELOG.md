@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Schedule triggers: claiming a due trigger now stores its next run in the same
+  transaction, so a crash or deploy can no longer leave an enabled schedule with no
+  next run. Schedules already stuck that way are repaired by the scheduler (#111).
+- Enabling a schedule trigger recomputes its next run from now (#111).
+- Schedule `timezone` is honoured: cron is evaluated in the configured IANA zone
+  (default UTC) and unknown zones are rejected at validation. Adds the `chrono-tz`
+  dependency (#111).
+- Saving a new agent version no longer deletes triggers created through the API; spec
+  triggers keep a stable id when unchanged. New migration `0039_trigger_managed.sql`
+  adds `triggers.managed` (existing rows without an owner or harness are backfilled as
+  spec-managed) (#111).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

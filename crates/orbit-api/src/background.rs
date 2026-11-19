@@ -165,6 +165,11 @@ async fn archive_old_runs(state: &AppState) {
 }
 
 async fn scheduler_tick(state: &AppState) -> anyhow::Result<()> {
+    match state.store.repair_stuck_schedule_triggers().await {
+        Ok(0) => {}
+        Ok(count) => tracing::warn!(count, "repaired schedule triggers with no next run"),
+        Err(error) => tracing::warn!(%error, "schedule trigger repair failed"),
+    }
     for trigger in state.store.claim_due_triggers(10).await? {
         if let Err(error) = fire_trigger(state, trigger).await {
             tracing::warn!(%error, "scheduled trigger failed");
@@ -192,14 +197,7 @@ async fn fire_trigger(state: &AppState, trigger: Trigger) -> anyhow::Result<()> 
 }
 
 async fn fire_trigger_inner(state: &AppState, trigger: Trigger) -> anyhow::Result<()> {
-    let next = trigger
-        .config
-        .get("cron")
-        .and_then(|value| value.as_str())
-        .and_then(|cron| cron.parse::<croner::Cron>().ok())
-        .and_then(|cron| cron.find_next_occurrence(&Utc::now(), false).ok());
-    state.store.reschedule_trigger(trigger.id, next).await?;
-
+    // `claim_due_triggers` already stored the next occurrence atomically with the claim.
     let agent = state
         .store
         .get_agent(trigger.org_id, trigger.agent_id)

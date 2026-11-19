@@ -74,5 +74,6 @@ rand = "0.8"
 hex = "0.4"
 libc = "0.2"
 croner = "4"
+chrono-tz = "0.10"
 regex = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }

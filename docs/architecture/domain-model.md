@@ -100,11 +100,23 @@ backend `SecretStore`; API responses redact them (`has_credential: true`).
 
 ### Trigger
 `kind ∈ {manual, schedule, webhook, event}` (enforced by a CHECK constraint). Config is
-validated per kind: a 5-field cron expression for `schedule`, a subject filter for
+validated per kind: a 5-field cron expression plus an optional IANA `timezone` (default
+UTC; unknown zones are rejected) for `schedule`, a subject filter for
 `event`, an HMAC secret reference for `webhook`. Triggers can be disabled without being
 deleted, and a trigger auto-disables after `max_failures` consecutive failures.
 A `schedule` trigger may also carry a `task`: the text given to the agent each time it
 fires. Without one the run gets a generic "perform your configured task" prompt.
+
+Schedule semantics: the cron expression is evaluated in the trigger's `timezone`, so
+`0 9 * * *` in `Europe/Amsterdam` fires at 09:00 local time across DST changes. The
+scheduler claims a due trigger and stores its next `next_run_at` in the same transaction
+(missed runs are not replayed), and a sweep repairs any enabled schedule trigger left
+with a NULL `next_run_at`. Enabling a trigger recomputes `next_run_at` from now.
+
+Triggers declared in an agent spec are *managed* (`triggers.managed = true`): each new
+agent version replaces only managed rows, keeping the id and history of a spec trigger
+whose kind and config are unchanged. Triggers created through `POST /api/v1/triggers`
+are never modified by version sync.
 
 ### Execution
 Lifecycle:

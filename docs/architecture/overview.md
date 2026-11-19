@@ -77,7 +77,7 @@ Manual execution:
    events and then tails new ones (SSE, `Last-Event-ID` supported).
 
 Scheduled and team-driven executions use the same queued path. Background loops live in
-`orbit-api`: the scheduler claims due cron triggers (`FOR UPDATE SKIP LOCKED`), the team
+`orbit-api`: the scheduler claims due cron triggers and stores their next run atomically (`FOR UPDATE SKIP LOCKED`), the team
 advancer moves pipeline runs forward, the work-source dispatcher enqueues issues, and the
 reaper fails orphaned executions. A worker only needs `ORBIT_API_URL` and a scoped
 `ORBIT_WORKER_TOKEN` — no database, bus or master-key access. Retention and deduplication
