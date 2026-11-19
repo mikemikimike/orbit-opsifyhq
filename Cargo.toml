@@ -20,8 +20,7 @@ version = "0.21.0"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/orbit-platform/orbit"
-authors = ["ORBIT contributors"]
+repository = "https://github.com/opsifyhq/orbit"
 
 [workspace.dependencies]
 orbit-domain = { path = "crates/orbit-domain" }
@@ -63,7 +62,6 @@ http = "1"
 utoipa = { version = "5", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 serde_yaml = "0.9"
-jsonschema = "0.26"
 async-nats = "0.52"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 jsonwebtoken = "9"

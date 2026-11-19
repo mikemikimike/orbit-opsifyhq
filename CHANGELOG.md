@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Changed
+
+- Audit logs are now pruned daily after `ORBIT_AUDIT_RETENTION_DAYS` days (default 365,
+  `0` keeps them forever; Helm `platform.auditRetentionDays`). (#130)
+- Workspace `repository` metadata points at `opsifyhq/orbit` and is inherited by all crates. (#130)
+
+### Removed
+
+- Unused store functions (`delete_memory`, `disable_trigger`, `get_connector`,
+  `get_organization_by_slug`, `get_worker_profile_by_id`, `list_agents_with_harness`,
+  `set_connection_status`, `set_harness_enabled`, `set_team_step_execution`,
+  `update_execution_status`, `update_organization`, `worker_heartbeat_age_seconds`,
+  `list_stale_queued_executions`). (#130)
+- Unused dependencies (`futures`/`tracing` in contracts, `tracing` in domain and harness,
+  workspace `jsonschema`) and the unused workspace `authors` field. (#130)
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
