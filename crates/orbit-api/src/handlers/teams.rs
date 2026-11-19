@@ -163,6 +163,68 @@ pub(crate) fn parse_definition(team: &AgentTeam) -> Result<TeamDefinition, ApiEr
         .map_err(|error| ApiError::internal(format!("team definition is invalid: {error}")))
 }
 
+/// Connections a team run injects beyond the agent specs: the team's shared connections
+/// and an enabled work source connection.
+pub(crate) fn team_connection_ids(definition: &TeamDefinition) -> Vec<Uuid> {
+    let mut ids = definition.connection_ids.clone();
+    if let Some(source) = &definition.work_source {
+        if source.enabled {
+            ids.extend(source.connection_id);
+        }
+    }
+    ids
+}
+
+/// A caller-supplied repository must be one of the team's configured repositories; the
+/// run injects the team's connection credentials, so it must not retarget them.
+fn validate_requested_repositories(
+    definition: &TeamDefinition,
+    payload: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let mut allowed: Vec<String> = Vec::new();
+    allowed.extend(definition.repository.iter().cloned());
+    allowed.extend(
+        definition
+            .repositories
+            .iter()
+            .map(|repository| repository.repository.clone()),
+    );
+    if let Some(source) = &definition.work_source {
+        allowed.extend(source.repository.iter().cloned());
+    }
+    let is_allowed = |value: &str| {
+        allowed
+            .iter()
+            .any(|candidate| candidate.trim().eq_ignore_ascii_case(value.trim()))
+    };
+    if let Some(repository) = payload.get("repository").and_then(|value| value.as_str()) {
+        if !is_allowed(repository) {
+            return Err(ApiError::validation(vec![ValidationIssue::new(
+                "payload.repository",
+                "repository is not one of the team's configured repositories",
+            )]));
+        }
+    }
+    if let Some(items) = payload
+        .get("repositories")
+        .and_then(|value| value.as_array())
+    {
+        for (idx, item) in items.iter().enumerate() {
+            let repository = item
+                .get("repository")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if !is_allowed(repository) {
+                return Err(ApiError::validation(vec![ValidationIssue::new(
+                    format!("payload.repositories[{idx}].repository"),
+                    "repository is not one of the team's configured repositories",
+                )]));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn validate_work_source_connection(
     state: &AppState,
     org_id: Uuid,
@@ -786,19 +848,39 @@ pub(crate) async fn start_step(
             })?,
         },
     };
-    if let Some(record) = state
-        .store
-        .get_harness_by_kind(run.org_id, harness_kind.as_str())
-        .await?
+    // Shared execution preflight (#140), re-evaluated for every step with the identity
+    // that requested the run (falling back to the team owner).
+    let team = state.store.get_agent_team(run.org_id, run.team_id).await?;
+    let team_connections = team_connection_ids(definition);
+    match crate::preflight::background_access(
+        state,
+        run.org_id,
+        &[run.requested_by, team.owner_user_id],
+    )
+    .await?
     {
-        if !record.enabled || record.implementation_status != "available" {
-            return Err(ApiError::validation(vec![ValidationIssue::new(
-                "harness",
-                format!(
-                    "harness '{}' is {} and cannot run team steps",
-                    harness_kind, record.implementation_status
-                ),
-            )]));
+        Some(access) => {
+            access.require_use(
+                "agent team",
+                team.owner_user_id,
+                team.owner_team_id,
+                &team.visibility,
+            )?;
+            crate::preflight::Preflight {
+                state,
+                org_id: run.org_id,
+                access: &access,
+                agent: &agent,
+                spec: &spec,
+                harness: harness_kind,
+                extra_connection_ids: &team_connections,
+            }
+            .run()
+            .await?;
+        }
+        None => {
+            crate::preflight::require_harness_available(state, run.org_id, harness_kind).await?;
+            crate::preflight::require_hourly_quota(state, run.org_id, agent.id, &spec).await?;
         }
     }
     let native = definition.mode == "native";
@@ -901,8 +983,28 @@ pub async fn create_run(
             .count_all_executions_since(auth.org_id, since)
             .await?,
     )?;
-    let team = require_team_view(&state, &auth, team_id).await?;
+    // Running a team needs use (not just view) on the team, its step agents' connections
+    // and providers, and the team's shared connections (#140).
+    let team = state.store.get_agent_team(auth.org_id, team_id).await?;
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    access.require_view(
+        "agent team",
+        team.owner_user_id,
+        team.owner_team_id,
+        &team.visibility,
+    )?;
     let definition = parse_definition(&team)?;
+    let step_agent_ids: Vec<Uuid> = definition.steps.iter().map(|step| step.agent_id).collect();
+    crate::preflight::authorize_team_run(
+        &state,
+        auth.org_id,
+        &access,
+        &team,
+        &step_agent_ids,
+        &team_connection_ids(&definition),
+    )
+    .await?;
+    validate_requested_repositories(&definition, &body.payload)?;
     let task = if body.task.trim().is_empty() {
         definition.instructions.trim()
     } else {
@@ -1063,7 +1165,7 @@ pub(crate) async fn advance(state: &AppState, run: TeamRun) -> anyhow::Result<()
         let next = (current.step_index as usize) + 1;
         if next < definition.steps.len() {
             let run_for_step = state.store.get_team_run(run.org_id, run.id).await?;
-            let created = start_step(
+            let created = match start_step(
                 state,
                 &run_for_step,
                 &definition,
@@ -1071,7 +1173,15 @@ pub(crate) async fn advance(state: &AppState, run: TeamRun) -> anyhow::Result<()
                 execution.output.as_ref(),
             )
             .await
-            .map_err(|error| anyhow::anyhow!(error.message))?;
+            {
+                Ok(created) => created,
+                // Refused by the preflight (access lost, harness/quota): fail the run
+                // instead of retrying the same step every poll.
+                Err(error) if error.status.is_client_error() => {
+                    return crate::preflight::fail_team_run(state, &run, &error).await;
+                }
+                Err(error) => return Err(anyhow::anyhow!(error.message)),
+            };
             if definition.auto_launch {
                 if let (Some(profile_id), Some(execution_id)) =
                     (definition.worker_profile_id, created.execution_id)

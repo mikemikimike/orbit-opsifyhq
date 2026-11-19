@@ -86,20 +86,20 @@ pub async fn start(
             })?,
         },
     };
-    if let Some(record) = state
-        .store
-        .get_harness_by_kind(auth.org_id, harness.as_str())
-        .await?
-    {
-        if !record.enabled || record.implementation_status != "available" {
-            return Err(ApiError::validation(vec![
-                orbit_domain::ValidationIssue::new(
-                    "harness",
-                    format!("harness '{}' is not available", harness),
-                ),
-            ]));
-        }
+    // Shared execution preflight (#140): the same checks every run of this runtime will
+    // face, so a runtime that could never start is rejected up front.
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    crate::preflight::Preflight {
+        state: &state,
+        org_id: auth.org_id,
+        access: &access,
+        agent: &agent,
+        spec: &spec,
+        harness,
+        extra_connection_ids: &[],
     }
+    .run()
+    .await?;
     let task = body
         .task
         .as_deref()
