@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Editing an agent in the web UI no longer drops `spec.harnessConfig` (and `resources.network`, webhook `secret_ref`) from the saved version; a type-level guard now fails the web typecheck if the Zod contract falls behind the API schema (#109).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

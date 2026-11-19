@@ -181,8 +181,6 @@ export function AgentForm({
   const [definition, setDefinition] = useState<AgentDefinition>(() =>
     initial ? structuredClone(initial) : emptyAgentDefinition(),
   );
-  // Harness config is validated on submit but never stored on the agent.
-  const [harnessConfigText] = useState(JSON.stringify(initial?.spec.harness?.config ?? {}, null, 2));
   const [issues, setIssues] = useState<Array<{ path: string; message: string }>>([]);
   const [limitsOpen, setLimitsOpen] = useState(false);
   const meta = useMeta();
@@ -373,14 +371,6 @@ export function AgentForm({
   }, [definition]);
 
   async function handleSubmit() {
-    if (harnessConfigText.trim()) {
-      try {
-        JSON.parse(harnessConfigText);
-      } catch {
-        revealIssues([{ path: "spec.harness.config", message: "must be valid JSON" }]);
-        return;
-      }
-    }
     const parsed = agentDefinitionSchema.safeParse(buildCandidate());
     if (!parsed.success) {
       revealIssues(

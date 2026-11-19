@@ -49,7 +49,8 @@ export const triggerSchema = z.discriminatedUnion("type", [
     /** What the agent is asked to do each time the schedule fires. */
     task: z.string().max(20000).optional(),
   }),
-  z.object({ type: z.literal("webhook"), secretRef: z.string().optional() }),
+  // Wire name is snake_case (`secret_ref`): `TriggerSpec` only renames its variants.
+  z.object({ type: z.literal("webhook"), secret_ref: z.string().nullish() }),
   z.object({ type: z.literal("event"), subject: z.string().min(1, "event subject is required") }),
   z.object({ type: z.literal("manual") }),
 ]);
@@ -60,12 +61,18 @@ export const autonomySchema = z.object({
   maxExecutionsPerHour: z.number().int().min(1).max(10000).optional(),
 });
 
+export const networkPolicySchema = z.object({
+  mode: z.enum(["default", "allowlist", "denied"]).nullish(),
+  allowedHosts: z.array(z.string()).default([]),
+});
+
 export const resourceLimitsSchema = z.object({
   timeoutSeconds: z.number().int().min(1).max(86400),
   maxConcurrentExecutions: z.number().int().min(1).max(20),
   memoryMb: z.number().int().min(64).max(65536).optional(),
   cpuMillis: z.number().int().min(100).max(64000).optional(),
   maxOutputTokens: z.number().int().min(1).max(1_000_000).optional(),
+  network: networkPolicySchema.nullish(),
 });
 
 export const agentSpecSchema = z.object({
@@ -85,6 +92,12 @@ export const agentSpecSchema = z.object({
       params: z.record(z.string(), z.unknown()).default({}),
     })
     .default({ management: "harness", params: {} }),
+  /**
+   * Harness-specific options keyed by harness kind (`opencode`, `pi`, ...). Not edited by
+   * the Agent Studio form, but it must round-trip: Zod strips unknown keys, so omitting it
+   * here silently drops it on every UI save (#109).
+   */
+  harnessConfig: z.record(z.string(), z.unknown()).default({}),
   instructions: z.object({
     system: z.string().min(1, "system instructions are required").max(200_000),
     constraints: z.array(z.string()).default([]),
@@ -174,6 +187,7 @@ export function emptyAgentDefinition(): AgentDefinition {
     metadata: { name: "", description: "", labels: {} },
     spec: {
       model: { management: "harness", params: {} },
+      harnessConfig: {},
       instructions: { system: "", constraints: [] },
       connectors: [],
       skills: [],
