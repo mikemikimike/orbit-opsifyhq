@@ -8,8 +8,12 @@ use orbit_security::{JwtValidator, LicenseHandle, LicenseSource, SecretCipher};
 use orbit_store::Store;
 use tokio::net::TcpListener;
 
+/// Upper bound on how long open connections may delay exit after a shutdown signal.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let shutdown = tokio_util::sync::CancellationToken::new();
     dotenvy::dotenv().ok();
     telemetry::init("orbit-api");
 
@@ -80,9 +84,10 @@ async fn main() -> anyhow::Result<()> {
         ca_secret_key: config.ca_secret_key.clone(),
         archive_after_days: config.archive_after_days,
         license: LicenseHandle::load(LicenseSource::from_env()),
+        shutdown: shutdown.clone(),
     };
 
-    orbit_api::background::spawn(state.clone());
+    let background = orbit_api::background::spawn(state.clone());
     let router = build_router(state);
     let listener = TcpListener::bind(&config.http_addr)
         .await
@@ -94,13 +99,38 @@ async fn main() -> anyhow::Result<()> {
         "ORBIT API listening"
     );
 
-    axum::serve(
+    // Signal -> cancel token (ends SSE streams, stops background loops) -> axum drains
+    // remaining connections. A hard deadline keeps a stuck connection from outliving the
+    // kubelet grace period.
+    let signal_token = shutdown.clone();
+    let serve = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("HTTP server failed")?;
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        signal_token.cancel();
+    });
+    let deadline = {
+        let token = shutdown.clone();
+        async move {
+            token.cancelled().await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        }
+    };
+    tokio::select! {
+        result = serve => result.context("HTTP server failed")?,
+        _ = deadline => tracing::warn!(
+            grace_secs = SHUTDOWN_GRACE.as_secs(),
+            "graceful shutdown deadline exceeded; exiting with connections still open"
+        ),
+    }
+    shutdown.cancel();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        futures::future::join_all(background),
+    )
+    .await;
     tracing::info!("ORBIT API stopped");
     Ok(())
 }

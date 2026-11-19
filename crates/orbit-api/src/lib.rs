@@ -21,6 +21,7 @@ pub mod openapi;
 pub mod request_id;
 pub mod routes;
 pub mod state;
+pub mod supervisor;
 pub mod team_outcomes;
 pub mod telemetry;
 pub mod work_sources;

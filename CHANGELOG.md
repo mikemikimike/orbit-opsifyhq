@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- `/readyz` now depends on PostgreSQL only; an event bus (NATS) outage is reported as
+  `checks.eventBus: "unavailable"` / `degraded: ["eventBus"]` instead of removing every API
+  pod from the Service (#125).
+- NATS JetStream publishes are now confirmed: send failures surface as `EventBusError`
+  (3 s timeout) and missing server acknowledgements are logged in the background, without
+  adding latency to request paths; docs no longer claim durable consumers/replay (#125).
+- Graceful shutdown: a shared cancellation token ends execution SSE streams and stops
+  background loops on SIGTERM, with a 10 s hard deadline; background loops are supervised
+  and restarted with a logged error if they panic (#125).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

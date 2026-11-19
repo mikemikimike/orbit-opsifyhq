@@ -118,7 +118,7 @@ Expo/React Native client can share `packages/api-client` and `packages/contracts
 ## 8. Observability
 
 - Structured JSON logs (`tracing`) with request IDs and trace IDs.
-- `GET /healthz` (liveness) and `GET /readyz` (DB + event bus readiness).
+- `GET /healthz` (liveness) and `GET /readyz` (readiness depends on the database; event bus health is reported but non-gating).
 - `GET /metrics` Prometheus text endpoint (core counters; OpenTelemetry export seam).
 - Execution events carry `execution_id`, `agent_id`, `harness`, and timestamps for
   correlation across control and execution planes.

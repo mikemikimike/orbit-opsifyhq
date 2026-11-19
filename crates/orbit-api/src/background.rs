@@ -10,56 +10,58 @@ use chrono::Utc;
 use orbit_contracts::{subjects, OrbitEvent};
 use orbit_domain::{AgentStatus, ExecutionStatus, LogLevel, TriggerSource};
 use orbit_store::Trigger;
+use tokio::task::JoinHandle;
 
 use crate::state::AppState;
+use crate::supervisor::supervise;
 
-pub fn spawn(state: AppState) {
+pub fn spawn(state: AppState) -> Vec<JoinHandle<()>> {
+    let mut handles = Vec::new();
     // Offline license: re-read the mounted file so airgapped renewals apply without a
     // restart (Secret volume updates propagate within ~60s).
-    let license_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise("license", &state, |license_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             license_state.license.reload();
         }
-    });
+    }));
 
-    let output_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise("outputs", &state, |output_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             crate::handlers::outputs::deliver_pending(&output_state).await;
         }
-    });
+    }));
 
-    let scheduler_state = state.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(15));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            if let Err(error) = scheduler_tick(&scheduler_state).await {
-                tracing::error!(%error, "scheduler tick failed");
+    handles.push(supervise(
+        "scheduler",
+        &state,
+        |scheduler_state| async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = scheduler_tick(&scheduler_state).await {
+                    tracing::error!(%error, "scheduler tick failed");
+                }
             }
-        }
-    });
+        },
+    ));
 
-    let reaper_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise("reaper", &state, |reaper_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(15));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             reap(&reaper_state).await;
         }
-    });
+    }));
 
-    let team_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise("team_runs", &state, |team_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(2));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -76,22 +78,24 @@ pub fn spawn(state: AppState) {
                 Err(error) => tracing::warn!(%error, "team run polling failed"),
             }
         }
-    });
+    }));
 
-    let dispatcher_state = state.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(15));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            if let Err(error) = crate::dispatcher::dispatch_tick(&dispatcher_state).await {
-                tracing::error!(%error, "work source dispatcher tick failed");
+    handles.push(supervise(
+        "dispatcher",
+        &state,
+        |dispatcher_state| async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = crate::dispatcher::dispatch_tick(&dispatcher_state).await {
+                    tracing::error!(%error, "work source dispatcher tick failed");
+                }
             }
-        }
-    });
+        },
+    ));
 
-    let tag_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise("worker_tags", &state, |tag_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -100,10 +104,9 @@ pub fn spawn(state: AppState) {
                 tracing::warn!(%error, "worker tag reconciliation failed");
             }
         }
-    });
+    }));
 
-    let runtime_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise("runtime", &state, |runtime_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -112,32 +115,39 @@ pub fn spawn(state: AppState) {
                 tracing::warn!(%error, "agent runtime tick failed");
             }
         }
-    });
+    }));
 
-    let retention_state = state.clone();
-    tokio::spawn(async move {
-        // Run shortly after start, then daily.
-        let mut ticker = tokio::time::interval(Duration::from_secs(6 * 3600));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            archive_old_runs(&retention_state).await;
-        }
-    });
-
-    let pruner_state = state.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(3600));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            match pruner_state.store.prune_expired_memory().await {
-                Ok(n) if n > 0 => tracing::info!(count = n, "pruned expired memory entries"),
-                Ok(_) => {}
-                Err(error) => tracing::warn!(%error, "memory pruning failed"),
+    handles.push(supervise(
+        "retention",
+        &state,
+        |retention_state| async move {
+            // Run shortly after start, then daily.
+            let mut ticker = tokio::time::interval(Duration::from_secs(6 * 3600));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                archive_old_runs(&retention_state).await;
             }
-        }
-    });
+        },
+    ));
+
+    handles.push(supervise(
+        "memory_pruner",
+        &state,
+        |pruner_state| async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match pruner_state.store.prune_expired_memory().await {
+                    Ok(n) if n > 0 => tracing::info!(count = n, "pruned expired memory entries"),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "memory pruning failed"),
+                }
+            }
+        },
+    ));
+    handles
 }
 
 /// Archive terminal executions, team runs and worker launches older than the configured

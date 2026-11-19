@@ -6,7 +6,7 @@ use base64::Engine;
 use http_body_util::BodyExt;
 use orbit_api::{build_router, AppState, DevIdentity};
 use orbit_domain::UserRole;
-use orbit_events::MemoryEventBus;
+use orbit_events::{EventBusError, MemoryEventBus};
 use orbit_harness::HarnessRegistry;
 use orbit_security::{AuthConfig, AuthMode, DevAuthConfig, SecretCipher};
 use orbit_store::Store;
@@ -14,7 +14,38 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+/// Event bus whose health can be flipped to simulate a NATS outage.
+struct SwitchableBus {
+    inner: MemoryEventBus,
+    healthy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl orbit_events::EventBus for SwitchableBus {
+    fn driver(&self) -> &'static str {
+        "memory"
+    }
+    async fn publish(&self, event: orbit_contracts::OrbitEvent) -> Result<(), EventBusError> {
+        self.inner.publish(event).await
+    }
+    async fn subscribe(
+        &self,
+        filter: orbit_contracts::SubjectFilter,
+    ) -> Result<orbit_events::EventStream, EventBusError> {
+        self.inner.subscribe(filter).await
+    }
+    async fn health(&self) -> Result<(), EventBusError> {
+        if self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(EventBusError::Unavailable("simulated outage".into()))
+        }
+    }
+}
+
 struct TestApp {
+    bus_healthy: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: tokio_util::sync::CancellationToken,
     router: axum::Router,
     store: Store,
     org_id: Uuid,
@@ -71,7 +102,12 @@ async fn test_app(allow_anonymous: bool) -> Option<TestApp> {
         allow_api_tokens: true,
     };
 
-    let bus = Arc::new(MemoryEventBus::new(128));
+    let bus_healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let bus = Arc::new(SwitchableBus {
+        inner: MemoryEventBus::new(128),
+        healthy: bus_healthy.clone(),
+    });
     let state = AppState {
         store: store.clone(),
         bus,
@@ -98,6 +134,7 @@ async fn test_app(allow_anonymous: bool) -> Option<TestApp> {
         ca_secret_name: None,
         ca_secret_key: "ca-bundle.crt".into(),
         archive_after_days: None,
+        shutdown: shutdown.clone(),
         license: orbit_security::LicenseHandle::load(orbit_security::LicenseSource {
             token: None,
             file: None,
@@ -112,6 +149,8 @@ async fn test_app(allow_anonymous: bool) -> Option<TestApp> {
 
     let created = create_demo_agent(&store, org.id, user.id).await;
     Some(TestApp {
+        bus_healthy,
+        shutdown,
         router: build_router(state),
         store,
         org_id: org.id,
@@ -191,6 +230,81 @@ async fn public_endpoints_and_meta() {
     let (status, body) = send(&app.router, get("/api/v1/openapi.json")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["paths"]["/api/v1/agents"].is_object());
+}
+
+#[tokio::test]
+async fn readyz_depends_on_database_only() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(&app.router, get("/readyz")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["checks"]["eventBus"], "ok");
+
+    // Bus outage: still ready, but reported as unavailable/degraded.
+    app.bus_healthy
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = send(&app.router, get("/readyz")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["checks"]["database"], "ok");
+    assert_eq!(body["checks"]["eventBus"], "unavailable");
+    assert!(body["checks"]["eventBusError"]
+        .as_str()
+        .unwrap()
+        .contains("simulated outage"));
+    assert_eq!(body["degraded"], json!(["eventBus"]));
+}
+
+#[tokio::test]
+async fn execution_sse_stream_ends_on_shutdown() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/agents/{}/executions", app.agent_id),
+            json!({ "task": "long running" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let execution_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    app.store
+        .claim_execution(execution_id, "test-worker")
+        .await
+        .unwrap();
+    app.store
+        .mark_execution_running(execution_id, Some("session-sse"))
+        .await
+        .unwrap();
+
+    let uri = format!("/api/v1/executions/{execution_id}/events/stream");
+    let response = app
+        .router
+        .clone()
+        .oneshot(get(&uri))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body();
+
+    // The execution never finishes, so the stream only ends because of the token.
+    let shutdown = app.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        shutdown.cancel();
+    });
+    let started = std::time::Instant::now();
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), body.collect())
+        .await
+        .expect("SSE stream must end shortly after shutdown")
+        .unwrap()
+        .to_bytes();
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1400));
+    assert!(String::from_utf8_lossy(&bytes).contains("event: shutdown"));
 }
 
 #[tokio::test]

@@ -1575,6 +1575,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -1591,6 +1592,7 @@ dependencies = [
  "anyhow",
  "axum",
  "dotenvy",
+ "futures",
  "orbit-api",
  "orbit-contracts",
  "orbit-domain",
@@ -1601,6 +1603,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]

@@ -15,8 +15,21 @@ pub trait EventBus: Send + Sync {
 
 Drivers: `memory` (tokio broadcast, development and tests) and `nats` (JetStream,
 durable stream `ORBIT`). Selected with `ORBIT_EVENTS_DRIVER`; the API and worker must
-agree. JetStream consumers are durable (`orbit-worker`), with explicit ack and a max
-delivery count, so worker crashes redeliver.
+agree.
+
+`publish` on the NATS driver returns `EventBusError::Unavailable` when the message cannot be
+handed to the client within 3 s (`DEFAULT_PUBLISH_ACK_TIMEOUT`). The JetStream
+acknowledgement is then confirmed in the background with the same timeout; a missing stream,
+missing ack or timeout is logged as a warning (it never blocks the request that published). Callers log and continue, because PostgreSQL is the source of
+truth and workers poll the durable queue.
+
+> Current state: there are **no durable JetStream consumers and no event replay**. The
+> stream is a retained log (7 days); `subscribe` is a plain core NATS subscription, and
+> nothing in the API consumes it today. Durable pull consumers with explicit ack remain a
+> possible future addition.
+
+Readiness: `GET /readyz` depends on the database only. The bus is reported in the body
+(`checks.eventBus`, `degraded: ["eventBus"]`) but an outage does not fail the probe.
 
 ## Subjects
 
