@@ -296,7 +296,7 @@ async fn execution_lifecycle_and_events() {
         .unwrap();
     assert_eq!(events.len(), 2);
 
-    let summary = store.dashboard_summary(org).await.unwrap();
+    let summary = store.dashboard_summary(org, None).await.unwrap();
     assert_eq!(summary.total_agents, 1);
     assert!(summary.executions_24h >= 1);
 }

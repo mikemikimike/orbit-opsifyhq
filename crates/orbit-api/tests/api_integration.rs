@@ -1305,3 +1305,196 @@ async fn same_agent_queues_on_different_harnesses() {
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(second["harnessKind"], "pi");
 }
+
+async fn seed_team_agent_with_execution(
+    app: &TestApp,
+    owner_id: Uuid,
+    team_id: Uuid,
+    task: &str,
+) -> (Uuid, Uuid) {
+    let definition: orbit_domain::AgentDefinition = serde_json::from_value(definition()).unwrap();
+    let (agent, version) = app
+        .store
+        .create_agent(app.org_id, Some(owner_id), &definition)
+        .await
+        .unwrap();
+    app.store
+        .set_agent_status(app.org_id, agent.id, orbit_domain::AgentStatus::Active)
+        .await
+        .unwrap();
+    app.store
+        .set_resource_visibility(app.org_id, "agents", agent.id, "team", Some(team_id))
+        .await
+        .unwrap();
+    let execution = app
+        .store
+        .create_execution(orbit_store::executions::NewExecution {
+            org_id: app.org_id,
+            agent_id: agent.id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: orbit_domain::HarnessKind::Mock,
+            trigger_source: orbit_domain::TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: json!({ "task": task }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: Some(owner_id),
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+    app.store
+        .create_approval(app.org_id, execution.id, json!({}), None)
+        .await
+        .unwrap();
+    (agent.id, execution.id)
+}
+
+fn usage_total(body: &Value) -> i64 {
+    body["usage"]["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["executions"].as_i64().unwrap())
+        .sum()
+}
+
+fn recent_ids(body: &Value) -> Vec<String> {
+    body["summary"]["recentExecutions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+async fn owner_user(app: &TestApp) -> orbit_store::models::User {
+    app.store
+        .list_users(app.org_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|user| user.role == "owner")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn dashboard_summary_hides_other_teams_agents_and_executions() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let owner = owner_user(&app).await;
+    // The demo agent created by the harness belongs to the owner only.
+    make_private(&app.store, app.org_id, "agents", app.agent_id, owner.id).await;
+
+    let team_x = app
+        .store
+        .create_access_team(app.org_id, "Team X", "team-x", Some(owner.id))
+        .await
+        .unwrap();
+    let team_y = app
+        .store
+        .create_access_team(app.org_id, "Team Y", "team-y", Some(owner.id))
+        .await
+        .unwrap();
+    let viewer = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "dash-viewer@test.local",
+            "Viewer",
+            UserRole::Viewer,
+        )
+        .await
+        .unwrap();
+    app.store
+        .upsert_team_member(team_x.id, viewer.id, "viewer")
+        .await
+        .unwrap();
+    app.store
+        .set_platform_setting(
+            "team_isolation",
+            &json!({ "enabled": true }),
+            Some(owner.id),
+        )
+        .await
+        .unwrap();
+
+    let (_, exec_x) =
+        seed_team_agent_with_execution(&app, owner.id, team_x.id, "visible-to-x").await;
+    let (_, exec_y) =
+        seed_team_agent_with_execution(&app, owner.id, team_y.id, "SECRET-of-team-y").await;
+    let viewer_token = token_for(&app.store, app.org_id, viewer.id, "dash-viewer").await;
+
+    let (status, body) = send(
+        &app.router,
+        auth_get("/api/v1/dashboard/summary", &viewer_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recent_ids(&body), vec![exec_x.to_string()]);
+    assert!(!body.to_string().contains("SECRET-of-team-y"));
+    let summary = &body["summary"];
+    assert_eq!(summary["totalAgents"], 1);
+    assert_eq!(summary["activeAgents"], 1);
+    assert_eq!(summary["executions24h"], 1);
+    assert_eq!(summary["runningExecutions"], 1);
+    assert_eq!(summary["pendingApprovals"], 1);
+    assert_eq!(usage_total(&body), 1);
+
+    // The owner still sees everything: both teams' executions and the private demo agent.
+    let (status, body) = send(
+        &app.router,
+        auth_get("/api/v1/dashboard/summary", "test-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let recent = recent_ids(&body);
+    assert!(recent.contains(&exec_x.to_string()));
+    assert!(recent.contains(&exec_y.to_string()));
+    let summary = &body["summary"];
+    assert_eq!(summary["totalAgents"], 3);
+    assert_eq!(summary["executions24h"], 2);
+    assert_eq!(summary["pendingApprovals"], 2);
+    assert_eq!(usage_total(&body), 2);
+}
+
+#[tokio::test]
+async fn dashboard_summary_is_empty_for_user_outside_every_team() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let owner = owner_user(&app).await;
+    make_private(&app.store, app.org_id, "agents", app.agent_id, owner.id).await;
+    let team_y = app
+        .store
+        .create_access_team(app.org_id, "Team Y2", "team-y2", Some(owner.id))
+        .await
+        .unwrap();
+    let (_, exec_y) = seed_team_agent_with_execution(&app, owner.id, team_y.id, "hidden").await;
+    let outsider = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "dash-outsider@test.local",
+            "Outsider",
+            UserRole::Viewer,
+        )
+        .await
+        .unwrap();
+    let token = token_for(&app.store, app.org_id, outsider.id, "dash-outsider").await;
+    let (status, body) = send(&app.router, auth_get("/api/v1/dashboard/summary", &token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let summary = &body["summary"];
+    assert_eq!(summary["totalAgents"], 0);
+    assert_eq!(summary["executions24h"], 0);
+    assert_eq!(summary["pendingApprovals"], 0);
+    assert!(recent_ids(&body).is_empty());
+    assert_eq!(usage_total(&body), 0);
+    assert!(!body.to_string().contains(&exec_y.to_string()));
+}

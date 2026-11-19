@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- Dashboard summary (counts, recent executions, usage) now only includes agents the
+  caller can view, closing a cross-team/private execution data leak (#133).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
