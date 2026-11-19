@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use orbit_domain::ValidationIssue;
 use orbit_security::{new_secret_ref, AuthContext, Permission, SecretValue};
-use orbit_store::{ExecutionRecord, Output, TeamRun};
+use orbit_store::outputs::DeliveryOutcome;
+use orbit_store::{ExecutionRecord, Output, OutputDeliveryJob, StoreError, TeamRun};
 
 use crate::audit;
 use crate::error::ApiError;
@@ -280,7 +281,21 @@ pub async fn test_output(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Delivery used by the test endpoint and the background outbox worker.
+/// Why a delivery attempt failed, and whether retrying can help.
+#[derive(Debug)]
+pub struct SendError {
+    pub status: Option<u16>,
+    pub message: String,
+    pub retryable: bool,
+}
+
+/// HTTP statuses worth retrying: server errors, timeouts and rate limits. Other 4xx
+/// (bad URL, revoked webhook, rejected payload) will not succeed on retry.
+fn status_is_retryable(status: u16) -> bool {
+    status >= 500 || status == 408 || status == 429
+}
+
+/// Delivery used by the test endpoint.
 pub async fn deliver(
     state: &AppState,
     output: &Output,
@@ -288,16 +303,50 @@ pub async fn deliver(
     execution: Option<&ExecutionRecord>,
     team_run: Option<&TeamRun>,
 ) -> Result<(), ApiError> {
-    let url = state
-        .store
-        .get_secret_value(&output.secret_ref)
-        .await?
-        .map(|value| value.expose().to_string())
-        .ok_or_else(|| ApiError::internal("output webhook secret is missing"))?;
+    send(state, output, text, execution, team_run, None)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "output_delivery_failed",
+                error.message,
+            )
+        })
+}
+
+/// POST one notification. When `delivery_id` is set it is sent as `Idempotency-Key` and
+/// `X-Orbit-Delivery-Id` (and `deliveryId` in generic webhook bodies) so receivers can
+/// de-duplicate the at-least-once delivery. Slack/Mattermost ignore unknown headers.
+pub async fn send(
+    state: &AppState,
+    output: &Output,
+    text: &str,
+    execution: Option<&ExecutionRecord>,
+    team_run: Option<&TeamRun>,
+    delivery_id: Option<Uuid>,
+) -> Result<(), SendError> {
+    let url = match state.store.get_secret_value(&output.secret_ref).await {
+        Ok(Some(value)) => value.expose().to_string(),
+        Ok(None) => {
+            return Err(SendError {
+                status: None,
+                message: "output webhook secret is missing".into(),
+                retryable: false,
+            })
+        }
+        Err(error) => {
+            return Err(SendError {
+                status: None,
+                message: error.to_string(),
+                retryable: true,
+            })
+        }
+    };
     let client = orbit_security::client_with_custom_ca(std::time::Duration::from_secs(15));
     let payload = if output.kind == "webhook" {
         serde_json::json!({
             "event": execution.map(|e| format!("execution.{}", e.status)).unwrap_or_else(|| "test".into()),
+            "deliveryId": delivery_id,
             "text": text,
             "execution": execution.map(|e| serde_json::json!({
                 "id": e.id, "agentName": e.agent_name, "status": e.status,
@@ -311,64 +360,135 @@ pub async fn deliver(
     } else {
         serde_json::json!({ "text": text })
     };
-    let response = client
-        .post(&url)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                "output_delivery_failed",
-                error.to_string(),
-            )
-        })?;
-    if !response.status().is_success() {
-        return Err(ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "output_delivery_failed",
-            format!("webhook returned HTTP {}", response.status()),
-        ));
+    let mut request = client.post(&url).json(&payload);
+    if let Some(id) = delivery_id {
+        request = request
+            .header("Idempotency-Key", id.to_string())
+            .header("X-Orbit-Delivery-Id", id.to_string());
+    }
+    let response = request.send().await.map_err(|error| SendError {
+        status: None,
+        // reqwest errors embed the (secret) webhook URL; strip it.
+        message: error.without_url().to_string(),
+        retryable: true,
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(SendError {
+            status: Some(status.as_u16()),
+            message: format!("webhook returned HTTP {status}"),
+            retryable: status_is_retryable(status.as_u16()),
+        });
     }
     Ok(())
 }
 
-/// Background outbox loop: enqueue recent terminal executions, deliver due rows.
+const DELIVERY_LEASE: chrono::Duration = chrono::Duration::seconds(120);
+const MAX_DELIVERIES_PER_TICK: usize = 25;
+
+/// Background outbox loop: enqueue finished runs, then claim and deliver due rows.
+///
+/// Safe to run on every replica and concurrently: rows are claimed one at a time with a
+/// lease (`FOR UPDATE SKIP LOCKED`), so each delivery is sent by one worker at a time and a
+/// crashed sender's rows are reclaimed after the lease expires (at-least-once).
 pub async fn deliver_pending(state: &AppState) {
-    let since = chrono::Utc::now() - chrono::Duration::minutes(30);
-    let _ = state.store.enqueue_output_deliveries(since).await;
-    let _ = state.store.enqueue_team_output_deliveries(since).await;
-    let Ok(jobs) = state.store.due_output_deliveries(25).await else {
-        return;
+    if let Err(error) = state.store.enqueue_output_deliveries().await {
+        tracing::error!(%error, "output delivery enqueue failed");
+    }
+    if let Err(error) = state.store.enqueue_team_output_deliveries().await {
+        tracing::error!(%error, "team output delivery enqueue failed");
+    }
+    for _ in 0..MAX_DELIVERIES_PER_TICK {
+        let job = match state.store.claim_output_deliveries(1, DELIVERY_LEASE).await {
+            Ok(mut jobs) => match jobs.pop() {
+                Some(job) => job,
+                None => break,
+            },
+            Err(error) => {
+                tracing::error!(%error, "output delivery claim failed");
+                break;
+            }
+        };
+        process_delivery(state, job).await;
+    }
+}
+
+async fn process_delivery(state: &AppState, job: OutputDeliveryJob) {
+    let (outcome, status, error) = attempt_delivery(state, &job).await;
+    match state
+        .store
+        .finish_output_delivery(
+            job.id,
+            job.claim_token,
+            outcome,
+            status,
+            error.as_deref(),
+            job.attempts,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(delivery_id = %job.id, "output delivery claim lost before finish");
+        }
+        Err(error) => {
+            // The lease will expire and the row is reclaimed.
+            tracing::error!(delivery_id = %job.id, %error, "recording output delivery result failed");
+        }
+    }
+}
+
+type AttemptResult = (DeliveryOutcome, Option<i32>, Option<String>);
+
+async fn attempt_delivery(state: &AppState, job: &OutputDeliveryJob) -> AttemptResult {
+    let skipped = |reason: &str| (DeliveryOutcome::Skipped, None, Some(reason.to_string()));
+    let retry = |error: StoreError| (DeliveryOutcome::Retry, None, Some(error.to_string()));
+    let output = match state.store.get_output(job.org_id, job.output_id).await {
+        Ok(output) if output.enabled => output,
+        Ok(_) => return skipped("output is disabled"),
+        Err(StoreError::NotFound(_)) => return skipped("output was deleted"),
+        Err(error) => return retry(error),
     };
-    for job in jobs {
-        let output = match state.store.get_output(job.org_id, job.output_id).await {
-            Ok(output) => output,
-            Err(_) => continue,
-        };
-        let execution = match job.execution_id {
-            Some(id) => state.store.get_execution_by_id_any_org(id).await.ok(),
-            None => None,
-        };
-        let team_run = match job.team_run_id {
-            Some(id) => state.store.get_team_run_any_org(id).await.ok(),
-            None => None,
-        };
-        let text = execution
-            .as_ref()
-            .map(summary)
-            .or_else(|| team_run.as_ref().map(team_summary))
-            .unwrap_or_else(|| "ORBIT run finished".into());
-        let result = deliver(state, &output, &text, execution.as_ref(), team_run.as_ref()).await;
-        let attempts = job.attempts + 1;
-        let (success, status, error) = match &result {
-            Ok(()) => (true, None, None),
-            Err(error) => (false, None, Some(error.message.clone())),
-        };
-        let _ = state
-            .store
-            .finish_output_delivery(job.id, success, status, error.as_deref(), attempts)
-            .await;
+    let execution = match job.execution_id {
+        Some(id) => match state.store.get_execution_by_id_any_org(id).await {
+            Ok(execution) => Some(execution),
+            Err(StoreError::NotFound(_)) => return skipped("execution was deleted"),
+            Err(error) => return retry(error),
+        },
+        None => None,
+    };
+    let team_run = match job.team_run_id {
+        Some(id) => match state.store.get_team_run_any_org(id).await {
+            Ok(run) => Some(run),
+            Err(StoreError::NotFound(_)) => return skipped("team run was deleted"),
+            Err(error) => return retry(error),
+        },
+        None => None,
+    };
+    let text = execution
+        .as_ref()
+        .map(summary)
+        .or_else(|| team_run.as_ref().map(team_summary))
+        .unwrap_or_else(|| "ORBIT run finished".into());
+    match send(
+        state,
+        &output,
+        &text,
+        execution.as_ref(),
+        team_run.as_ref(),
+        Some(job.id),
+    )
+    .await
+    {
+        Ok(()) => (DeliveryOutcome::Succeeded, None, None),
+        Err(error) => {
+            let outcome = if error.retryable {
+                DeliveryOutcome::Retry
+            } else {
+                DeliveryOutcome::Failed
+            };
+            (outcome, error.status.map(i32::from), Some(error.message))
+        }
     }
 }
 

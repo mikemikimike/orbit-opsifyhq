@@ -614,6 +614,7 @@ pub struct OutputDeliveryJob {
     pub execution_id: Option<Uuid>,
     pub team_run_id: Option<Uuid>,
     pub attempts: i32,
+    pub claim_token: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]

@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Output deliveries are claimed with a lease (`FOR UPDATE SKIP LOCKED`), so multiple API
+  replicas or overlapping ticks no longer send duplicate notifications; interrupted sends
+  are retried after the lease expires, and each delivery carries an `Idempotency-Key` /
+  `X-Orbit-Delivery-Id` header (#112).
+- Output enqueueing no longer uses a 30-minute look-back: per-output high-water marks
+  deliver every run finished during an API outage once, without back-filling runs from
+  before the output was created (#112).
+- Output deliveries treat 4xx responses (except 408/429) as permanent, mark deliveries of
+  deleted or disabled outputs `skipped`, and log enqueue errors instead of dropping them
+  (#112).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
