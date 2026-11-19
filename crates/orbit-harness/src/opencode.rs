@@ -23,7 +23,7 @@ use orbit_domain::{
 ///
 /// Executes `opencode run --standalone --format json` in a per-execution workspace and
 /// maps OpenCode's NDJSON event stream to ORBIT harness events. Tested against
-/// OpenCode **v2.2.5** (see `tests/opencode_e2e.rs`).
+/// OpenCode **v2.3.0** (see `tests/opencode_e2e.rs`).
 ///
 /// Authentication is harness-managed: the worker image/container must provide an
 /// OpenCode auth store (mounted Secret in Kubernetes) or provider credentials in its
@@ -182,7 +182,7 @@ impl OpenCodeHarnessAdapter {
             kind: HarnessKind::OpenCode,
             name: "OpenCode".into(),
             description:
-                "OpenCode CLI harness with sessions, streaming NDJSON events, tool calls and harness-managed providers. Tested against OpenCode v2.2.5."
+                "OpenCode CLI harness with sessions, streaming NDJSON events, tool calls and harness-managed providers. Tested against OpenCode v2.3.0."
                     .into(),
             capabilities: HarnessCapabilities {
                 supports_sessions: true,
@@ -193,7 +193,7 @@ impl OpenCodeHarnessAdapter {
                 supports_tool_events: true,
                 supports_usage_reporting: true,
                 harness_managed_providers: true,
-                supports_platform_providers: false,
+                supports_platform_providers: true,
                 execution_modes: vec![ExecutionMode::OnDemand],
                 max_timeout_seconds: 86_400,
                 max_memory_mb: 16_384,

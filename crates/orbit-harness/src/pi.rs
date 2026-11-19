@@ -24,7 +24,7 @@ use orbit_domain::{
 /// events to ORBIT harness events, captures the session id and applies a platform tool
 /// allowlist: autonomy levels 1–2 are read-only (no shell/edit/write).
 ///
-/// Tested against Pi **1.5.0** (see `tests/pi_e2e.rs`).
+/// Tested against Pi **1.5.2** (see `tests/pi_e2e.rs`).
 #[derive(Debug, Clone, Default)]
 pub struct PiHarnessAdapter;
 
@@ -221,7 +221,7 @@ impl PiHarnessAdapter {
             kind: HarnessKind::Pi,
             name: "Pi".into(),
             description:
-                "Pi coding-agent harness (headless JSON mode) with sessions, skills and platform-enforced read-only tools at low autonomy. Tested against Pi 1.5.0."
+                "Pi coding-agent harness (headless JSON mode) with sessions, skills and platform-enforced read-only tools at low autonomy. Tested against Pi 1.5.2."
                     .into(),
             capabilities: HarnessCapabilities {
                 supports_sessions: true,
@@ -232,7 +232,7 @@ impl PiHarnessAdapter {
                 supports_tool_events: true,
                 supports_usage_reporting: true,
                 harness_managed_providers: true,
-                supports_platform_providers: false,
+                supports_platform_providers: true,
                 execution_modes: vec![ExecutionMode::OnDemand],
                 max_timeout_seconds: 86_400,
                 max_memory_mb: 16_384,

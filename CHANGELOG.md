@@ -6,6 +6,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Documentation and metadata drift (#129): AGENTS.md now lists `opencode` and `pi` as available and
+  points at the real worker provider-resolution code; OpenCode and Pi descriptors report the verified
+  versions (v2.3.0, 1.5.2) and `supports_platform_providers: true`; the web API proxy uses the
+  Next.js `runtime` segment option; deployment docs use the published `ghcr.io/opsifyhq/orbit/*`
+  image names; ADR 0004 and the Pi provider note in the runtime contract match the code; stray
+  heredoc lines removed from the Kubernetes launcher doc.
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

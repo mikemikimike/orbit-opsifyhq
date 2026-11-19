@@ -4,7 +4,7 @@ import { createOrbitClient } from "@orbit/api-client";
 
 /**
  * Same-origin by default: the Next.js API proxy route forwards `/api/*` to the control
- * plane using `ORBIT_API_INTERNAL_URL` at harness. Set NEXT_PUBLIC_ORBIT_API_URL only
+ * plane using `ORBIT_API_INTERNAL_URL` at runtime. Set NEXT_PUBLIC_ORBIT_API_URL only
  * when the API is served from a different origin (e.g. native apps or split domains).
  */
 export const API_BASE_URL =

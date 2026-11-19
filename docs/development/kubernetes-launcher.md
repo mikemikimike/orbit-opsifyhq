@@ -88,8 +88,6 @@ The launcher adds `imagePullSecrets` to every pod it creates.
 - Worker pods receive `ORBIT_WORKER_TOKEN` (a scoped worker token minted for that
   launch) via env var. The token is revoked when the launch stops or fails.
 - The launcher never exposes kubectl or the Docker socket to the API or web app.
-EOF
-echo done
 
 ## Custom CA certificates
 
