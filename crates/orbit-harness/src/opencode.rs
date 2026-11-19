@@ -204,7 +204,7 @@ impl OpenCodeHarnessAdapter {
                 "additionalProperties": false,
                 "properties": {
                     "binary": { "type": "string", "description": "opencode binary (default: opencode)" },
-                    "workspaceSubdir": { "type": "string" },
+                    "workspaceSubdir": { "type": "string", "description": "Working directory relative to the execution workspace (no absolute paths or '..')" },
                     "provider": { "type": "string", "description": "harness-managed provider, e.g. opencode-go" },
                     "model": { "type": "string", "description": "model id; provider/model derived when needed" },
                     "agent": { "type": "string" },
@@ -705,17 +705,27 @@ impl OpenCodeHarnessAdapter {
         settings: OpenCodeSettings,
         session_ref: Option<String>,
     ) -> Result<(ExecutionOutcome, Option<String>, Usage), HarnessError> {
-        let workspace = PathBuf::from(&request.workspace.root);
+        let workspace_root = PathBuf::from(&request.workspace.root);
+        // `workspaceSubdir` is agent-author input: confine it to the execution workspace.
         let workspace = match &settings.workspace_subdir {
-            Some(sub) if !sub.trim().is_empty() => workspace.join(sub),
-            _ => workspace,
+            Some(sub) if !sub.trim().is_empty() => {
+                crate::paths::resolve_confined_dir(&workspace_root, sub).await?
+            }
+            _ => {
+                tokio::fs::create_dir_all(&workspace_root)
+                    .await
+                    .map_err(|e| {
+                        HarnessError::new(
+                            HarnessErrorKind::Internal,
+                            format!(
+                                "could not create workspace {}: {e}",
+                                workspace_root.display()
+                            ),
+                        )
+                    })?;
+                workspace_root
+            }
         };
-        tokio::fs::create_dir_all(&workspace).await.map_err(|e| {
-            HarnessError::new(
-                HarnessErrorKind::Internal,
-                format!("could not create workspace {}: {e}", workspace.display()),
-            )
-        })?;
         if let Err(err) = write_agent_instructions(&workspace, &request) {
             return Err(HarnessError::new(
                 HarnessErrorKind::Internal,
@@ -992,6 +1002,11 @@ impl HarnessAdapter for OpenCodeHarnessAdapter {
                         report.push("serverUrl", "must be an http(s) URL");
                     }
                 }
+                if let Some(sub) = &settings.workspace_subdir {
+                    if let Err(message) = crate::paths::validate_relative_subpath(sub) {
+                        report.push("workspaceSubdir", message);
+                    }
+                }
             }
             Err(err) => report.push("config", err.message),
         }
@@ -1101,6 +1116,30 @@ impl HarnessAdapter for OpenCodeHarnessAdapter {
 mod tests {
     use super::*;
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn validate_config_rejects_escaping_workspace_subdir() {
+        let adapter = OpenCodeHarnessAdapter;
+        for bad in ["/etc", "../other-execution", "a/../../b"] {
+            let report = adapter
+                .validate_config(&HarnessConfig {
+                    kind: HarnessKind::OpenCode,
+                    settings: serde_json::json!({ "workspaceSubdir": bad }),
+                })
+                .await;
+            assert!(
+                report.issues.iter().any(|i| i.path == "workspaceSubdir"),
+                "{bad} accepted"
+            );
+        }
+        let ok = adapter
+            .validate_config(&HarnessConfig {
+                kind: HarnessKind::OpenCode,
+                settings: serde_json::json!({ "workspaceSubdir": "repo/app" }),
+            })
+            .await;
+        assert!(ok.issues.iter().all(|i| i.path != "workspaceSubdir"));
+    }
 
     #[test]
     fn builds_cli_arguments_without_hardcoded_providers() {

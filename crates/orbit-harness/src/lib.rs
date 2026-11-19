@@ -6,6 +6,7 @@
 
 pub mod mock;
 pub mod opencode;
+pub mod paths;
 pub mod pi;
 pub mod planned;
 pub mod registry;
