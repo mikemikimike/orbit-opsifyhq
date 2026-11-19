@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 struct TestApp {
     router: axum::Router,
+    state: AppState,
     store: Store,
     org_id: Uuid,
     agent_id: Uuid,
@@ -112,7 +113,8 @@ async fn test_app(allow_anonymous: bool) -> Option<TestApp> {
 
     let created = create_demo_agent(&store, org.id, user.id).await;
     Some(TestApp {
-        router: build_router(state),
+        router: build_router(state.clone()),
+        state,
         store,
         org_id: org.id,
         agent_id: created,
@@ -1304,4 +1306,695 @@ async fn same_agent_queues_on_different_harnesses() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(second["harnessKind"], "pi");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #140: shared execution preflight and related permission checks
+// ---------------------------------------------------------------------------
+
+async fn token_with_scopes(
+    store: &Store,
+    org_id: Uuid,
+    user_id: Uuid,
+    name: &str,
+    scopes: &[&str],
+) -> String {
+    let issued = orbit_security::issue_api_token();
+    let scopes: Vec<String> = scopes.iter().map(|scope| (*scope).to_string()).collect();
+    store
+        .create_api_token(
+            org_id,
+            user_id,
+            name,
+            &issued.prefix,
+            &issued.hash,
+            &scopes,
+            None,
+        )
+        .await
+        .expect("api token");
+    issued.token
+}
+
+fn auth_json(method: &str, path: &str, token: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn webhook_connection(app: &TestApp, name: &str, owner: Uuid) -> Uuid {
+    let connector = app
+        .store
+        .get_connector_by_slug(app.org_id, "webhook")
+        .await
+        .unwrap()
+        .expect("webhook connector");
+    let connection = app
+        .store
+        .create_connection(
+            app.org_id,
+            connector.id,
+            name,
+            &json!({ "url": "http://127.0.0.1:9/hook" }),
+            &[],
+            None,
+            Some(owner),
+        )
+        .await
+        .unwrap();
+    make_private(&app.store, app.org_id, "connections", connection.id, owner).await;
+    connection.id
+}
+
+/// Agent owned by `owner` with optional connection binding and hourly quota.
+async fn bound_agent(
+    app: &TestApp,
+    owner: Uuid,
+    connection: Option<Uuid>,
+    max_per_hour: Option<u32>,
+) -> Uuid {
+    let mut value = definition();
+    if let Some(connection) = connection {
+        value["spec"]["connectors"] =
+            json!([{ "connector": "webhook", "connectionId": connection }]);
+    }
+    if let Some(max) = max_per_hour {
+        value["spec"]["autonomy"]["maxExecutionsPerHour"] = json!(max);
+    }
+    let definition: orbit_domain::AgentDefinition = serde_json::from_value(value).unwrap();
+    let (agent, _) = app
+        .store
+        .create_agent(app.org_id, Some(owner), &definition)
+        .await
+        .unwrap();
+    app.store
+        .set_agent_status(app.org_id, agent.id, orbit_domain::AgentStatus::Active)
+        .await
+        .unwrap();
+    app.store
+        .assign_resource_owner(app.org_id, "agents", agent.id, owner)
+        .await
+        .unwrap();
+    agent.id
+}
+
+async fn share_org(app: &TestApp, table: &str, id: Uuid) {
+    app.store
+        .set_resource_visibility(app.org_id, table, id, "org", None)
+        .await
+        .unwrap();
+}
+
+async fn operator(app: &TestApp, email: &str) -> orbit_store::User {
+    app.store
+        .ensure_user(app.org_id, email, email, UserRole::Operator)
+        .await
+        .unwrap()
+}
+
+async fn access_team(app: &TestApp, slug: &str) -> Uuid {
+    app.store
+        .create_access_team(app.org_id, slug, slug, None)
+        .await
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn agent_specs_require_use_of_referenced_connections_and_providers() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = operator(&app, "pf-spec-alice@test.local").await;
+    let bob = operator(&app, "pf-spec-bob@test.local").await;
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "alice").await;
+    let bob_token = token_for(&app.store, app.org_id, bob.id, "bob").await;
+    let alice_connection = webhook_connection(&app, "Alice hook", alice.id).await;
+
+    let mut with_connection = definition();
+    with_connection["spec"]["connectors"] =
+        json!([{ "connector": "webhook", "connectionId": alice_connection }]);
+
+    // Invisible connection: 404 with the field path in the envelope details.
+    let (status, body) = send(
+        &app.router,
+        auth_post("/api/v1/agents", &bob_token, with_connection.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["error"]["details"][0]["path"],
+        "spec.connectors[0].connectionId"
+    );
+
+    // The owner can bind it.
+    let (status, body) = send(
+        &app.router,
+        auth_post("/api/v1/agents", &alice_token, with_connection.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Updating an existing agent re-checks the references.
+    let bob_agent = bound_agent(&app, bob.id, None, None).await;
+    let (status, _) = send(
+        &app.router,
+        auth_patch(
+            &format!("/api/v1/agents/{bob_agent}"),
+            &bob_token,
+            json!({ "definition": with_connection.clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Visible but not usable (team viewer): 403.
+    let team = access_team(&app, "pf-spec-team").await;
+    app.store
+        .upsert_team_member(team, bob.id, "viewer")
+        .await
+        .unwrap();
+    app.store
+        .set_resource_visibility(
+            app.org_id,
+            "connections",
+            alice_connection,
+            "team",
+            Some(team),
+        )
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &app.router,
+        auth_post("/api/v1/agents", &bob_token, with_connection),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Providers: a private provider cannot be bound by another user.
+    let provider = app
+        .store
+        .create_provider(
+            app.org_id,
+            "pf-alice-provider",
+            "openai_compatible",
+            &json!({ "baseUrl": "http://127.0.0.1:9/v1" }),
+            None,
+        )
+        .await
+        .unwrap();
+    make_private(&app.store, app.org_id, "providers", provider.id, alice.id).await;
+    let mut with_provider = definition();
+    with_provider["spec"]["model"] =
+        json!({ "management": "platform", "provider": "pf-alice-provider", "model": "m" });
+    let (status, body) = send(
+        &app.router,
+        auth_post("/api/v1/agents", &bob_token, with_provider.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["details"][0]["path"], "spec.model.provider");
+    let (status, body) = send(
+        &app.router,
+        auth_post("/api/v1/agents", &alice_token, with_provider),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn rerun_applies_the_execute_preflight() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = operator(&app, "pf-rerun-alice@test.local").await;
+    let bob = operator(&app, "pf-rerun-bob@test.local").await;
+    let bob_token = token_for(&app.store, app.org_id, bob.id, "bob").await;
+    // Alice owns the connection and shares it org-wide; bob's agent binds it.
+    let connection = webhook_connection(&app, "Shared hook", alice.id).await;
+    share_org(&app, "connections", connection).await;
+    let agent = bound_agent(&app, bob.id, Some(connection), None).await;
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agents/{agent}/executions"),
+            &bob_token,
+            json!({ "task": "first" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let execution_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    app.store
+        .request_execution_cancel(app.org_id, execution_id)
+        .await
+        .unwrap();
+
+    // Baseline: rerun works while bob can use the connection.
+    let rerun = format!("/api/v1/executions/{execution_id}/rerun");
+    let (status, body) = send(&app.router, auth_post(&rerun, &bob_token, json!({}))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let second: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    app.store
+        .request_execution_cancel(app.org_id, second)
+        .await
+        .unwrap();
+
+    // Connection access revoked (alice makes it private again): the rerun is refused.
+    make_private(&app.store, app.org_id, "connections", connection, alice.id).await;
+    let (status, body) = send(&app.router, auth_post(&rerun, &bob_token, json!({}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["error"]["details"][0]["path"],
+        "spec.connectors[0].connectionId"
+    );
+
+    // Quota: maxExecutionsPerHour is enforced with 429.
+    let limited = bound_agent(&app, bob.id, None, Some(1)).await;
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agents/{limited}/executions"),
+            &bob_token,
+            json!({ "task": "once" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let first: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    app.store
+        .request_execution_cancel(app.org_id, first)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/executions/{first}/rerun"),
+            &bob_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+
+    // A harness that cannot run executions blocks the rerun.
+    let planned = HarnessRegistry::builtin()
+        .descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.kind == orbit_domain::HarnessKind::ClaudeCode)
+        .expect("claude code descriptor");
+    assert_ne!(planned.implementation_status.as_str(), "available");
+    app.store.upsert_harness_descriptor(&planned).await.unwrap();
+    let plain = bound_agent(&app, bob.id, None, None).await;
+    let agent_row = app.store.get_agent(app.org_id, plain).await.unwrap();
+    let version = app
+        .store
+        .get_current_version(app.org_id, &agent_row)
+        .await
+        .unwrap();
+    let blocked = app
+        .store
+        .create_execution(orbit_store::executions::NewExecution {
+            org_id: app.org_id,
+            agent_id: plain,
+            agent_version_id: version.id,
+            agent_name: &agent_row.name,
+            harness_kind: orbit_domain::HarnessKind::ClaudeCode,
+            trigger_source: orbit_domain::TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: json!({ "task": "x" }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: Some(bob.id),
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+    app.store
+        .request_execution_cancel(app.org_id, blocked.id)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/executions/{}/rerun", blocked.id),
+            &bob_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["details"][0]["path"], "harness");
+}
+
+#[tokio::test]
+async fn cancel_and_team_runs_require_use_not_just_view() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = operator(&app, "pf-use-alice@test.local").await;
+    let viola = operator(&app, "pf-use-viola@test.local").await;
+    let mark = operator(&app, "pf-use-mark@test.local").await;
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "alice").await;
+    let viola_token = token_for(&app.store, app.org_id, viola.id, "viola").await;
+    let mark_token = token_for(&app.store, app.org_id, mark.id, "mark").await;
+    let team = access_team(&app, "pf-use-team").await;
+    app.store
+        .upsert_team_member(team, viola.id, "viewer")
+        .await
+        .unwrap();
+    app.store
+        .upsert_team_member(team, mark.id, "member")
+        .await
+        .unwrap();
+
+    let agent = bound_agent(&app, alice.id, None, None).await;
+    app.store
+        .set_resource_visibility(app.org_id, "agents", agent, "team", Some(team))
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agents/{agent}/executions"),
+            &alice_token,
+            json!({ "task": "run" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let execution = body["id"].as_str().unwrap().to_string();
+
+    // A team viewer can see the execution but not cancel it.
+    let (status, _) = send(
+        &app.router,
+        auth_get(&format!("/api/v1/executions/{execution}"), &viola_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/executions/{execution}/cancel"),
+            &viola_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/executions/{execution}/cancel"),
+            &mark_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Team runs: viewer refused, member allowed.
+    let team_definition = json!({ "steps": [{ "agentId": agent }] });
+    let team_row = app
+        .store
+        .create_agent_team(app.org_id, "Use team", "", &team_definition, Some(alice.id))
+        .await
+        .unwrap();
+    app.store
+        .assign_resource_owner(app.org_id, "agent_teams", team_row.id, alice.id)
+        .await
+        .unwrap();
+    app.store
+        .set_resource_visibility(app.org_id, "agent_teams", team_row.id, "team", Some(team))
+        .await
+        .unwrap();
+    let runs = format!("/api/v1/agent-teams/{}/runs", team_row.id);
+    let (status, _) = send(
+        &app.router,
+        auth_post(&runs, &viola_token, json!({ "task": "go" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A caller-supplied repository outside the team's configured set is refused.
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &runs,
+            &mark_token,
+            json!({ "task": "go", "payload": { "repository": "evil/repo" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["details"][0]["path"], "payload.repository");
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(&runs, &mark_token, json!({ "task": "go" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A step agent bound to a connection the member cannot use blocks the run.
+    let secret = webhook_connection(&app, "Alice private hook", alice.id).await;
+    let bound = bound_agent(&app, alice.id, Some(secret), None).await;
+    app.store
+        .set_resource_visibility(app.org_id, "agents", bound, "team", Some(team))
+        .await
+        .unwrap();
+    let team2 = app
+        .store
+        .create_agent_team(
+            app.org_id,
+            "Bound team",
+            "",
+            &json!({ "steps": [{ "agentId": bound }] }),
+            Some(alice.id),
+        )
+        .await
+        .unwrap();
+    app.store
+        .set_resource_visibility(app.org_id, "agent_teams", team2.id, "team", Some(team))
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agent-teams/{}/runs", team2.id),
+            &mark_token,
+            json!({ "task": "go" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn tool_policies_require_manage_on_the_target_agent() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = operator(&app, "pf-policy-alice@test.local").await;
+    let carol = operator(&app, "pf-policy-carol@test.local").await;
+    let carol_token = token_with_scopes(
+        &app.store,
+        app.org_id,
+        carol.id,
+        "carol",
+        &["settings:write", "settings:read", "agents:read"],
+    )
+    .await;
+    let alice_agent = bound_agent(&app, alice.id, None, None).await;
+    make_private(&app.store, app.org_id, "agents", alice_agent, alice.id).await;
+    let carol_agent = bound_agent(&app, carol.id, None, None).await;
+    let policy = |agent: Option<Uuid>| {
+        json!({
+            "name": "allow bash",
+            "agentId": agent,
+            "action": "allow",
+            "matcher": { "tool": "bash" }
+        })
+    };
+
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/tool-policies",
+            &carol_token,
+            policy(Some(alice_agent)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/tool-policies",
+            &carol_token,
+            policy(Some(carol_agent)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let policy_id = body["id"].as_str().unwrap().to_string();
+
+    // Moving the policy onto an agent she cannot manage is refused too.
+    let (status, _) = send(
+        &app.router,
+        auth_json(
+            "PATCH",
+            &format!("/api/v1/tool-policies/{policy_id}"),
+            &carol_token,
+            policy(Some(alice_agent)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Org-wide policies keep requiring only settings:write.
+    let (status, body) = send(
+        &app.router,
+        auth_post("/api/v1/tool-policies", &carol_token, policy(None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn export_checks_the_read_permission_of_the_resource_kind() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let dave = operator(&app, "pf-export-dave@test.local").await;
+    let agents_only = token_with_scopes(
+        &app.store,
+        app.org_id,
+        dave.id,
+        "agents-only",
+        &["agents:read"],
+    )
+    .await;
+    let dave_agent = bound_agent(&app, dave.id, None, None).await;
+    let provider = app
+        .store
+        .create_provider(
+            app.org_id,
+            "pf-export-provider",
+            "openai_compatible",
+            &json!({ "baseUrl": "http://127.0.0.1:9/v1" }),
+            None,
+        )
+        .await
+        .unwrap();
+    share_org(&app, "providers", provider.id).await;
+
+    let (status, _) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/export/providers/{}", provider.id),
+            &agents_only,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = send(
+        &app.router,
+        auth_get(&format!("/api/v1/export/agents/{dave_agent}"), &agents_only),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let providers_reader = token_with_scopes(
+        &app.store,
+        app.org_id,
+        dave.id,
+        "providers",
+        &["agents:read", "providers:read"],
+    )
+    .await;
+    let (status, _) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/export/providers/{}", provider.id),
+            &providers_reader,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn scheduled_trigger_fails_when_its_owner_lost_connection_access() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = operator(&app, "pf-trigger-alice@test.local").await;
+    let bob = operator(&app, "pf-trigger-bob@test.local").await;
+    // Bob owns the connection and shares it org-wide; alice's agent and trigger use it.
+    let connection = webhook_connection(&app, "Bob trigger hook", bob.id).await;
+    share_org(&app, "connections", connection).await;
+    let agent = bound_agent(&app, alice.id, Some(connection), None).await;
+    let trigger = app
+        .store
+        .create_trigger(
+            app.org_id,
+            agent,
+            "schedule",
+            None,
+            json!({ "cron": "* * * * *" }),
+            true,
+        )
+        .await
+        .unwrap();
+    app.store
+        .assign_resource_owner(app.org_id, "triggers", trigger.id, alice.id)
+        .await
+        .unwrap();
+
+    // While the owner can use the connection the trigger runs.
+    let current = app.store.get_trigger(app.org_id, trigger.id).await.unwrap();
+    orbit_api::background::fire_trigger(&app.state, current)
+        .await
+        .expect("first fire succeeds");
+    let (executions, _, _) = app
+        .store
+        .list_executions(app.org_id, 50, None, None, Some(agent), None)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    app.store
+        .request_execution_cancel(app.org_id, executions[0].id)
+        .await
+        .unwrap();
+
+    // Bob withdraws the connection: the trigger owner has lost access at fire time.
+    make_private(&app.store, app.org_id, "connections", connection, bob.id).await;
+    let current = app.store.get_trigger(app.org_id, trigger.id).await.unwrap();
+    let error = orbit_api::background::fire_trigger(&app.state, current)
+        .await
+        .expect_err("fire is refused");
+    assert!(error.to_string().contains("refused"), "{error}");
+    let (executions, _, _) = app
+        .store
+        .list_executions(app.org_id, 50, None, None, Some(agent), None)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1, "no execution may be created");
+    let (logs, _) = app
+        .store
+        .list_audit_logs(app.org_id, 10, None, Some("trigger.fire_denied"))
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1);
 }

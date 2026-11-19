@@ -51,6 +51,17 @@ fn redact(value: &mut serde_json::Value) {
     }
 }
 
+/// The read permission that guards listing the resource kind (#140).
+fn read_permission(resource: &str) -> Permission {
+    match resource {
+        "providers" => Permission::ProvidersRead,
+        "connections" => Permission::ConnectionsRead,
+        "worker_profiles" | "agent_teams" => Permission::HarnessesRead,
+        "tool_policies" => Permission::SettingsRead,
+        _ => Permission::AgentsRead,
+    }
+}
+
 #[utoipa::path(get, path = "/api/v1/export/{resource}/{resource_id}", tag = "export", responses((status = 200, description = "Secret-free resource export")))]
 pub async fn export_resource(
     State(state): State<AppState>,
@@ -58,7 +69,7 @@ pub async fn export_resource(
     Path((resource, resource_id)): Path<(String, Uuid)>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    auth.require(Permission::AgentsRead)?;
+    auth.require(read_permission(&resource))?;
     let (owner_user, owner_team, visibility) = state
         .store
         .resource_ownership(auth.org_id, &resource, resource_id)

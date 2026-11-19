@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- One shared execution preflight (`crates/orbit-api/src/preflight.rs`) now guards every path that starts an execution: execute, rerun, runtime start and ticks, scheduled triggers, team runs and team steps, and queue starts. It checks agent use, use of every bound connection and the platform model provider, harness availability and the `maxExecutionsPerHour` quota. `rerun` previously skipped connection use, quota and harness checks (#140).
+- Scheduled triggers and continuous runtimes re-check access at run time for the stored identity (trigger owner, runtime creator, falling back to the agent owner). A trigger whose owner lost access fails with a recorded `trigger.fire_denied` audit entry and counts towards auto-disable; a runtime is stopped with the error (#140).
+- Creating, updating or importing an agent now requires use rights on every referenced connection and model provider (`404` if invisible, `403` if visible but not usable, with the field path in `details`) (#140).
+- `cancel` of an execution and creating a team run require use (not just view) on the agent/team. A team run's caller-supplied `payload.repository` / `payload.repositories` must be among the team's configured repositories (#140).
+- Tool policy create/update/delete require manage on the target agent (and on the new agent when it changes); `GET /export/{resource}/{id}` requires the read permission of the resource kind instead of `agents:read` for everything (#140).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
