@@ -193,7 +193,10 @@ impl WorkerClient {
                     .map(str::to_string)
             })
             .unwrap_or(body);
-        anyhow::anyhow!("worker API returned {status}: {message}")
+        anyhow::Error::new(crate::retry::ApiStatusError {
+            status: status.as_u16(),
+            message,
+        })
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> anyhow::Result<T> {

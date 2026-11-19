@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Worker: `running` and `complete` reports are retried with bounded exponential backoff
+  and jitter (a single 503 or timeout no longer strands an execution as `running`);
+  a runner error or panic now reports the execution `failed`, and the worker's `active`
+  entry is always released (#116).
+- Control plane: executions still `running` past `started_at + timeout_seconds + grace`
+  are ended as `timed_out` even when their worker keeps heartbeating (grace:
+  `ORBIT_EXECUTION_TIMEOUT_GRACE_SECONDS`, default 300; approval waits are excluded) (#116).
+- Worker shutdown stops claiming without dropping an in-flight claim, cancels in-flight
+  executions (including docker-driver containers), waits `ORBIT_WORKER_SHUTDOWN_GRACE_SECONDS`
+  (default 15) and reports anything left as failed with "worker shutdown" (#116).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

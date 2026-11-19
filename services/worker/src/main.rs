@@ -8,6 +8,7 @@ mod gitlab;
 mod kubernetes;
 mod liveness;
 mod mcp_broker;
+mod retry;
 mod runner;
 mod skills;
 mod subagents;
@@ -166,7 +167,9 @@ async fn main() -> anyhow::Result<()> {
         allow_web_fetch: session.allow_web_fetch,
         native_tool_permissions: session.native_tool_permissions,
         extra_env,
-        active: Arc::new(tokio::sync::Mutex::new(std::collections::BTreeMap::new())),
+        active: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        retry: retry::RetryPolicy::lifecycle(),
     };
 
     tracing::info!(
@@ -201,29 +204,35 @@ async fn main() -> anyhow::Result<()> {
     let semaphore = Arc::new(Semaphore::new(config.concurrency));
     liveness::spawn(state.clone(), config.heartbeat_interval);
 
-    loop {
-        tokio::select! {
-            _ = shutdown_signal() => {
-                tracing::info!("shutdown signal received; waiting for active executions");
-                break;
-            }
-            result = runner::claim_and_dispatch(&state, &semaphore, config.poll_interval) => {
-                if let Err(err) = result {
-                    tracing::error!(error = %err, "dispatch loop error");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
+    // The signal only flips `state.shutdown`; it never drops the dispatch loop, so a claim
+    // request already in flight finishes and its execution is tracked and reported.
+    let signal_state = state.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received; stopping claims and interrupting executions");
+        signal_state.shutdown.cancel();
+    });
+
+    while !state.shutdown.is_cancelled() {
+        if let Err(err) = runner::claim_and_dispatch(&state, &semaphore, config.poll_interval).await
+        {
+            tracing::error!(error = %err, "dispatch loop error");
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                _ = state.shutdown.cancelled() => {}
             }
         }
     }
 
-    // Give in-flight executions a bounded grace period.
-    for _ in 0..30 {
-        let active = state.active.lock().await.len();
-        if active == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
+    // Interrupt in-flight executions, wait a bounded grace period for them to report,
+    // then report whatever is left as failed ("worker shutdown").
+    let grace = Duration::from_secs(
+        std::env::var("ORBIT_WORKER_SHUTDOWN_GRACE_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(15),
+    );
+    runner::shutdown(&state, grace).await;
     if let Err(error) = state.client.offline(&state.worker_id).await {
         tracing::warn!(%error, "failed to remove worker heartbeat");
     }

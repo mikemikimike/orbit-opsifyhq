@@ -188,6 +188,65 @@ impl Store {
         .await?)
     }
 
+    /// End runs stuck `running` past their deadline, regardless of worker heartbeat.
+    ///
+    /// Liveness is otherwise tracked per worker: a healthy worker whose runner task died,
+    /// or whose `/complete` call never got through, keeps heartbeating while the run stays
+    /// `running` and holds the agent's concurrency slot. A run is ended as `timed_out`
+    /// once `started_at + timeout_seconds + grace_seconds` has passed. Time spent waiting
+    /// on approvals is added to the deadline because the worker pauses the run's clock
+    /// for it. The conditional `status = 'running'` makes this safe to run from several
+    /// API replicas and loses cleanly to a worker that reports in at the same moment.
+    pub async fn reap_timed_out_executions(
+        &self,
+        org_id: Option<Uuid>,
+        grace_seconds: i64,
+    ) -> StoreResult<Vec<ExecutionRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query_as::<_, ExecutionRecord>(
+            r#"
+            UPDATE executions e
+            SET status = 'timed_out',
+                error = jsonb_build_object(
+                    'code', 'execution_timeout',
+                    'message', 'execution exceeded its timeout and was not reported finished by its worker',
+                    'retryable', true
+                ),
+                finished_at = now(),
+                updated_at = now()
+            WHERE e.status = 'running'
+              AND e.started_at IS NOT NULL
+              AND ($2::uuid IS NULL OR e.org_id = $2)
+              AND e.started_at
+                  + make_interval(secs =>
+                        e.timeout_seconds::float8
+                        + $1
+                        + COALESCE((
+                            SELECT sum(EXTRACT(EPOCH FROM (COALESCE(a.decided_at, now()) - a.created_at)))
+                            FROM approvals a WHERE a.execution_id = e.id
+                          ), 0)::float8
+                    ) < now()
+            RETURNING e.*
+            "#,
+        )
+        .bind(grace_seconds as f64)
+        .bind(org_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if !rows.is_empty() {
+            let ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+            sqlx::query(
+                "UPDATE approvals SET status = 'expired', decided_at = now() WHERE execution_id = ANY($1) AND status = 'pending'",
+            )
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(rows)
+    }
+
     pub async fn list_worker_heartbeats(&self) -> StoreResult<Vec<WorkerHeartbeat>> {
         Ok(sqlx::query_as::<_, WorkerHeartbeat>(
             "SELECT * FROM worker_heartbeats ORDER BY last_heartbeat_at DESC",
