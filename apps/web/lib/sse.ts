@@ -1,4 +1,5 @@
 import { eventStreamUrl, getAccessToken } from "./api";
+import { apiErrorFromResponse, handleUnauthorized } from "./http";
 
 export interface ParsedSseEvent {
   event: string;
@@ -18,6 +19,9 @@ export async function streamExecutionEvents(
     lastEventId?: string;
     afterSeq?: number;
     onEvent: (event: ParsedSseEvent) => void;
+    /** Called once the server accepted the stream (HTTP 200), before any event. */
+    onOpen?: () => void;
+    /** Called with an `ApiError` for HTTP failures (check `status`), or the network error. */
     onError?: (error: unknown) => void;
   },
 ): Promise<void> {
@@ -37,9 +41,12 @@ export async function streamExecutionEvents(
       signal: options.signal,
       cache: "no-store",
     });
-    if (!response.ok || !response.body) {
-      throw new Error(`event stream failed with HTTP ${response.status}`);
+    if (!response.ok) {
+      if (response.status === 401) handleUnauthorized();
+      throw await apiErrorFromResponse(response);
     }
+    if (!response.body) throw new Error("The event stream has no body");
+    options.onOpen?.();
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();

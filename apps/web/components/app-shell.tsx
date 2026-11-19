@@ -3,6 +3,12 @@
 import { useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
 
+import { CloudOff, RefreshCw } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/ui/empty-state";
+import { isSessionError } from "@/lib/http";
+import { errorMessage } from "@orbit/api-client";
 import { BrandMark, Wordmark } from "@/components/shell/brand";
 import { CommandPaletteProvider } from "@/components/shell/command-palette";
 import { MobileHeader, MobileTabBar } from "@/components/shell/mobile-nav";
@@ -28,12 +34,23 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     const login = `/login?next=${encodeURIComponent(pathname)}`;
     if (!getAccessToken()) {
       router.replace(login);
-    } else if (me.isError) {
-      // Expired or foreign token: clear it instead of treating it as a session.
+    } else if (isSessionError(me.error)) {
+      // 401 (expired or foreign token) or 403 (user disabled): the session is over.
+      // Any other failure (5xx, network) keeps the token and shows a retry state below.
       setAccessToken(null);
       router.replace(login);
     }
-  }, [meta.data?.auth, me.isError, pathname, publicPath, router]);
+  }, [meta.data?.auth, me.error, pathname, publicPath, router]);
+
+  const authMode = (meta.data?.auth ?? {}) as { mode?: string };
+  const sessionUnavailable =
+    authMode.mode === "oidc" && !publicPath && !me.data && me.isError && !isSessionError(me.error)
+      ? {
+          message: errorMessage(me.error),
+          retrying: me.isFetching,
+          retry: () => void me.refetch(),
+        }
+      : null;
 
   const title = publicPath ? "Sign in · ORBIT" : `${pageLabel(pathname)} · ORBIT`;
 
@@ -57,7 +74,22 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     <>
       {/* React hoists <title> into <head>; the root layout sets none, so this is the only one. */}
       <title>{title}</title>
-      <SignedInShell pathname={pathname}>{children}</SignedInShell>
+      <SignedInShell pathname={pathname}>
+        {sessionUnavailable ? (
+          <EmptyState
+            icon={<CloudOff />}
+            title="Can't reach ORBIT right now"
+            description={`You are still signed in. ${sessionUnavailable.message}`}
+            action={
+              <Button onClick={sessionUnavailable.retry} loading={sessionUnavailable.retrying}>
+                <RefreshCw /> Retry
+              </Button>
+            }
+          />
+        ) : (
+          children
+        )}
+      </SignedInShell>
     </>
   );
 }

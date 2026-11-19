@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Web: a transient `/me` failure (5xx, API restart, network blip) no longer signs the
+  user out. Only 401 (and 403 for disabled users) clears the session; other errors keep
+  it and show a retry state. Failed queries no longer retry 4xx responses (#126).
+- Web: the execution event stream stops retrying on 401/403/404 (401 signs out, 403/404
+  show a forbidden/not-found state), backs off exponentially with jitter (up to 30 s) on
+  5xx and network errors, and clears its error after reconnecting (#126).
+- Web: the license query, provider connection test and agent YAML export now go through
+  the shared request helper, so they use the same base URL, handle 401 like every other
+  call and show readable messages for non-JSON error responses (#126).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
