@@ -150,7 +150,7 @@ production-grade database deployment.
 team runs and worker launches older than that window. Records are never deleted; the
 default list simply hides archived runs, and the UI can switch to Active/Archived/All.
 
-`platform.auditRetentionDays` (`ORBIT_AUDIT_RETENTION_DAYS`, default `365`, `0` keeps
+`platform.auditRetentionDays` (`ORBIT_AUDIT_RETENTION_DAYS`, default `0`, which keeps
 audit logs forever) deletes audit log entries older than that window once a day. Unlike
 archiving, this permanently removes rows; set `0` if compliance requires indefinite retention.
 

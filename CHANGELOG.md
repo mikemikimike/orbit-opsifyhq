@@ -10,8 +10,9 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ### Changed
 
-- Audit logs are now pruned daily after `ORBIT_AUDIT_RETENTION_DAYS` days (default 365,
-  `0` keeps them forever; Helm `platform.auditRetentionDays`). (#130)
+- Optional audit-log retention: set `ORBIT_AUDIT_RETENTION_DAYS` (Helm
+  `platform.auditRetentionDays`) to prune entries older than N days daily; unset or `0`
+  keeps them forever (default). (#130)
 - Workspace `repository` metadata points at `opsifyhq/orbit` and is inherited by all crates. (#130)
 
 ### Removed

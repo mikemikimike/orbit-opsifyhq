@@ -113,7 +113,7 @@ append-only.
 | `platform.logFormat` | `json` | `text` for local |
 | `platform.bodyLimitBytes` | `2097152` | |
 | `platform.archiveAfterDays` | `30` | archive terminal runs older than N days; `0` disables |
-| `platform.auditRetentionDays` | `365` | delete audit log entries older than N days; `0` keeps forever |
+| `platform.auditRetentionDays` | `0` | delete audit log entries older than N days; `0` (default) keeps forever |
 
 ### Database and bus
 

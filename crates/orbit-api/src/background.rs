@@ -142,25 +142,26 @@ pub fn spawn(state: AppState) {
     });
 }
 
-/// Default audit-log retention when `ORBIT_AUDIT_RETENTION_DAYS` is unset.
-const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 365;
-
-/// Parse `ORBIT_AUDIT_RETENTION_DAYS`: unset/invalid -> default, `0` -> keep forever.
+/// Parse `ORBIT_AUDIT_RETENTION_DAYS`. Unset, empty, `0` or invalid -> keep audit logs
+/// forever (`None`). Deleting audit history is opt-in so an upgrade never prunes it.
 fn audit_retention_days(raw: Option<&str>) -> Option<u32> {
     match raw.map(str::trim).filter(|value| !value.is_empty()) {
-        None => Some(DEFAULT_AUDIT_RETENTION_DAYS),
+        None => None,
         Some(value) => match value.parse::<u32>() {
             Ok(0) => None,
             Ok(days) => Some(days),
             Err(_) => {
-                tracing::warn!(value, "invalid ORBIT_AUDIT_RETENTION_DAYS; using default");
-                Some(DEFAULT_AUDIT_RETENTION_DAYS)
+                tracing::warn!(
+                    value,
+                    "invalid ORBIT_AUDIT_RETENTION_DAYS; keeping audit logs"
+                );
+                None
             }
         },
     }
 }
 
-/// Delete audit log rows older than `ORBIT_AUDIT_RETENTION_DAYS` (default 365, `0` keeps
+/// Delete audit log rows older than `ORBIT_AUDIT_RETENTION_DAYS` (unset or `0` keeps
 /// everything). Runs daily; the delete is idempotent so multiple API replicas are safe.
 fn spawn_audit_retention(state: AppState) {
     let Some(days) =
@@ -711,10 +712,10 @@ mod tests {
 
     #[test]
     fn audit_retention_parsing() {
-        assert_eq!(audit_retention_days(None), Some(365));
-        assert_eq!(audit_retention_days(Some("")), Some(365));
+        assert_eq!(audit_retention_days(None), None);
+        assert_eq!(audit_retention_days(Some("")), None);
         assert_eq!(audit_retention_days(Some("90")), Some(90));
         assert_eq!(audit_retention_days(Some("0")), None);
-        assert_eq!(audit_retention_days(Some("abc")), Some(365));
+        assert_eq!(audit_retention_days(Some("abc")), None);
     }
 }

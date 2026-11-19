@@ -80,5 +80,5 @@ database or the event bus directly.
 - **Retention** (every 6h) archives terminal executions, team runs and worker launches
   older than `ORBIT_ARCHIVE_AFTER_DAYS` (default 30, `0` disables).
 - **Audit retention** (daily) deletes `audit_logs` rows older than
-  `ORBIT_AUDIT_RETENTION_DAYS` (default 365, `0` keeps them forever).
+  `ORBIT_AUDIT_RETENTION_DAYS` (unset or `0`, the default, keeps them forever).
 - **Execution reaper** (every 15s) marks orphaned running executions failed.
