@@ -40,6 +40,9 @@ struct LauncherRequest {
     ca_secret_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     single_execution_id: Option<Uuid>,
+    /// Execution timeout; the launcher derives the Job `activeDeadlineSeconds` from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,12 +323,14 @@ pub(crate) async fn launch_profile_internal(
         )
         .await?;
     let worker_id = format!("worker-{}", &launch.id.to_string()[..8]);
+    let mut timeout_seconds = None;
     if let Some(execution_id) = single_execution_id {
-        state
+        let claimed = state
             .store
             .claim_execution(execution_id, &worker_id)
             .await?
             .ok_or_else(|| ApiError::conflict("execution is no longer queued for this launch"))?;
+        timeout_seconds = Some(claimed.timeout_seconds.max(1) as u64);
     }
     let request = LauncherRequest {
         launch_id: launch.id,
@@ -345,6 +350,7 @@ pub(crate) async fn launch_profile_internal(
         ca_secret_name: state.ca_secret_name.clone(),
         ca_secret_key: state.ca_secret_key.clone(),
         single_execution_id,
+        timeout_seconds,
     };
     let result: LauncherStatus = match call_launcher(
         state,

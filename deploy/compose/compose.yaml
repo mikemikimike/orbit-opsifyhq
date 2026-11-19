@@ -99,6 +99,11 @@ services:
       ORBIT_PI_AGENT_HOST_DIR: ${ORBIT_PI_AGENT_HOST_DIR:-}
       ORBIT_LAUNCHER_IMAGE_ALIASES: ${ORBIT_LAUNCHER_IMAGE_ALIASES:-}
       ORBIT_LOG_FORMAT: ${ORBIT_LOG_FORMAT:-text}
+    # The image runs as UID 10001; it needs the group that owns the Docker socket.
+    # Docker Desktop exposes the socket to group 0; on Linux set DOCKER_GID to
+    # `stat -c %g /var/run/docker.sock`.
+    group_add:
+      - "${DOCKER_GID:-0}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ../../.orbit-auth-export.json:/auth/auth-export.json:ro

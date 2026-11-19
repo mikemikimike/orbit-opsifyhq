@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Launcher: launch status is derived from the current container state. OOM is reported only
+  for `reason == "OOMKilled"` (Kubernetes) or `State.OOMKilled` (Docker), not exit code 137,
+  and a past OOM after a successful restart is a hint, not a failure (#120).
+- Launcher: Deployments in CrashLoopBackOff, ImagePullBackOff, ErrImagePull or
+  CreateContainerConfigError report `failed` with a message; failed Jobs and non-zero
+  Docker exits carry an error message (#120).
+- Launcher: single-execution Jobs set `activeDeadlineSeconds` from the execution timeout;
+  exited single-execution Docker containers are pruned after a retention window (#120).
+- Launcher: Helm startup/liveness/readiness probes and a non-root (UID 10001) image (#120).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
