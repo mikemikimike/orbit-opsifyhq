@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- OpenCode adapter now enforces the agent autonomy level for native tools: at Observe/Recommend, `bash` and file-mutating tools are denied and `--auto` is not passed; worker-profile permissions can only tighten this baseline (#110).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
