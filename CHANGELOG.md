@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- Dev auth mode no longer authenticates requests carrying a wrong bearer token when
+  `ORBIT_DEV_AUTH_ALLOW_ANONYMOUS=false`; only the exact dev token is accepted, compared in
+  constant time (#143).
+- The SSO login `next` parameter is validated to a same-origin path before it is stored
+  and before the post-login redirect, closing an open redirect (#143).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
