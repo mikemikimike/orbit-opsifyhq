@@ -139,7 +139,7 @@ helm template orbit deploy/helm/orbit -f deploy/helm/orbit/values.yaml
 
 ## Local requirements
 
-- Rust stable (>= 1.85, pinned by `rust-toolchain.toml`)
+- Rust 1.100.0 (pinned in `rust-toolchain.toml`; CI and Docker use the same version; MSRV is 1.85). Bump all three together
 - Node >= 20 and pnpm 10+ (`corepack enable`)
 - Docker + Compose v2
 - Helm 3 and (for cluster validation) kubectl + kind/k3d

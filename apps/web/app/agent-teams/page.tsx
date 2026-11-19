@@ -436,7 +436,6 @@ export default function AgentTeamsPage() {
       setTab("runs");
       void inspect(runId);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function patchWorkSource(patch: Partial<WorkSource>) {

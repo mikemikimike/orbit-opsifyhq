@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # ORBIT execution-plane worker. Harness binaries are NOT bundled here: harness
 # containers/Jobs are separate images by design (see docs/architecture/harness-contract.md).
-FROM rust:1-bookworm AS builder
+FROM rust:1.100-bookworm AS builder
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./

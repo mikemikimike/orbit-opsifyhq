@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Changed
+
+- CI gates (#127): `cargo audit`, `pnpm audit --audit-level=high` and TruffleHog (verified
+  secrets only) now fail the build; the only ignored advisory (`RUSTSEC-2024-0449`) is
+  documented in `ci.yml`. Third-party actions are pinned to commit SHAs.
+- Pull requests now run `helm lint` + `helm template` and build the api, worker, web and
+  launcher images without pushing them. Tag and release behaviour is unchanged.
+- Rust toolchain pinned to 1.100.0 in `rust-toolchain.toml` (CI installs from it) and
+  Docker base images to `rust:1.100-bookworm` / `node:22.23`.
+- Root `pnpm build` now works (it called build scripts that do not exist in the
+  consumed-as-source packages). The `lint` scripts, which only ran `tsc`, are removed in
+  favour of `typecheck`, along with the dead `eslint-disable` comments.
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

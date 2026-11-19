@@ -2,7 +2,7 @@
 # Pi-enabled execution worker. Pi is a Node package; the Rust worker binaries come from
 # the base worker image. Auth is mounted externally (PI_CODING_AGENT_DIR).
 ARG WORKER_BASE=orbit-worker:latest
-FROM node:22-bookworm-slim AS node
+FROM node:22.23-bookworm-slim AS node
 FROM ${WORKER_BASE}
 
 USER root

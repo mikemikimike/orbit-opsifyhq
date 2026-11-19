@@ -2,7 +2,7 @@
 
 ## Prerequisites
 - Docker (Compose v2) and make
-- Rust stable (>= 1.85; pinned via `rust-toolchain.toml`)
+- Rust 1.100.0 (pinned via `rust-toolchain.toml`, installed automatically by rustup; MSRV 1.85). Docker images use `rust:1.100-bookworm`; bump both together
 - Node.js >= 20 and pnpm 10+ (`corepack enable && corepack prepare pnpm@latest --activate`)
 
 ## Fast path (everything in containers)

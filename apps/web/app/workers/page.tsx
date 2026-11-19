@@ -349,7 +349,6 @@ function WorkersPageInner() {
       }, 300);
     }
     // openEdit is a plain function recreated every render; running once is the point.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [deepLinked, profiles.data, searchParams]);
 
   const activeProfileLaunches = (launches.data ?? []).filter(

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # ORBIT control plane (orbit-api). Multi-stage, non-root, reproducible with --locked.
-FROM rust:1-bookworm AS builder
+FROM rust:1.100-bookworm AS builder
 WORKDIR /app
 
 # Dependency layer: manifests first for better build caching.
