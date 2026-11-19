@@ -65,6 +65,78 @@ fn validated(body: &EnvMappingRequest) -> Result<(String, String, serde_json::Va
     ))
 }
 
+/// Every secret and connection a mapping routes into worker env must belong to the
+/// caller's org and be usable by the caller. Foreign and unknown references are reported
+/// identically so the response never confirms that a secret exists elsewhere, and
+/// nothing about secret values is ever included.
+async fn validate_references(
+    state: &AppState,
+    auth: &AuthContext,
+    mappings: &serde_json::Value,
+) -> Result<(), ApiError> {
+    let access = crate::access::AccessScope::load(state, auth).await?;
+    let mut issues = Vec::new();
+    for (index, item) in mappings
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        if let Some(value) = item.get("connectionId").and_then(|v| v.as_str()) {
+            let usable = match Uuid::parse_str(value) {
+                Ok(id) => match state.store.get_connection(auth.org_id, id).await {
+                    Ok(connection) => access
+                        .require_use(
+                            "connection",
+                            connection.owner_user_id,
+                            connection.owner_team_id,
+                            &connection.visibility,
+                        )
+                        .is_ok(),
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            if !usable {
+                issues.push(ValidationIssue::new(
+                    "mappings",
+                    format!("mapping {index}: connection not found or not usable"),
+                ));
+            }
+        }
+        for field in ["secretRef", "secretKey"] {
+            let Some(reference) = item.get(field).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let usable = match state.store.secret_owner(auth.org_id, reference).await? {
+                Some(owner) if owner.kind != "output" => access
+                    .require_use(
+                        "secret",
+                        owner.owner_user_id,
+                        owner.owner_team_id,
+                        &owner.visibility,
+                    )
+                    .is_ok(),
+                _ => false,
+            };
+            if !usable {
+                issues.push(ValidationIssue::new(
+                    "mappings",
+                    format!(
+                        "mapping {index}: {field} does not reference a secret you can use in this organization"
+                    ),
+                ));
+            }
+        }
+    }
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::validation(issues))
+    }
+}
+
 #[utoipa::path(get, path = "/api/v1/env-mappings", tag = "env-mappings", responses((status = 200, body = [EnvMapping])))]
 pub async fn list(
     State(state): State<AppState>,
@@ -82,6 +154,7 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<EnvMapping>), ApiError> {
     auth.require(Permission::SettingsWrite)?;
     let (name, description, mappings) = validated(&body)?;
+    validate_references(&state, &auth, &mappings).await?;
     let mapping = state
         .store
         .create_env_mapping(auth.org_id, &name, &description, &mappings)
@@ -107,6 +180,7 @@ pub async fn update(
 ) -> Result<Json<EnvMapping>, ApiError> {
     auth.require(Permission::SettingsWrite)?;
     let (name, description, mappings) = validated(&body)?;
+    validate_references(&state, &auth, &mappings).await?;
     let mapping = state
         .store
         .update_env_mapping(auth.org_id, mapping_id, &name, &description, &mappings)

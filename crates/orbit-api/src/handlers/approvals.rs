@@ -105,12 +105,24 @@ async fn decide(
         .get_agent(auth.org_id, execution.agent_id)
         .await?;
     let access = crate::access::AccessScope::load(&state, &auth).await?;
-    access.require_view(
+    // Deciding lets the agent run a gated action, so it needs the same access as running
+    // the agent (use/manage), not just visibility. Invisible agents stay 404.
+    access.require_use(
         "approval",
         agent.owner_user_id,
         agent.owner_team_id,
         &agent.visibility,
     )?;
+    // Optional four-eyes policy: whoever requested the execution cannot decide it.
+    if execution.requested_by == Some(auth.user_id)
+        && crate::handlers::settings::load_approvals_settings(&state.store)
+            .await?
+            .approvals_require_different_approver
+    {
+        return Err(ApiError::forbidden(
+            "approvals require a different approver than the user who requested the execution",
+        ));
+    }
     let approval = state
         .store
         .decide_approval(

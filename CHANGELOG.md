@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- Approvals: deciding now requires use/manage access to the agent in addition to
+  `approvals:decide`; new optional `approvalsRequireDifferentApprover` setting
+  (`/api/v1/settings/approvals`, default off) stops the requester from approving their own
+  execution; expired approvals can no longer be decided (409); worker approval waits are
+  bound to their execution, `waitSeconds` is clamped to 24 h and pending approvals are
+  capped at 50 per execution (#144).
+- Environment mappings: `secretRef`/`secretKey`/`connectionId` are validated against the
+  caller's org and access (422) and worker env resolution is org-scoped (#144).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

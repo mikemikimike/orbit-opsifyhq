@@ -166,6 +166,11 @@ pub struct CreateApprovalRequest {
     pub wait_seconds: u64,
 }
 
+/// Upper bound for how long an approval request stays decidable (24 h).
+const MAX_APPROVAL_WAIT_SECONDS: u64 = 24 * 60 * 60;
+/// Cap on simultaneously pending approvals per execution.
+const MAX_PENDING_APPROVALS_PER_EXECUTION: i64 = 50;
+
 fn default_approval_wait() -> u64 {
     300
 }
@@ -567,7 +572,7 @@ async fn resolve_team_env(
             let Some(reference) = row.connection.credential_ref.as_deref() else {
                 continue;
             };
-            let Ok(Some(secret)) = store.get_secret_value(reference).await else {
+            let Ok(Some(secret)) = store.get_secret_value_for_org(org_id, reference).await else {
                 continue;
             };
             let token = secret.expose().to_string();
@@ -628,7 +633,7 @@ async fn resolve_team_env(
                 match store.get_connection(org_id, connection_id).await {
                     Ok(connection) => match connection.credential_ref {
                         Some(reference) => store
-                            .get_secret_value(&reference)
+                            .get_secret_value_for_org(org_id, &reference)
                             .await
                             .ok()
                             .flatten()
@@ -639,7 +644,7 @@ async fn resolve_team_env(
                 }
             } else if let Some(reference) = item.secret_ref.as_ref().or(item.secret_key.as_ref()) {
                 store
-                    .get_secret_value(reference)
+                    .get_secret_value_for_org(org_id, reference)
                     .await
                     .ok()
                     .flatten()
@@ -802,13 +807,24 @@ pub async fn create_approval(
     crate::extract::ApiJson(body): crate::extract::ApiJson<CreateApprovalRequest>,
 ) -> Result<Json<Approval>, ApiError> {
     let execution = ensure_execution(&state, &auth, body.execution_id).await?;
+    if state
+        .store
+        .count_pending_approvals(auth.org_id, execution.id)
+        .await?
+        >= MAX_PENDING_APPROVALS_PER_EXECUTION
+    {
+        return Err(ApiError::rate_limited(
+            "too many pending approvals for this execution",
+        ));
+    }
+    let wait_seconds = body.wait_seconds.clamp(1, MAX_APPROVAL_WAIT_SECONDS) as i64;
     let approval = state
         .store
         .create_approval(
             auth.org_id,
             execution.id,
             body.action,
-            Some(Utc::now() + chrono::Duration::seconds(body.wait_seconds as i64)),
+            Some(Utc::now() + chrono::Duration::seconds(wait_seconds)),
         )
         .await?;
     Ok(Json(approval))
@@ -821,6 +837,10 @@ pub async fn await_approval(
     Query(query): Query<ApprovalQuery>,
 ) -> Result<Json<Approval>, ApiError> {
     ensure_execution(&state, &auth, query.execution_id).await?;
+    let existing = state.store.get_approval(auth.org_id, approval_id).await?;
+    if existing.execution_id != query.execution_id {
+        return Err(ApiError::not_found("approval"));
+    }
     Ok(Json(
         state
             .store
@@ -1283,7 +1303,7 @@ pub async fn resolve_env(
                     if let Some(ref secret_ref) = conn.credential_ref {
                         state
                             .store
-                            .get_secret_value(secret_ref)
+                            .get_secret_value_for_org(auth.org_id, secret_ref)
                             .await
                             .ok()
                             .flatten()
@@ -1298,7 +1318,7 @@ pub async fn resolve_env(
         {
             state
                 .store
-                .get_secret_value(secret_ref)
+                .get_secret_value_for_org(auth.org_id, secret_ref)
                 .await
                 .ok()
                 .flatten()
