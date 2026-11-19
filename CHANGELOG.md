@@ -6,6 +6,29 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Added
+
+- Portable, secret-free export for agents, skills, connections, model providers, worker
+  profiles, agent teams, triggers and tool policies (`GET /api/v1/export/{resource}/{id}?format=yaml|markdown`):
+  an `apiVersion`/`kind`/`metadata`/`spec` envelope that references other resources by
+  name, `SKILL.md` for skills, and recursive redaction of credentials and credential
+  references (#80).
+- `POST /api/v1/import` for those documents and for multi-document bundles, with
+  `mode=create|update|upsert` (default create: a name conflict is a 409 and nothing is
+  overwritten), `dryRun=true` validation reports listing conflicts and unresolved
+  references, per-kind permission checks and audit entries (#80). Credentials in files are
+  never imported.
+- Export and Import actions on the Agents, Skills, Connectors, Model providers, Agent teams
+  and Workers pages; the import dialog shows the validation report before anything is
+  written (#80).
+
+### Changed
+
+- `GET /api/v1/agents/{id}/export` and the JSON export now return the redacted portable
+  document (connections by name instead of `connectionId`) (#80).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
