@@ -81,7 +81,7 @@ pub struct OidcConfig {
     pub auto_create_teams: bool,
     /// Deny users whose IdP groups do not match any configured role/team mapping.
     pub require_mapped_group: bool,
-    /// Re-evaluate the stored role on every login when a mapping matches. Without this,
+    /// Re-evaluate the stored role on login, only when a group mapping matches. Without this,
     /// the mapped role is only used at auto-provisioning.
     pub sync_roles: bool,
     pub clock_skew_seconds: u64,

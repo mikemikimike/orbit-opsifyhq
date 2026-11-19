@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- OIDC role sync no longer resets manually assigned roles to the default role when a user's groups match no role mapping (#124).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added
