@@ -1305,3 +1305,520 @@ async fn same_agent_queues_on_different_harnesses() {
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(second["harnessKind"], "pi");
 }
+
+// ---- #139: worker identity binding, memory scoping, launch visibility ----
+
+fn worker_request(method: &str, path: &str, token: &str, body: Option<Value>) -> Request<Body> {
+    let builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"));
+    match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+async fn worker_token(store: &Store, org_id: Uuid, name: &str) -> String {
+    let issued = orbit_security::issue_worker_token();
+    store
+        .create_worker_token(
+            org_id,
+            None,
+            name,
+            &issued.prefix,
+            &issued.hash,
+            &["mock".to_string()],
+        )
+        .await
+        .expect("worker token");
+    issued.token
+}
+
+async fn queue_execution(app: &TestApp, key: &str) -> Uuid {
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agents/{}/executions", app.agent_id),
+            "test-token",
+            json!({ "task": key }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    Uuid::parse_str(body["id"].as_str().unwrap()).unwrap()
+}
+
+async fn claim_as(app: &TestApp, token: &str, worker_id: &str) -> Option<Uuid> {
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/claim",
+            token,
+            Some(json!({ "workerId": worker_id, "harnesses": ["mock"], "target": "local" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["execution"]["execution"]["id"]
+        .as_str()
+        .map(|id| Uuid::parse_str(id).unwrap())
+}
+
+#[tokio::test]
+async fn worker_cannot_act_on_execution_claimed_by_another_worker() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let token_a = worker_token(&app.store, app.org_id, "worker-a").await;
+    let token_b = worker_token(&app.store, app.org_id, "worker-b").await;
+    let queued = queue_execution(&app, "bound execution").await;
+
+    // Unclaimed executions are not reachable through the worker surface.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            &format!("/api/v1/worker/executions/{queued}/events"),
+            &token_a,
+            Some(json!({ "kind": "log", "level": "info", "message": "early" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let claimed = claim_as(&app, &token_a, "worker-a").await.expect("claimed");
+    assert_eq!(claimed, queued);
+
+    let base = format!("/api/v1/worker/executions/{claimed}");
+    // Worker B is rejected on every execution-scoped endpoint, with the error envelope.
+    let attempts = [
+        ("GET", format!("{base}/context"), None),
+        ("GET", format!("{base}/cancel"), None),
+        (
+            "POST",
+            format!("{base}/running"),
+            Some(json!({ "sessionRef": "s" })),
+        ),
+        (
+            "POST",
+            format!("{base}/events"),
+            Some(json!({ "kind": "log", "level": "info", "message": "forged" })),
+        ),
+        (
+            "POST",
+            format!("{base}/complete"),
+            Some(json!({ "status": "succeeded", "output": { "forged": true } })),
+        ),
+        (
+            "POST",
+            "/api/v1/worker/approvals".to_string(),
+            Some(json!({ "executionId": claimed, "action": { "a": 1 } })),
+        ),
+        (
+            "POST",
+            "/api/v1/worker/audit".to_string(),
+            Some(json!({ "executionId": claimed, "action": "x" })),
+        ),
+    ];
+    for (method, path, body) in attempts {
+        let (status, body) = send(&app.router, worker_request(method, &path, &token_b, body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+        assert!(body["error"]["code"].is_string(), "{path}: {body}");
+    }
+    let untouched = app.store.get_execution(app.org_id, claimed).await.unwrap();
+    assert_eq!(untouched.status, "dispatched");
+    assert!(untouched.output.is_none());
+
+    // The claiming worker still drives its execution end to end.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            &format!("{base}/running"),
+            &token_a,
+            Some(json!({ "sessionRef": "s" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            &format!("{base}/events"),
+            &token_a,
+            Some(json!({ "kind": "log", "level": "info", "message": "ok" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            &format!("{base}/complete"),
+            &token_a,
+            Some(json!({ "status": "succeeded", "output": { "ok": true } })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["updated"], true);
+}
+
+#[tokio::test]
+async fn illegal_status_transitions_are_rejected() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    // queued -> succeeded is refused by the store.
+    let queued = queue_execution(&app, "illegal transition").await;
+    let result = app
+        .store
+        .finish_execution(
+            queued,
+            orbit_domain::ExecutionStatus::Succeeded,
+            Some(&json!({ "forged": true })),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(result.is_none());
+    let current = app.store.get_execution(app.org_id, queued).await.unwrap();
+    assert_eq!(current.status, "queued");
+    assert!(current.output.is_none());
+
+    // Cancellation from queued is still allowed (and frees the agent's concurrency slot).
+    let cancelled = app
+        .store
+        .request_execution_cancel(app.org_id, queued)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+
+    // dispatched -> succeeded (skipping `running`) is refused through the API too.
+    queue_execution(&app, "dispatched transition").await;
+    let token = worker_token(&app.store, app.org_id, "worker-t").await;
+    let claimed = claim_as(&app, &token, "worker-t").await.unwrap();
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            &format!("/api/v1/worker/executions/{claimed}/complete"),
+            &token,
+            Some(json!({ "status": "succeeded", "output": { "x": 1 } })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["updated"], false);
+    let current = app.store.get_execution(app.org_id, claimed).await.unwrap();
+    assert_eq!(current.status, "dispatched");
+}
+
+#[tokio::test]
+async fn worker_memory_requires_a_bound_execution_and_uses_its_agent() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let token_a = worker_token(&app.store, app.org_id, "mem-a").await;
+    let token_b = worker_token(&app.store, app.org_id, "mem-b").await;
+    let execution = queue_execution(&app, "memory").await;
+    claim_as(&app, &token_a, "mem-a").await.expect("claimed");
+    let owner = app.store.list_users(app.org_id).await.unwrap()[0].id;
+    let other_agent = create_demo_agent(&app.store, app.org_id, owner).await;
+
+    // execution_id is mandatory.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/memory/store",
+            &token_a,
+            Some(json!({ "agentId": other_agent, "kind": "short_term", "content": "x" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Another worker cannot use the execution to reach the agent's memory.
+    for path in ["list", "store"] {
+        let (status, _) = send(
+            &app.router,
+            worker_request(
+                "POST",
+                &format!("/api/v1/worker/memory/{path}"),
+                &token_b,
+                Some(json!({ "executionId": execution, "kind": "k", "content": "x" })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+
+    // A caller-supplied agent id that differs from the execution's agent is refused.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/memory/store",
+            &token_a,
+            Some(json!({
+                "executionId": execution,
+                "agentId": other_agent,
+                "kind": "short_term",
+                "content": "poison"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(app
+        .store
+        .list_memory(app.org_id, other_agent, None, 20)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Without agentId the entry lands on the execution's own agent.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/memory/store",
+            &token_a,
+            Some(json!({ "executionId": execution, "kind": "short_term", "content": "mine" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, listed) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/memory/list",
+            &token_a,
+            Some(json!({ "executionId": execution })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed[0]["content"], "mine");
+
+    // Oversize content is rejected with a 413 envelope.
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/memory/store",
+            &token_a,
+            Some(json!({
+                "executionId": execution,
+                "kind": "short_term",
+                "content": "x".repeat(64 * 1024 + 1)
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body["error"]["code"], "payload_too_large");
+}
+
+#[tokio::test]
+async fn worker_offline_and_heartbeat_are_owner_scoped() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let token_a = worker_token(&app.store, app.org_id, "hb-a").await;
+    let token_b = worker_token(&app.store, app.org_id, "hb-b").await;
+    let worker_id = format!("hb-worker-{}", Uuid::now_v7());
+    let beat = json!({ "workerId": worker_id, "harnesses": ["mock"], "target": "local" });
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/heartbeat",
+            &token_a,
+            Some(beat.clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Another token can neither take over nor delete the record.
+    let (status, _) = send(
+        &app.router,
+        worker_request("POST", "/api/v1/worker/heartbeat", &token_b, Some(beat)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "DELETE",
+            &format!("/api/v1/worker/heartbeat/{worker_id}"),
+            &token_b,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let listed = app.store.list_worker_heartbeats(app.org_id).await.unwrap();
+    assert!(listed.iter().any(|w| w.worker_id == worker_id));
+    assert!(app
+        .store
+        .list_worker_heartbeats(Uuid::now_v7())
+        .await
+        .unwrap()
+        .is_empty());
+
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "DELETE",
+            &format!("/api/v1/worker/heartbeat/{worker_id}"),
+            &token_a,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn worker_launches_follow_profile_visibility() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "launch-alice@test.local",
+            "Alice",
+            UserRole::Viewer,
+        )
+        .await
+        .unwrap();
+    let bob = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "launch-bob@test.local",
+            "Bob",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "alice").await;
+    let bob_token = token_for(&app.store, app.org_id, bob.id, "bob").await;
+    let profile = app
+        .store
+        .create_worker_profile(
+            app.org_id,
+            "Bob private worker",
+            "mock",
+            "local",
+            "process",
+            "orbit-worker",
+            "test",
+            "all",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &json!({}),
+            &json!({}),
+            &json!({}),
+            false,
+            false,
+            false,
+            false,
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    make_private(
+        &app.store,
+        app.org_id,
+        "worker_profiles",
+        profile.id,
+        bob.id,
+    )
+    .await;
+    let launch = app
+        .store
+        .create_worker_launch(
+            app.org_id,
+            profile.id,
+            &profile.name,
+            "local",
+            "orbit-worker:test",
+            None,
+            Some(bob.id),
+        )
+        .await
+        .unwrap();
+
+    let (status, listed) = send(
+        &app.router,
+        auth_get("/api/v1/worker-launches?includeInactive=true", &alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["id"] != launch.id.to_string()));
+    for suffix in ["", "/logs"] {
+        let (status, _) = send(
+            &app.router,
+            auth_get(
+                &format!("/api/v1/worker-launches/{}{suffix}", launch.id),
+                &alice_token,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "alice {suffix}");
+    }
+
+    // The profile owner sees it (logs then fail only because no launcher is configured).
+    let (status, listed) = send(
+        &app.router,
+        auth_get("/api/v1/worker-launches?includeInactive=true", &bob_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == launch.id.to_string()));
+    let (status, _) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/worker-launches/{}", launch.id),
+            &bob_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/worker-launches/{}/logs", launch.id),
+            &bob_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}

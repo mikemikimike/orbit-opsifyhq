@@ -109,6 +109,13 @@ for AI agents. It identifies assets, threat actors, attack vectors, and mitigati
 - Tokens can be revoked
 - Worker heartbeats are monitored (stale workers are reaped)
 - Single-execution tokens for container mode
+- Execution-scoped worker endpoints are bound to the token that claimed the execution
+  (`executions.worker_token_id`); other tokens get `404`. Worker heartbeat records are
+  owned by the first token that reports them and are org-scoped (#139)
+- Terminal transitions are enforced in SQL from the domain transition table
+- Agent memory is only reachable through a bound execution and uses that execution's
+  agent; entries are capped at 64 KiB
+- `workspaceSubdir` / `sessionDir` are relative paths confined to the execution workspace
 
 ## Recommendations for production
 

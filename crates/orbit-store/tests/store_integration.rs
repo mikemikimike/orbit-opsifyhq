@@ -556,7 +556,14 @@ async fn orphaned_executions_are_failed_and_approvals_expired() {
         .await
         .unwrap();
     store
-        .upsert_worker_heartbeat("worker-alive", &["mock".into()], "local", Some("test"))
+        .upsert_worker_heartbeat(
+            org,
+            uuid::Uuid::now_v7(),
+            "worker-alive",
+            &["mock".into()],
+            "local",
+            Some("test"),
+        )
         .await
         .unwrap();
 
@@ -591,7 +598,14 @@ async fn unstarted_executions_on_a_live_worker_are_ended() {
         .await
         .unwrap();
     store
-        .upsert_worker_heartbeat("worker-skewed", &["mock".into()], "local", Some("test"))
+        .upsert_worker_heartbeat(
+            org,
+            uuid::Uuid::now_v7(),
+            "worker-skewed",
+            &["mock".into()],
+            "local",
+            Some("test"),
+        )
         .await
         .unwrap();
 
@@ -858,6 +872,7 @@ async fn skills_profiles_and_agent_scoped_claims() {
             &["mock".into()],
             "local",
             &[agent_a.id],
+            None,
             None,
         )
         .await
@@ -1298,6 +1313,7 @@ async fn team_worker_cannot_claim_another_teams_execution() {
             "local",
             &[],
             Some(uuid::Uuid::now_v7()),
+            None,
         )
         .await
         .unwrap();
@@ -1312,6 +1328,7 @@ async fn team_worker_cannot_claim_another_teams_execution() {
             "local",
             &[],
             Some(team_a.id),
+            None,
         )
         .await
         .unwrap()
@@ -1326,6 +1343,7 @@ async fn team_worker_cannot_claim_another_teams_execution() {
             "local",
             &[],
             Some(team_a.id),
+            None,
         )
         .await
         .unwrap();

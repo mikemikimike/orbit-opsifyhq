@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- Worker API endpoints (`running`, `events`, `complete`, `context`, cancel poll, approvals,
+  audit, connection/model resolution) are bound to the worker token that claimed the
+  execution; other tokens receive `404` (#139). Migration 0043 adds
+  `executions.worker_token_id` and owner/org columns on `worker_heartbeats`.
+- `finish_execution` enforces the execution transition table in SQL (for example
+  `queued -> succeeded` is rejected); worker `offline`/heartbeat only affect the calling
+  token's own worker record and `GET /api/v1/workers` is org-scoped (#139).
+- Worker memory endpoints require `executionId`, use that execution's agent (a mismatching
+  `agentId` is refused) and cap content at 64 KiB (`413`). Workers upgrade together with
+  the API (#139).
+- Worker launch list/get/logs are filtered by worker-profile visibility (#139).
+- OpenCode `workspaceSubdir` and Pi `sessionDir` must be relative paths without `..`, and
+  are confined to the execution workspace at runtime, including symlink escapes (#139).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

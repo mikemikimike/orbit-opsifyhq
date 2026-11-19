@@ -44,7 +44,7 @@ impl AccessScope {
         })
     }
 
-    fn is_privileged(&self) -> bool {
+    pub fn is_privileged(&self) -> bool {
         matches!(self.role, UserRole::Owner | UserRole::Admin)
     }
 

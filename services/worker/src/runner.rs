@@ -591,10 +591,12 @@ pub async fn run_execution(
                 .as_ref()
                 .map(|o| o.to_string())
                 .unwrap_or_default();
+            // The API caps memory entries at 64 KiB; keep the head within that bound.
+            let content = truncate_utf8(&content, 60 * 1024);
             if !content.is_empty() {
                 let _ = state
                     .client
-                    .store_memory(execution.agent_id, kind, &content)
+                    .store_memory(execution_id, execution.agent_id, kind, content)
                     .await;
             }
         }
@@ -699,4 +701,16 @@ fn map_harness_event(
         HarnessEventKind::Error => ExecutionEventKind::Error,
     };
     (kind, event.level, event.message, event.data)
+}
+
+/// Longest prefix of `value` that fits in `max_bytes` without splitting a character.
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }

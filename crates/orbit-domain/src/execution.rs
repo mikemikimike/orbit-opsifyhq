@@ -56,17 +56,42 @@ impl ExecutionStatus {
             (Dispatched, Running) => true,
             (Dispatched, Cancelled) => true,
             (Dispatched, Failed) => true,
+            (Dispatched, TimedOut) => true,
             (Running, AwaitingApproval) => true,
             (Running, Succeeded) => true,
             (Running, Failed) => true,
             (Running, TimedOut) => true,
             (Running, Cancelled) => true,
+            (Running, Rejected) => true,
             (AwaitingApproval, Running) => true,
             (AwaitingApproval, Rejected) => true,
             (AwaitingApproval, Cancelled) => true,
             (AwaitingApproval, TimedOut) => true,
+            (AwaitingApproval, Failed) => true,
             _ => false,
         }
+    }
+
+    /// Every status in lifecycle order.
+    pub const ALL: [ExecutionStatus; 9] = [
+        Self::Queued,
+        Self::Dispatched,
+        Self::Running,
+        Self::AwaitingApproval,
+        Self::Succeeded,
+        Self::Failed,
+        Self::TimedOut,
+        Self::Cancelled,
+        Self::Rejected,
+    ];
+
+    /// Non-terminal statuses from which `next` is a legal transition (excluding `next`
+    /// itself). The store uses this to reject e.g. `queued -> succeeded`.
+    pub fn sources_for(next: ExecutionStatus) -> Vec<ExecutionStatus> {
+        Self::ALL
+            .into_iter()
+            .filter(|from| *from != next && from.can_transition_to(next))
+            .collect()
     }
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -407,6 +432,22 @@ mod tests {
         assert!(AwaitingApproval.can_transition_to(Running));
         assert!(!Queued.can_transition_to(Running));
         assert!(!Succeeded.can_transition_to(Failed));
+        assert!(!Queued.can_transition_to(Succeeded));
+        assert!(!Dispatched.can_transition_to(Succeeded));
+    }
+
+    #[test]
+    fn terminal_sources_follow_the_table() {
+        use ExecutionStatus::*;
+        assert_eq!(ExecutionStatus::sources_for(Succeeded), vec![Running]);
+        assert_eq!(
+            ExecutionStatus::sources_for(Cancelled),
+            vec![Queued, Dispatched, Running, AwaitingApproval]
+        );
+        assert!(!ExecutionStatus::sources_for(Failed).contains(&Queued));
+        for terminal in [Succeeded, Failed, TimedOut, Cancelled, Rejected] {
+            assert!(!ExecutionStatus::sources_for(Failed).contains(&terminal));
+        }
     }
 
     #[test]
