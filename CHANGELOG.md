@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- API: `Path`/`Query` rejections, unknown routes, wrong methods and other non-JSON 4xx/5xx
+  responses now return the standard error envelope with a `requestId` (#123).
+- API: `PUT /settings/oidc`, `/settings/access` and `/settings/harness` return envelope errors
+  for bad bodies, write audit records (`settings.*.update`, with a before/after summary) and
+  OIDC settings are validated (issuer/JWKS URLs, role names, team mappings) (#123).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

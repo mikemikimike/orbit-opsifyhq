@@ -199,3 +199,92 @@ impl From<axum::extract::rejection::JsonRejection> for ApiError {
         ApiError::new(err.status(), code, err.body_text())
     }
 }
+
+/// Maximum number of bytes of a foreign plain-text error body copied into the envelope.
+const FOREIGN_BODY_LIMIT: usize = 1024;
+
+fn code_for_status(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => "bad_request",
+        401 => "unauthorized",
+        403 => "forbidden",
+        404 => "not_found",
+        405 => "method_not_allowed",
+        406 => "not_acceptable",
+        408 => "request_timeout",
+        409 => "conflict",
+        413 => "payload_too_large",
+        414 => "uri_too_long",
+        415 => "unsupported_media_type",
+        422 => "validation_error",
+        429 => "rate_limited",
+        501 => "unsupported",
+        502 => "bad_gateway",
+        503 => "unavailable",
+        504 => "gateway_timeout",
+        s if (400..500).contains(&s) => "bad_request",
+        _ => "internal",
+    }
+}
+
+/// Central safety net for the error envelope (AGENTS.md rule 9).
+///
+/// Extractor rejections (`Path`, `Query`, body limits), unmatched routes and
+/// method mismatches are produced by axum/tower as plain text or empty bodies.
+/// This middleware rewrites any 4xx/5xx response that is not already JSON into
+/// the standard envelope. It leaves successful responses, redirects, 304,
+/// streams, `HEAD` responses, already-JSON errors and the Swagger UI untouched.
+/// Headers such as `Allow` are preserved.
+pub async fn envelope_rejections(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let response = next.run(request).await;
+
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error())
+        || method == axum::http::Method::HEAD
+        || path == "/docs"
+        || path.starts_with("/docs/")
+    {
+        return response;
+    }
+    let is_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("json"));
+    if is_json {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, FOREIGN_BODY_LIMIT)
+        .await
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    let message = if text.is_empty() {
+        status
+            .canonical_reason()
+            .unwrap_or("request failed")
+            .to_string()
+    } else {
+        text
+    };
+
+    let mut rewritten = ApiError::new(status, code_for_status(status), message).into_response();
+    for (name, value) in parts.headers.iter() {
+        if name == axum::http::header::CONTENT_TYPE || name == axum::http::header::CONTENT_LENGTH {
+            continue;
+        }
+        rewritten.headers_mut().append(name.clone(), value.clone());
+    }
+    rewritten
+}
+
+/// Router fallback for unmatched routes.
+pub async fn not_found_fallback() -> ApiError {
+    ApiError::not_found("no such route")
+}

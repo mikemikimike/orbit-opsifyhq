@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use orbit_security::{AuthContext, Permission};
 
+use orbit_domain::ValidationIssue;
+
+use crate::audit;
 use crate::error::ApiError;
+use crate::extract::ApiJson;
 use crate::state::AppState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -89,13 +93,109 @@ pub async fn get_oidc(
     Ok(Json(settings))
 }
 
-#[utoipa::path(put, path = "/api/v1/settings/oidc", tag = "settings", request_body = UpdateOidcRequest, responses((status = 200, body = OidcSettings)))]
+/// Validate OIDC settings. Returns field-level issues; `None`-free means valid.
+fn validate_oidc(state: &AppState, settings: &OidcSettings) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    for (path, value) in [
+        ("settings.issuer", &settings.issuer),
+        ("settings.jwksUrl", &settings.jwks_url),
+    ] {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match reqwest::Url::parse(value) {
+            Ok(url) if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() => {
+                issues.push(ValidationIssue::new(path, "must be an http(s) URL"));
+            }
+            Ok(url) if url.scheme() != "https" && state.is_production() => {
+                issues.push(ValidationIssue::new(
+                    path,
+                    "must use https when ORBIT_ENV=production",
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => issues.push(ValidationIssue::new(path, "must be a valid URL")),
+        }
+    }
+    let redirect = settings.redirect_uri.trim();
+    if !redirect.is_empty() && reqwest::Url::parse(redirect).is_err() {
+        issues.push(ValidationIssue::new(
+            "settings.redirectUri",
+            "must be a valid URL",
+        ));
+    }
+
+    let mut role_refs: Vec<(String, &str)> = Vec::new();
+    if !settings.default_role.trim().is_empty() {
+        role_refs.push(("settings.defaultRole".into(), settings.default_role.trim()));
+    }
+    for (group, role) in &settings.group_roles {
+        role_refs.push((format!("settings.groupRoles.{group}"), role.trim()));
+    }
+    // Only built-in roles take effect at OIDC login (`apply_stored_oidc` parses them as
+    // `UserRole`), so accepting a custom role name here would be saved and then ignored.
+    for (path, role) in role_refs {
+        if role.parse::<orbit_domain::UserRole>().is_err() {
+            issues.push(ValidationIssue::new(
+                path,
+                format!(
+                    "unknown role '{role}': OIDC mappings support the built-in roles \
+                     (owner, admin, operator, viewer)"
+                ),
+            ));
+        }
+    }
+    for (group, value) in &settings.team_groups {
+        let valid = value.split_once(':').is_some_and(|(team, role)| {
+            !team.trim().is_empty() && matches!(role.trim(), "lead" | "member" | "viewer")
+        });
+        if !valid {
+            issues.push(ValidationIssue::new(
+                format!("settings.teamGroups.{group}"),
+                "must be '<team-slug>:<lead|member|viewer>'",
+            ));
+        }
+    }
+    issues
+}
+
+/// Audit-safe summary of OIDC settings. The settings hold no client secret; only
+/// non-sensitive configuration is summarised (mappings by count, not content).
+fn oidc_audit_summary(settings: &OidcSettings) -> serde_json::Value {
+    serde_json::json!({
+        "issuer": settings.issuer,
+        "clientId": settings.client_id,
+        "jwksUrl": settings.jwks_url,
+        "audience": settings.audience,
+        "autoProvision": settings.auto_provision,
+        "defaultRole": settings.default_role,
+        "roleClaim": settings.role_claim,
+        "groupRoles": settings.group_roles,
+        "teamGroups": settings.team_groups,
+        "autoCreateTeams": settings.auto_create_teams,
+        "requireMappedGroup": settings.require_mapped_group,
+        "syncRoles": settings.sync_roles,
+    })
+}
+
+#[utoipa::path(put, path = "/api/v1/settings/oidc", tag = "settings", request_body = UpdateOidcRequest, responses((status = 200, body = OidcSettings), (status = 422, body = crate::error::ErrorEnvelope)))]
 pub async fn update_oidc(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-    Json(body): Json<UpdateOidcRequest>,
+    ApiJson(body): ApiJson<UpdateOidcRequest>,
 ) -> Result<Json<OidcSettings>, ApiError> {
     auth.require(Permission::SettingsWrite)?;
+    let issues = validate_oidc(&state, &body.settings);
+    if !issues.is_empty() {
+        return Err(ApiError::validation(issues));
+    }
+    let before = state
+        .store
+        .get_platform_setting("oidc")
+        .await?
+        .and_then(|value| serde_json::from_value::<OidcSettings>(value).ok())
+        .map(|settings| oidc_audit_summary(&settings));
     let value =
         serde_json::to_value(&body.settings).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let stored = state
@@ -103,6 +203,15 @@ pub async fn update_oidc(
         .set_platform_setting("oidc", &value, Some(auth.user_id))
         .await?;
     let settings: OidcSettings = serde_json::from_value(stored).unwrap_or(body.settings);
+    audit::record(
+        &state,
+        &auth,
+        "settings.oidc.update",
+        Some("platform_setting"),
+        None,
+        serde_json::json!({ "before": before, "after": oidc_audit_summary(&settings) }),
+    )
+    .await;
     Ok(Json(settings))
 }
 
@@ -265,14 +374,31 @@ pub async fn get_access(
 pub async fn update_access(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-    Json(body): Json<AccessSettings>,
+    ApiJson(body): ApiJson<AccessSettings>,
 ) -> Result<Json<AccessSettings>, ApiError> {
     auth.require(Permission::SettingsWrite)?;
+    let before = state
+        .store
+        .get_platform_setting("team_isolation")
+        .await?
+        .map(|value| access_settings(value).team_isolation);
     let value = serde_json::json!({ "enabled": body.team_isolation });
     state
         .store
         .set_platform_setting("team_isolation", &value, Some(auth.user_id))
         .await?;
+    audit::record(
+        &state,
+        &auth,
+        "settings.access.update",
+        Some("platform_setting"),
+        None,
+        serde_json::json!({
+            "before": { "teamIsolation": before },
+            "after": { "teamIsolation": body.team_isolation },
+        }),
+    )
+    .await;
     Ok(Json(body))
 }
 
@@ -306,9 +432,19 @@ pub async fn get_harness(
 pub async fn update_harness(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-    Json(body): Json<HarnessSettings>,
+    ApiJson(body): ApiJson<HarnessSettings>,
 ) -> Result<Json<HarnessSettings>, ApiError> {
     auth.require(Permission::SettingsWrite)?;
+    let before = state
+        .store
+        .get_platform_setting("harness_default")
+        .await?
+        .and_then(|value| {
+            value
+                .get("default")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
     if let Some(harness) = &body.default_harness {
         harness.parse::<orbit_domain::HarnessKind>().map_err(|_| {
             ApiError::validation(vec![orbit_domain::ValidationIssue::new(
@@ -322,5 +458,17 @@ pub async fn update_harness(
         .store
         .set_platform_setting("harness_default", &value, Some(auth.user_id))
         .await?;
+    audit::record(
+        &state,
+        &auth,
+        "settings.harness.update",
+        Some("platform_setting"),
+        None,
+        serde_json::json!({
+            "before": { "defaultHarness": before },
+            "after": { "defaultHarness": body.default_harness },
+        }),
+    )
+    .await;
     Ok(Json(body))
 }
