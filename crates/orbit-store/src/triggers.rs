@@ -186,11 +186,6 @@ impl Store {
         Ok(())
     }
 
-    /// Safer alternative to deleting: disable without losing history.
-    pub async fn disable_trigger(&self, org_id: Uuid, trigger_id: Uuid) -> StoreResult<Trigger> {
-        self.set_trigger_enabled(org_id, trigger_id, false).await
-    }
-
     /// Due schedule triggers, claimed by updating `next_run_at`.
     pub async fn claim_due_triggers(&self, limit: i64) -> StoreResult<Vec<Trigger>> {
         let rows = sqlx::query_as::<_, Trigger>(

@@ -80,13 +80,4 @@ impl Store {
         .await?;
         Ok(result.rows_affected())
     }
-
-    pub async fn delete_memory(&self, org_id: Uuid, agent_id: Uuid) -> StoreResult<()> {
-        sqlx::query("DELETE FROM agent_memory WHERE org_id = $1 AND agent_id = $2")
-            .bind(org_id)
-            .bind(agent_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
 }

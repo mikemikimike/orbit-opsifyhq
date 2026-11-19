@@ -343,24 +343,4 @@ impl Store {
         .await
         .map_err(Into::into)
     }
-
-    pub async fn set_team_step_execution(
-        &self,
-        step_id: Uuid,
-        execution_id: Uuid,
-    ) -> StoreResult<TeamStep> {
-        sqlx::query_as::<_, TeamStep>(
-            r#"
-            UPDATE team_steps
-            SET execution_id = $2, started_at = COALESCE(started_at, now()), updated_at = now()
-            WHERE id = $1
-            RETURNING *
-            "#,
-        )
-        .bind(step_id)
-        .bind(execution_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(Into::into)
-    }
 }

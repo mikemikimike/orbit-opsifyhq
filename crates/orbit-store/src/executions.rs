@@ -280,29 +280,6 @@ impl Store {
         .await?)
     }
 
-    /// Update non-terminal progress (e.g. awaiting approval).
-    pub async fn update_execution_status(
-        &self,
-        execution_id: Uuid,
-        from: &[ExecutionStatus],
-        to: ExecutionStatus,
-    ) -> StoreResult<Option<ExecutionRecord>> {
-        let from_values: Vec<String> = from.iter().map(|s| s.as_str().to_string()).collect();
-        Ok(sqlx::query_as::<_, ExecutionRecord>(
-            r#"
-            UPDATE executions
-            SET status = $2, updated_at = now()
-            WHERE id = $1 AND status = ANY($3)
-            RETURNING *
-            "#,
-        )
-        .bind(execution_id)
-        .bind(to.as_str())
-        .bind(&from_values)
-        .fetch_optional(&self.pool)
-        .await?)
-    }
-
     /// Request cancellation. Queued executions are cancelled immediately; running ones
     /// are flagged for the worker to abort the harness.
     pub async fn request_execution_cancel(
@@ -452,41 +429,6 @@ impl Store {
         .bind(agent_id)
         .bind(since)
         .fetch_one(&self.pool)
-        .await?)
-    }
-
-    /// Executions requested but not claimed within the reclaim window.
-    pub async fn list_stale_queued_executions(
-        &self,
-        older_than_seconds: i64,
-        limit: i64,
-    ) -> StoreResult<Vec<ExecutionRecord>> {
-        Ok(sqlx::query_as::<_, ExecutionRecord>(
-            r#"
-            SELECT * FROM executions
-            WHERE status = 'queued' AND created_at < now() - ($1 || ' seconds')::interval
-            ORDER BY created_at ASC
-            LIMIT $2
-            "#,
-        )
-        .bind(older_than_seconds.to_string())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
-    }
-
-    pub async fn list_agents_with_harness(&self, org_id: Uuid) -> StoreResult<Vec<(Uuid, String)>> {
-        Ok(sqlx::query_as::<_, (Uuid, String)>(
-            r#"
-            SELECT DISTINCT a.id,
-                   COALESCE(av.spec->'harness'->>'type', 'mock')
-            FROM agents a
-            JOIN agent_versions av ON av.agent_id = a.id AND av.version = a.current_version
-            WHERE a.org_id = $1 AND a.status = 'active'
-            "#,
-        )
-        .bind(org_id)
-        .fetch_all(&self.pool)
         .await?)
     }
 }
