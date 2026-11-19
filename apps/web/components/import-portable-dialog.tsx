@@ -231,7 +231,7 @@ export function ImportPortableButton({
             }}
           />
 
-          <div className="space-y-4">
+          <div className="min-w-0 space-y-4">
             <div className="flex flex-wrap items-center gap-3">
               <Button type="button" variant="outline" onClick={() => fileInput.current?.click()}>
                 <FileUp /> Choose file
