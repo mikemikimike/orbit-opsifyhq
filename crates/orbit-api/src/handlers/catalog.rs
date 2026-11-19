@@ -207,6 +207,21 @@ pub async fn update_provider(
         None => None,
     };
 
+    // A stored credential must never follow an edited endpoint: if the base URL changes,
+    // the caller has to supply the credential for the new endpoint in the same request.
+    if let (Some(new_config), Some(_)) = (&config, &existing.secret_ref) {
+        if body.credential.is_none()
+            && normalized_base_url(new_config) != normalized_base_url(&existing.config)
+        {
+            return Err(ApiError::validation(vec![
+                orbit_domain::ValidationIssue::new(
+                    "credential",
+                    "re-enter the API key when changing the base URL",
+                ),
+            ]));
+        }
+    }
+
     let secret_ref = if let Some(credential) = &body.credential {
         if credential.trim().is_empty() {
             return Err(ApiError::validation(vec![
@@ -297,10 +312,12 @@ pub async fn probe_provider(
     Extension(auth): Extension<AuthContext>,
     Path(provider_id): Path<Uuid>,
 ) -> Result<Json<ProviderProbeResponse>, ApiError> {
-    auth.require(Permission::ProvidersRead)?;
+    // Probing sends the stored credential to the provider endpoint and persists the
+    // discovered models, so it needs the same rights as editing the provider.
+    auth.require(Permission::ProvidersWrite)?;
     let provider = state.store.get_provider(auth.org_id, provider_id).await?;
     let access = crate::access::AccessScope::load(&state, &auth).await?;
-    access.require_view(
+    access.require_manage(
         "provider",
         provider.owner_user_id,
         provider.owner_team_id,
@@ -399,8 +416,18 @@ async fn probe_endpoint(
             error: Some("provider declares no /models endpoint".into()),
         };
     }
-    let client = orbit_security::client_with_custom_ca(std::time::Duration::from_secs(10));
     let url = format!("{}/models", base_url.trim_end_matches('/'));
+    if let Err(error) =
+        orbit_security::check_outbound_url(&url, &orbit_security::OutboundPolicy::from_env()).await
+    {
+        return ProviderProbeResponse {
+            ok: false,
+            latency_ms: 0,
+            models: vec![],
+            error: Some(format!("endpoint refused ({})", error.category())),
+        };
+    }
+    let client = orbit_security::guarded_client(std::time::Duration::from_secs(10));
     let mut request = client.get(&url);
     if let Some(credential) = credential {
         request = request.bearer_auth(credential);
@@ -451,15 +478,28 @@ async fn probe_endpoint(
             ok: false,
             latency_ms,
             models: vec![],
-            error: Some(format!("endpoint returned HTTP {}", response.status())),
+            error: Some(format!(
+                "endpoint returned status {}",
+                response.status().as_u16()
+            )),
         },
         Err(err) => ProviderProbeResponse {
             ok: false,
             latency_ms,
             models: vec![],
-            error: Some(err.to_string()),
+            error: Some(orbit_security::describe_request_error(&err)),
         },
     }
+}
+
+fn normalized_base_url(config: &serde_json::Value) -> String {
+    config
+        .get("baseUrl")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
 }
 
 fn sanitize_provider_config(config: &mut serde_json::Value) {
@@ -774,13 +814,7 @@ async fn probe_connection(
     config: &serde_json::Value,
     credential: Option<&str>,
 ) -> (bool, Option<u16>, String) {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(client) => client,
-        Err(error) => return (false, None, error.to_string()),
-    };
+    let client = orbit_security::guarded_client(std::time::Duration::from_secs(10));
     let (url, request) = match slug {
         "gitlab" | "github" => {
             let base = config
@@ -818,6 +852,15 @@ async fn probe_connection(
             );
         }
     };
+    if let Err(error) =
+        orbit_security::check_outbound_url(&url, &orbit_security::OutboundPolicy::from_env()).await
+    {
+        return (
+            false,
+            None,
+            format!("endpoint refused ({})", error.category()),
+        );
+    }
     match request.send().await {
         Ok(response) => {
             let status = response.status();
@@ -838,7 +881,7 @@ async fn probe_connection(
                 },
             )
         }
-        Err(error) => (false, None, error.to_string()),
+        Err(error) => (false, None, orbit_security::describe_request_error(&error)),
     }
 }
 

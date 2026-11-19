@@ -154,6 +154,7 @@ pub async fn create(
             "webhookUrl must be http(s)",
         )]));
     }
+    guard_webhook_url(url).await?;
     let secret_ref = new_secret_ref("output");
     state
         .store
@@ -206,6 +207,7 @@ pub async fn update(
                     "webhookUrl must be http(s)",
                 )]));
             }
+            guard_webhook_url(url).await?;
             let reference = new_secret_ref("output");
             state
                 .store
@@ -294,7 +296,14 @@ pub async fn deliver(
         .await?
         .map(|value| value.expose().to_string())
         .ok_or_else(|| ApiError::internal("output webhook secret is missing"))?;
-    let client = orbit_security::client_with_custom_ca(std::time::Duration::from_secs(15));
+    guard_webhook_url(&url).await.map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "output_delivery_failed",
+            error.message.clone(),
+        )
+    })?;
+    let client = orbit_security::guarded_client(std::time::Duration::from_secs(15));
     let payload = if output.kind == "webhook" {
         serde_json::json!({
             "event": execution.map(|e| format!("execution.{}", e.status)).unwrap_or_else(|| "test".into()),
@@ -320,7 +329,7 @@ pub async fn deliver(
             ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 "output_delivery_failed",
-                error.to_string(),
+                orbit_security::describe_request_error(&error),
             )
         })?;
     if !response.status().is_success() {
@@ -424,4 +433,14 @@ fn summary(execution: &ExecutionRecord) -> String {
             .unwrap_or("task"),
         output
     )
+}
+
+/// Refuse webhook targets in loopback, link-local/metadata or other blocked ranges
+/// (see `ORBIT_OUTBOUND_*`). Private ranges are allowed by default.
+async fn guard_webhook_url(url: &str) -> Result<(), ApiError> {
+    orbit_security::check_outbound_url(url, &orbit_security::OutboundPolicy::from_env())
+        .await
+        .map_err(|error| {
+            ApiError::validation(vec![ValidationIssue::new("webhookUrl", error.to_string())])
+        })
 }

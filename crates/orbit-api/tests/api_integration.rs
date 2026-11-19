@@ -1305,3 +1305,110 @@ async fn same_agent_queues_on_different_harnesses() {
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(second["harnessKind"], "pi");
 }
+
+#[tokio::test]
+async fn changing_provider_base_url_requires_reentering_the_credential() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(
+        &app.router,
+        post(
+            "/api/v1/providers",
+            json!({
+                "name": "Rebind Gateway",
+                "kind": "openai_compatible",
+                "config": { "baseUrl": "http://10.1.2.3:9999/v1", "model": "qwen" },
+                "credential": "sk-rebind-secret"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+    let path = format!("/api/v1/providers/{id}");
+    let patch = |body: Value| {
+        Request::builder()
+            .method("PATCH")
+            .uri(&path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // New host without a new key: refused, nothing changes.
+    let (status, body) = send(
+        &app.router,
+        patch(json!({ "config": { "baseUrl": "http://evil.example/v1", "model": "qwen" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("re-enter the API key"));
+    let stored: Value = sqlx::query_scalar("SELECT config FROM providers WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_one(app.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored["baseUrl"], "http://10.1.2.3:9999/v1");
+
+    // Same URL (trailing slash only) keeps the credential.
+    let (status, body) = send(
+        &app.router,
+        patch(json!({ "config": { "baseUrl": "http://10.1.2.3:9999/v1", "model": "other" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // New host with a freshly supplied key is accepted.
+    let (status, body) = send(
+        &app.router,
+        patch(json!({
+            "config": { "baseUrl": "http://10.9.9.9:9999/v1", "model": "qwen" },
+            "credential": "sk-new-key"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn provider_probe_requires_manage_and_refuses_metadata_addresses() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let provider = app
+        .store
+        .create_provider(
+            app.org_id,
+            "Metadata probe",
+            "openai_compatible",
+            &json!({ "baseUrl": "http://169.254.169.254/v1", "model": "m" }),
+            None,
+        )
+        .await
+        .unwrap();
+    // An operator can see org-visible providers but cannot probe (send credentials).
+    let operator = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "probe-op@test.local",
+            "Operator",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let operator_token = token_for(&app.store, app.org_id, operator.id, "probe-op").await;
+    let path = format!("/api/v1/providers/{}/test", provider.id);
+    let (status, _) = send(&app.router, auth_post(&path, &operator_token, json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The manager's probe is refused by the outbound guard with a generic category.
+    let (status, body) = send(&app.router, post(&path, json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"], "endpoint refused (blocked)");
+}
