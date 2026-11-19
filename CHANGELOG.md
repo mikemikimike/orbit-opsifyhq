@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- `GET /agents/{id}/versions` now applies the same visibility check as `GET /agents/{id}` and returns 404 for agents the caller cannot view, instead of leaking full specs (#134).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

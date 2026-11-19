@@ -125,14 +125,7 @@ pub async fn list_agent_executions(
     Query(query): Query<ExecutionListQuery>,
 ) -> Result<Json<ExecutionPage>, ApiError> {
     auth.require(Permission::ExecutionsRead)?;
-    let agent = state.store.get_agent(auth.org_id, agent_id).await?;
-    let access = crate::access::AccessScope::load(&state, &auth).await?;
-    access.require_view(
-        "agent",
-        agent.owner_user_id,
-        agent.owner_team_id,
-        &agent.visibility,
-    )?;
+    super::load_visible_agent(&state, &auth, agent_id).await?;
     let (items, next_cursor, total) = state
         .store
         .list_executions(

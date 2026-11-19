@@ -46,11 +46,12 @@ pub(crate) fn limit(value: Option<u32>) -> i64 {
     orbit_domain::clamp_limit(value)
 }
 
-pub(crate) async fn load_agent_detail(
+/// Load an agent the caller may view; invisible agents are indistinguishable from missing (404).
+pub(crate) async fn load_visible_agent(
     state: &AppState,
     auth: &AuthContext,
     agent_id: Uuid,
-) -> Result<AgentDetail, ApiError> {
+) -> Result<orbit_store::Agent, ApiError> {
     let agent = state.store.get_agent(auth.org_id, agent_id).await?;
     let access = crate::access::AccessScope::load(state, auth).await?;
     access.require_view(
@@ -59,6 +60,15 @@ pub(crate) async fn load_agent_detail(
         agent.owner_team_id,
         &agent.visibility,
     )?;
+    Ok(agent)
+}
+
+pub(crate) async fn load_agent_detail(
+    state: &AppState,
+    auth: &AuthContext,
+    agent_id: Uuid,
+) -> Result<AgentDetail, ApiError> {
+    let agent = load_visible_agent(state, auth, agent_id).await?;
     let version = state.store.get_current_version(auth.org_id, &agent).await?;
     let spec = parse_spec(&version)?;
     let triggers = state

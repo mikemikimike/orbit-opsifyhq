@@ -14,7 +14,7 @@ use crate::dto::{
     UpdateAgentRequest,
 };
 use crate::error::ApiError;
-use crate::handlers::{limit, load_agent_detail, parse_spec};
+use crate::handlers::{limit, load_agent_detail, load_visible_agent, parse_spec};
 use crate::state::AppState;
 
 async fn require_agent_manage(
@@ -312,6 +312,7 @@ pub async fn list_versions(
     Path(agent_id): Path<Uuid>,
 ) -> Result<Json<Vec<AgentVersionView>>, ApiError> {
     auth.require(Permission::AgentsRead)?;
+    load_visible_agent(&state, &auth, agent_id).await?;
     let versions = state
         .store
         .list_agent_versions(auth.org_id, agent_id)
@@ -326,14 +327,7 @@ pub async fn export_agent(
     Path(agent_id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     auth.require(Permission::AgentsRead)?;
-    let agent = state.store.get_agent(auth.org_id, agent_id).await?;
-    let access = crate::access::AccessScope::load(&state, &auth).await?;
-    access.require_view(
-        "agent",
-        agent.owner_user_id,
-        agent.owner_team_id,
-        &agent.visibility,
-    )?;
+    let agent = load_visible_agent(&state, &auth, agent_id).await?;
     let version = state.store.get_current_version(auth.org_id, &agent).await?;
     let yaml = if version.definition_yaml.trim().is_empty() {
         let spec = parse_spec(&version)?;

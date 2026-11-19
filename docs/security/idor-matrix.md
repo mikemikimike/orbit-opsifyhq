@@ -6,6 +6,9 @@ Enforced by `crates/orbit-api/src/access.rs` (`AccessScope`). Invisible resource
 | Resource | List filter | Get | Write | Execution/approval |
 |---|---|---|---|---|
 | Agents | yes | yes | yes | parent visibility |
+| Agent versions (`/agents/{id}/versions`) | — | parent visibility (404) | — | — |
+| Agent export / agent executions list | — | parent visibility (404) | — | — |
+| Agent runtime / activate / pause | — | manage (404 if invisible) | manage | — |
 | Skills | yes | yes | yes | — |
 | Connections | yes | yes | yes | referenced connection checked on run |
 | Providers | yes | yes | yes | — |
