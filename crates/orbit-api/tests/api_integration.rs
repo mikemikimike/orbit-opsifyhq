@@ -1305,3 +1305,185 @@ async fn same_agent_queues_on_different_harnesses() {
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(second["harnessKind"], "pi");
 }
+
+async fn seed_execution(store: &Store, org_id: Uuid, agent_id: Uuid) -> Uuid {
+    let agent = store.get_agent(org_id, agent_id).await.unwrap();
+    let version = store.get_current_version(org_id, &agent).await.unwrap();
+    store
+        .create_execution(orbit_store::executions::NewExecution {
+            org_id,
+            agent_id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: orbit_domain::HarnessKind::Mock,
+            trigger_source: orbit_domain::TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: json!({ "task": "seeded" }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: None,
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn execution_list_applies_visibility_before_paging() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "page-alice@test.local",
+            "Alice",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let bob = app
+        .store
+        .ensure_user(app.org_id, "page-bob@test.local", "Bob", UserRole::Operator)
+        .await
+        .unwrap();
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "alice").await;
+    let agent_a = create_demo_agent(&app.store, app.org_id, alice.id).await;
+    let agent_b = create_demo_agent(&app.store, app.org_id, bob.id).await;
+    make_private(&app.store, app.org_id, "agents", agent_a, alice.id).await;
+    make_private(&app.store, app.org_id, "agents", agent_b, bob.id).await;
+
+    // 3 visible executions first, then 7 newer hidden ones.
+    let mut visible_ids = Vec::new();
+    for _ in 0..3 {
+        visible_ids.push(seed_execution(&app.store, app.org_id, agent_a).await);
+    }
+    for _ in 0..7 {
+        seed_execution(&app.store, app.org_id, agent_b).await;
+    }
+
+    let (status, page1) = send(
+        &app.router,
+        auth_get("/api/v1/executions?limit=2", &alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page1}");
+    assert_eq!(page1["items"].as_array().unwrap().len(), 2);
+    assert!(page1["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["agentId"] == agent_a.to_string()));
+    assert_eq!(page1["total"], 3);
+    let cursor = page1["nextCursor"]
+        .as_str()
+        .expect("next cursor")
+        .to_string();
+
+    let (status, page2) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/executions?limit=2&cursor={cursor}"),
+            &alice_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page2}");
+    assert_eq!(page2["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page2["items"][0]["agentId"], agent_a.to_string());
+    assert!(page2["nextCursor"].is_null(), "{page2}");
+    assert_eq!(page2["total"], 3);
+
+    let mut seen: Vec<String> = [&page1, &page2]
+        .iter()
+        .flat_map(|p| p["items"].as_array().unwrap().iter())
+        .map(|item| item["id"].as_str().unwrap().to_string())
+        .collect();
+    seen.sort();
+    let mut expected: Vec<String> = visible_ids.iter().map(|id| id.to_string()).collect();
+    expected.sort();
+    assert_eq!(seen, expected);
+
+    // The org owner (dev identity) sees everything: 10 executions, one full page.
+    let (status, owner) = send(&app.router, get("/api/v1/executions?limit=50")).await;
+    assert_eq!(status, StatusCode::OK, "{owner}");
+    assert_eq!(owner["items"].as_array().unwrap().len(), 10);
+    assert_eq!(owner["total"], 10);
+}
+
+#[tokio::test]
+async fn approval_list_applies_visibility_in_sql() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "appr-alice@test.local",
+            "Alice",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let bob = app
+        .store
+        .ensure_user(app.org_id, "appr-bob@test.local", "Bob", UserRole::Operator)
+        .await
+        .unwrap();
+    let agent_a = create_demo_agent(&app.store, app.org_id, alice.id).await;
+    let agent_b = create_demo_agent(&app.store, app.org_id, bob.id).await;
+    make_private(&app.store, app.org_id, "agents", agent_a, alice.id).await;
+    make_private(&app.store, app.org_id, "agents", agent_b, bob.id).await;
+
+    let mut visible = Vec::new();
+    for _ in 0..2 {
+        let execution = seed_execution(&app.store, app.org_id, agent_a).await;
+        let approval = app
+            .store
+            .create_approval(app.org_id, execution, json!({ "action": "a" }), None)
+            .await
+            .unwrap();
+        visible.push(approval.id);
+    }
+    for _ in 0..5 {
+        let execution = seed_execution(&app.store, app.org_id, agent_b).await;
+        app.store
+            .create_approval(app.org_id, execution, json!({ "action": "b" }), None)
+            .await
+            .unwrap();
+    }
+
+    // Operators cannot decide approvals over HTTP, so exercise the store predicate the
+    // handler passes for non-privileged callers: newer hidden rows must not consume the
+    // page limit.
+    let alice_access =
+        orbit_store::access::ResourceAccess::new(alice.id, false, vec![]).with_team_isolation(true);
+    let rows = app
+        .store
+        .list_approvals(app.org_id, Some("pending"), 2, Some(&alice_access))
+        .await
+        .unwrap();
+    let mut got: Vec<Uuid> = rows.iter().map(|r| r.approval.id).collect();
+    got.sort();
+    visible.sort();
+    assert_eq!(got, visible);
+    assert!(rows.iter().all(|r| r.agent_id == agent_a));
+
+    // Internal access and the privileged owner see all 7 rows.
+    let all = app
+        .store
+        .list_approvals(app.org_id, Some("pending"), 50, None)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 7);
+    let (status, body) = send(&app.router, get("/api/v1/approvals?status=pending")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 7);
+}

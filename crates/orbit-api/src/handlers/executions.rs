@@ -55,7 +55,8 @@ pub async fn list_executions(
         }
     }
     let access = crate::access::AccessScope::load(&state, &auth).await?;
-    let (items, next_cursor, _total) = state
+    let store_access = access.store_access();
+    let (items, next_cursor, total) = state
         .store
         .list_executions(
             auth.org_id,
@@ -64,21 +65,11 @@ pub async fn list_executions(
             query.status.as_deref(),
             query.agent_id,
             query.archived,
+            Some(&store_access),
         )
         .await?;
-    let mut visible = Vec::with_capacity(items.len());
-    for execution in items {
-        let agent = state
-            .store
-            .get_agent(auth.org_id, execution.agent_id)
-            .await?;
-        if access.can_view(agent.owner_user_id, agent.owner_team_id, &agent.visibility) {
-            visible.push(execution);
-        }
-    }
-    let total = visible.len() as i64;
     Ok(Json(ExecutionPage {
-        items: visible,
+        items,
         next_cursor,
         total,
     }))
@@ -142,6 +133,7 @@ pub async fn list_agent_executions(
             query.status.as_deref(),
             Some(agent_id),
             query.archived,
+            None,
         )
         .await?;
     Ok(Json(ExecutionPage {

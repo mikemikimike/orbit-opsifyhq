@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Fixed
+
+- Execution and approval lists apply visibility in SQL instead of after paging: pages are full, `total` is the real visible total, and the per-row agent lookups (N+1) are gone (#122).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

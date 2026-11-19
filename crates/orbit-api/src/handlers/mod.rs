@@ -67,7 +67,7 @@ pub(crate) async fn load_agent_detail(
         .await?;
     let (executions, _, _) = state
         .store
-        .list_executions(auth.org_id, 5, None, None, Some(agent.id), None)
+        .list_executions(auth.org_id, 5, None, None, Some(agent.id), None, None)
         .await?;
 
     Ok(AgentDetail {
