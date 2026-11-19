@@ -137,7 +137,7 @@ jobs:
         with:
           path: ./
           # Fail only on verified (live) secrets; unverified matches are ignored.
-          extra_args: --only-verified --fail
+          extra_args: --only-verified  # the action adds --fail itself
 
   # ---------------------------------------------------------------- helm validation
   helm:
