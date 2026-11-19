@@ -337,6 +337,7 @@ fn write_open_code_policy_plugin(workspace: &Path) -> std::io::Result<()> {
     std::fs::write(
         dir.join("orbit-policy.ts"),
         r#"import { Plugin } from "@opencode/plugin"
+import { createHash } from "node:crypto"
 
 const POLICY_TOOLS = new Set([
   "read", "grep", "glob", "list",
@@ -344,9 +345,22 @@ const POLICY_TOOLS = new Set([
   "webfetch", "websearch", "subagent", "task", "question",
 ])
 
-const READ_ONLY = new Set(["read", "grep", "glob", "list"])
+// Stable hash of the call: tool name + canonical JSON (sorted keys). Must match the
+// broker's `arguments_hash`; approvals are bound to it.
+function canon(value: any): string {
+  if (Array.isArray(value)) return "[" + value.map(canon).join(",") + "]"
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value).filter((k) => value[k] !== undefined).sort()
+      .map((k) => JSON.stringify(k) + ":" + canon(value[k])).join(",") + "}"
+  }
+  return JSON.stringify(value ?? null)
+}
+function callHash(tool: string, input: unknown) {
+  return createHash("sha256").update(tool + "\u001f" + canon(input ?? {})).digest("hex")
+}
 
-async function checkPolicy(tool: string, input: unknown) {
+// The effect is derived by the broker from the tool name; it is never declared here.
+async function checkPolicy(tool: string, input: unknown): Promise<string | undefined> {
   const base = process.env.ORBIT_BROKER_URL
   const token = process.env.ORBIT_BROKER_TOKEN
   if (!base || !token) throw new Error("ORBIT policy broker is unavailable")
@@ -359,12 +373,12 @@ async function checkPolicy(tool: string, input: unknown) {
     },
     body: JSON.stringify({
       tool,
-      effect: READ_ONLY.has(tool) ? "read" : "write",
       arguments: input ?? {},
+      argumentsHash: callHash(tool, input),
     }),
   })
-  if (response.ok) return
   const body = await response.json().catch(() => ({}))
+  if (response.ok) return body.argumentsHash as string | undefined
   throw new Error(body.reason ?? body.error ?? `ORBIT policy denied ${tool}`)
 }
 
@@ -378,7 +392,12 @@ export default Plugin.define({
         editor.update(tool.id, (draft: any) => {
           const original = draft.execute
           draft.execute = async (input: any, context: any) => {
-            await checkPolicy(tool.id, input)
+            const approved = await checkPolicy(tool.id, input)
+            // The approval is bound to the arguments that were checked: refuse to run
+            // anything else (for example if the input was mutated after the check).
+            if (!approved || approved !== callHash(tool.id, input)) {
+              throw new Error(`ORBIT policy: arguments changed after approval for ${tool.id}`)
+            }
             return original(input, context)
           }
         })

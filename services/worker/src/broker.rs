@@ -752,6 +752,7 @@ async fn call_tool(
         effect: Some(tool.effect),
         connection: Some(connection.name.clone()),
         arguments: call.arguments.clone(),
+        cwd: None,
     };
     let policy = evaluate_tool_call(platform, platform, &state.tool_policies, &tool_call);
     let decision = policy.decision;
@@ -888,6 +889,8 @@ async fn call_tool(
 #[serde(rename_all = "camelCase")]
 struct PolicyCheck {
     tool: String,
+    /// Caller-declared metadata. Never trusted for native tools: the effect is derived
+    /// from the tool name ([`native_tool_effect`]); a disagreement is only logged.
     #[serde(default)]
     capability: Option<String>,
     #[serde(default)]
@@ -896,11 +899,85 @@ struct PolicyCheck {
     connection: Option<String>,
     #[serde(default)]
     arguments: Value,
+    /// Hash ([`arguments_hash`]) of the arguments the harness hook is about to execute.
+    /// When present it must equal the hash of `arguments`; the response returns the
+    /// hash the approval is bound to so the hook can re-verify at execution time.
+    #[serde(default)]
+    arguments_hash: Option<String>,
+}
+
+/// Effect of a native harness tool, derived from its name. The caller's declaration is
+/// never used. Unknown tools are treated as `write` (fail closed).
+///
+/// | effect | tools |
+/// |---|---|
+/// | read | `read`, `grep`, `glob`, `list`, `ls`, `find` |
+/// | external_side_effect | `bash`, `shell`, `webfetch`, `websearch`, `task`, `subagent` |
+/// | write | `edit`, `write`, `patch`, `multiedit`, `apply_patch`, and anything unknown |
+fn native_tool_effect(tool: &str) -> CapabilityEffect {
+    match tool.trim().to_ascii_lowercase().as_str() {
+        "read" | "grep" | "glob" | "list" | "ls" | "find" => CapabilityEffect::Read,
+        "bash" | "shell" | "webfetch" | "websearch" | "task" | "subagent" => {
+            CapabilityEffect::ExternalSideEffect
+        }
+        _ => CapabilityEffect::Write,
+    }
+}
+
+/// Stable hash of a native tool call (tool name plus canonicalised arguments: sorted
+/// object keys, compact JSON). Approvals are bound to it.
+fn arguments_hash(tool: &str, arguments: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(
+        action_fingerprint(tool, arguments).as_bytes(),
+    ))
+}
+
+/// A hook that presents a hash must present the hash of the arguments it sends.
+fn verify_presented_hash(presented: Option<&str>, expected: &str) -> Result<(), &'static str> {
+    match presented {
+        Some(hash) if hash != expected => {
+            Err("arguments hash mismatch: the arguments differ from those that were checked")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Build the platform-derived call and evaluate it: autonomy and approval mode through
+/// `evaluate_capability` (so level changes apply automatically), then tool-policy rules.
+/// Native tools default to `require_approval`; an explicit `allow` rule may resolve that
+/// but can never weaken the autonomy/approval-mode floor.
+fn evaluate_native_call(
+    autonomy: AutonomyLevel,
+    approval_mode: ApprovalMode,
+    rules: &[ToolPolicyRule],
+    workspace: &std::path::Path,
+    request: &PolicyCheck,
+) -> (ToolCall, ToolPolicyOutcome) {
+    let effect = native_tool_effect(&request.tool);
+    let grants = [GrantedCapability {
+        connection_id: Uuid::nil(),
+        connector: "harness".into(),
+        capability: request.tool.clone(),
+        effect,
+    }];
+    let platform = evaluate_capability(autonomy, approval_mode, &request.tool, effect, &grants);
+    let call = ToolCall {
+        tool: request.tool.clone(),
+        capability: None,
+        effect: Some(effect),
+        connection: None,
+        arguments: request.arguments.clone(),
+        cwd: Some(workspace.to_string_lossy().into_owned()),
+    };
+    let outcome = evaluate_tool_call(platform, PolicyDecision::RequireApproval, rules, &call);
+    (call, outcome)
 }
 
 /// Policy decision for native harness tools (Claude Code `PreToolUse`, OpenCode hooks).
-/// Native tools have no connector capability, so they default to `require_approval` and
-/// only explicit `allow` rules can make them run unattended. Platform denial still wins.
+/// Effects are derived server-side; native tools default to `require_approval` and only
+/// explicit `allow` rules can make them run unattended. Autonomy, approval mode and
+/// platform denial always win.
 async fn policy_check(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
@@ -913,29 +990,69 @@ async fn policy_check(
         )
             .into_response();
     }
-    let call = ToolCall {
-        tool: request.tool.clone(),
-        capability: request.capability.clone(),
-        effect: request.effect,
-        connection: request.connection.clone(),
-        arguments: request.arguments.clone(),
-    };
-    let outcome = evaluate_tool_call(
-        PolicyDecision::Allow,
-        PolicyDecision::RequireApproval,
+    let args_hash = arguments_hash(&request.tool, &request.arguments);
+    if let Err(reason) = verify_presented_hash(request.arguments_hash.as_deref(), &args_hash) {
+        record_denied(&state, &request.tool, reason).await;
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "decision": "deny",
+                "reason": reason,
+                "argumentsHash": args_hash,
+            })),
+        )
+            .into_response();
+    }
+    let (call, outcome) = evaluate_native_call(
+        state.autonomy,
+        state.approval_mode,
         &state.tool_policies,
-        &call,
+        &state.workspace,
+        &request,
     );
+    let effect = call.effect.unwrap_or(CapabilityEffect::Write);
+    if request.effect.is_some_and(|declared| declared != effect)
+        || request.capability.is_some()
+        || request.connection.is_some()
+    {
+        record_event(
+            &state,
+            "tool_call",
+            LogLevel::Warn,
+            &format!(
+                "ignored caller-declared metadata for native tool {}",
+                call.tool
+            ),
+            json!({
+                "tool": call.tool,
+                "declaredEffect": request.effect.map(|e| e.as_str()),
+                "derivedEffect": effect.as_str(),
+                "declaredCapability": request.capability,
+                "declaredConnection": request.connection,
+            }),
+        )
+        .await;
+    }
+    let respond = |status: StatusCode, outcome: &ToolPolicyOutcome| {
+        let mut body = serde_json::to_value(outcome).unwrap_or_else(|_| json!({}));
+        if let Some(map) = body.as_object_mut() {
+            map.insert("argumentsHash".into(), json!(args_hash));
+        }
+        (status, Json(body)).into_response()
+    };
 
     match outcome.decision {
         PolicyDecision::Deny => {
             record_denied(
                 &state,
                 &call.tool,
-                outcome.reason.as_deref().unwrap_or("denied by tool policy"),
+                outcome
+                    .reason
+                    .as_deref()
+                    .unwrap_or("denied by autonomy or tool policy"),
             )
             .await;
-            (StatusCode::FORBIDDEN, Json(outcome)).into_response()
+            respond(StatusCode::FORBIDDEN, &outcome)
         }
         PolicyDecision::RequireApproval => {
             let action = json!({
@@ -943,16 +1060,17 @@ async fn policy_check(
                 "connector": "harness",
                 "connectionId": state.connection.as_ref().map(|connection| connection.id),
                 "connectionName": state.connection.as_ref().map(|connection| connection.name.clone()),
-                "effect": call.effect.map(|effect| effect.as_str()).unwrap_or("write"),
+                "effect": effect.as_str(),
                 "agentName": state.execution.agent_name,
                 "arguments": truncate_json(&call.arguments, 4000),
+                "argumentsHash": args_hash,
                 "reason": outcome.reason,
                 "impact": outcome.impact,
                 "rule": outcome.rule_name,
                 "source": "tool_policy",
             });
             match request_approval_action(&state, &call.tool, action, &call.arguments).await {
-                Ok(_) => (StatusCode::OK, Json(outcome)).into_response(),
+                Ok(_) => respond(StatusCode::OK, &outcome),
                 Err(error) => (
                     StatusCode::FORBIDDEN,
                     Json(json!({ "decision": "deny", "reason": error.to_string() })),
@@ -960,7 +1078,7 @@ async fn policy_check(
                     .into_response(),
             }
         }
-        PolicyDecision::Allow => (StatusCode::OK, Json(outcome)).into_response(),
+        PolicyDecision::Allow => respond(StatusCode::OK, &outcome),
     }
 }
 
@@ -1304,5 +1422,166 @@ mod tests {
                 &json!({ "owner": "acme", "repo": "site", "number": 58, "body": "hi" }),
             )
         );
+    }
+
+    fn request(tool: &str, effect: Option<CapabilityEffect>, arguments: Value) -> PolicyCheck {
+        PolicyCheck {
+            tool: tool.into(),
+            capability: None,
+            effect,
+            connection: None,
+            arguments,
+            arguments_hash: None,
+        }
+    }
+
+    fn allow_all() -> Vec<ToolPolicyRule> {
+        vec![ToolPolicyRule {
+            id: Uuid::now_v7(),
+            name: "allow everything".into(),
+            priority: 100,
+            enabled: true,
+            action: orbit_domain::ToolPolicyAction::Allow,
+            matcher: Default::default(),
+            reason: None,
+            impact: None,
+        }]
+    }
+
+    fn decide(
+        level: u8,
+        mode: ApprovalMode,
+        rules: &[ToolPolicyRule],
+        req: &PolicyCheck,
+    ) -> PolicyDecision {
+        let autonomy = AutonomyLevel::from_level(level).unwrap();
+        evaluate_native_call(autonomy, mode, rules, std::path::Path::new("/work"), req)
+            .1
+            .decision
+    }
+
+    #[test]
+    fn declared_read_effect_on_bash_is_ignored() {
+        let req = request(
+            "bash",
+            Some(CapabilityEffect::Read),
+            json!({ "command": "rm -rf /" }),
+        );
+        let (call, _) = evaluate_native_call(
+            AutonomyLevel::from_level(4).unwrap(),
+            ApprovalMode::Always,
+            &allow_all(),
+            std::path::Path::new("/work"),
+            &req,
+        );
+        assert_eq!(call.effect, Some(CapabilityEffect::ExternalSideEffect));
+        // `approval_mode=always` still requires approval despite the allow rule.
+        assert_eq!(
+            decide(4, ApprovalMode::Always, &allow_all(), &req),
+            PolicyDecision::RequireApproval
+        );
+    }
+
+    #[test]
+    fn effect_matcher_cannot_be_spoofed_by_the_caller() {
+        let rules = vec![ToolPolicyRule {
+            matcher: orbit_domain::ToolPolicyMatcher {
+                effect: Some(CapabilityEffect::Write),
+                ..Default::default()
+            },
+            action: orbit_domain::ToolPolicyAction::Deny,
+            name: "no writes".into(),
+            ..allow_all().remove(0)
+        }];
+        let spoofed = request(
+            "write",
+            Some(CapabilityEffect::Read),
+            json!({ "path": "a" }),
+        );
+        assert_eq!(
+            decide(4, ApprovalMode::Auto, &rules, &spoofed),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn unknown_tools_are_treated_as_write() {
+        assert_eq!(native_tool_effect("mystery_tool"), CapabilityEffect::Write);
+        assert_eq!(native_tool_effect("Read"), CapabilityEffect::Read);
+        assert_eq!(native_tool_effect("GREP"), CapabilityEffect::Read);
+        assert_eq!(native_tool_effect("edit"), CapabilityEffect::Write);
+        assert_eq!(
+            native_tool_effect("Bash"),
+            CapabilityEffect::ExternalSideEffect
+        );
+        let req = request("mystery_tool", Some(CapabilityEffect::Read), json!({}));
+        // Level 3 needs approval for writes even with a blanket allow rule.
+        assert_eq!(
+            decide(3, ApprovalMode::Auto, &allow_all(), &req),
+            PolicyDecision::RequireApproval
+        );
+        assert_eq!(
+            decide(4, ApprovalMode::Auto, &allow_all(), &req),
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn autonomy_and_approval_mode_apply_to_native_tools() {
+        let read = request("read", None, json!({ "path": "a" }));
+        let bash = request("bash", None, json!({ "command": "ls" }));
+        // Reads are allowed by an allow rule at every level.
+        for level in 1..=4 {
+            assert_eq!(
+                decide(level, ApprovalMode::Auto, &allow_all(), &read),
+                PolicyDecision::Allow
+            );
+        }
+        // An allow rule never lifts the platform floor for writes below level 4.
+        for level in 1..=3 {
+            assert_ne!(
+                decide(level, ApprovalMode::Auto, &allow_all(), &bash),
+                PolicyDecision::Allow,
+                "level {level}"
+            );
+        }
+        assert_eq!(
+            decide(4, ApprovalMode::Auto, &allow_all(), &bash),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            decide(4, ApprovalMode::Writes, &allow_all(), &bash),
+            PolicyDecision::RequireApproval
+        );
+        // Without rules native tools still default to approval.
+        assert_eq!(
+            decide(4, ApprovalMode::Auto, &[], &read),
+            PolicyDecision::RequireApproval
+        );
+    }
+
+    #[test]
+    fn presented_hash_mismatch_is_rejected() {
+        let hash = arguments_hash("bash", &json!({ "command": "ls" }));
+        assert!(verify_presented_hash(Some(&hash), &hash).is_ok());
+        assert!(verify_presented_hash(None, &hash).is_ok());
+        let other = arguments_hash("bash", &json!({ "command": "rm -rf /" }));
+        assert!(verify_presented_hash(Some(&other), &hash).is_err());
+    }
+
+    #[test]
+    fn approval_hash_binds_the_arguments() {
+        let a = arguments_hash("bash", &json!({ "command": "ls", "cwd": "/w" }));
+        let reordered = arguments_hash("bash", &json!({ "cwd": "/w", "command": "ls" }));
+        assert_eq!(a, reordered);
+        assert_ne!(
+            a,
+            arguments_hash("bash", &json!({ "command": "rm -rf /", "cwd": "/w" }))
+        );
+        assert_ne!(
+            a,
+            arguments_hash("edit", &json!({ "command": "ls", "cwd": "/w" }))
+        );
+        assert_eq!(a.len(), 64);
     }
 }

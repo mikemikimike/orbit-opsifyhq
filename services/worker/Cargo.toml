@@ -36,3 +36,4 @@ reqwest.workspace = true
 axum.workspace = true
 tower.workspace = true
 hex.workspace = true
+sha2.workspace = true

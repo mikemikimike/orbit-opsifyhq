@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- Tool policies fail closed (#141): a `deny` / `require_approval` rule with `pathGlob` or
+  `commandRegex` now matches when no path/command can be extracted from the arguments;
+  more path keys are recognised, unlisted keys are scanned, leading `..` is preserved and
+  resolved against the workspace, and tool names match case-insensitively.
+- Native `/policy` no longer trusts the caller (#141): effects are derived server-side
+  from the tool name (unknown tools count as writes), autonomy level and approval mode are
+  applied, and approvals are bound to a hash of the arguments that the OpenCode and Pi
+  hooks present. Caller-declared `effect`/`capability`/`connection` are ignored.
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

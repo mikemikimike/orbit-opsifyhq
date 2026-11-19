@@ -190,20 +190,36 @@ fn write_policy_extension(workspace: &Path) -> std::io::Result<PathBuf> {
     let path = dir.join("orbit-policy.ts");
     std::fs::write(
         &path,
-        r#"export default function (pi: any) {
+        r#"import { createHash } from "node:crypto";
+
+// Stable hash of tool name + canonical JSON (sorted keys); must match the broker's
+// `arguments_hash`. The broker rejects a call whose hash differs from its arguments.
+function canon(value: any): string {
+  if (Array.isArray(value)) return "[" + value.map(canon).join(",") + "]";
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value).filter((k) => value[k] !== undefined).sort()
+      .map((k) => JSON.stringify(k) + ":" + canon(value[k])).join(",") + "}";
+  }
+  return JSON.stringify(value ?? null);
+}
+
+export default function (pi: any) {
   pi.on("tool_call", async (event: any) => {
     const base = process.env.ORBIT_BROKER_URL;
     const token = process.env.ORBIT_BROKER_TOKEN;
     if (!base || !token) return { block: true, reason: "ORBIT policy broker is unavailable" };
-    const readOnly = ["read", "grep", "find", "ls", "codemode"].includes(event.toolName);
+    // The effect is derived by the broker from the tool name; it is never declared here.
+    const input = event.input ?? {};
+    const argumentsHash = createHash("sha256")
+      .update(event.toolName + "\u001f" + canon(input)).digest("hex");
     try {
       const response = await fetch(`${base.replace(/\/$/, "")}/policy`, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-        body: JSON.stringify({ tool: event.toolName, effect: readOnly ? "read" : "write", arguments: event.input }),
+        body: JSON.stringify({ tool: event.toolName, arguments: input, argumentsHash }),
       });
-      if (response.ok) return;
       const body = await response.json().catch(() => ({}));
+      if (response.ok) return;
       return { block: true, reason: body.reason ?? body.error ?? `ORBIT policy denied ${event.toolName}` };
     } catch (error) {
       return { block: true, reason: `ORBIT policy check failed: ${error}` };
