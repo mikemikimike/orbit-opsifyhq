@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::process_env::child_environment;
 use orbit_contracts::{
     CreateInstanceRequest, ExecutionOutcome, ExecutionRequest, HarnessAdapter, HarnessCapabilities,
     HarnessConfig, HarnessDescriptor, HarnessError, HarnessErrorKind, HarnessEvent,
@@ -258,7 +259,10 @@ impl PiHarnessAdapter {
     pub async fn probe(&self, settings: &PiSettings) -> Result<String, HarnessError> {
         let candidate = settings.binary();
         let mut command = Command::new(candidate);
-        command.arg("--version");
+        command
+            .arg("--version")
+            .env_clear()
+            .envs(child_environment(std::env::vars_os(), std::iter::empty()));
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         let output = tokio::time::timeout(Duration::from_secs(8), command.output())
@@ -576,11 +580,23 @@ impl PiHarnessAdapter {
         let mut command = Command::new(settings.binary());
         command.args(&args);
         command.current_dir(&workspace);
+        let mut explicit_env = request
+            .extra_env
+            .iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect::<Vec<_>>();
         // Worker-profile connection mappings, resolved by the control plane.
-        command.envs(&request.extra_env);
         if let Some(bridge) = &settings.orbit_mcp {
-            command.envs(&bridge.environment);
+            explicit_env.extend(
+                bridge
+                    .environment
+                    .iter()
+                    .map(|(name, value)| (name.into(), value.into())),
+            );
         }
+        command
+            .env_clear()
+            .envs(child_environment(std::env::vars_os(), explicit_env));
         command.env("PWD", &workspace);
         // Pi must not perform model-catalog/version network calls in headless or
         // airgapped execution. Provider requests still go to the configured endpoint.
