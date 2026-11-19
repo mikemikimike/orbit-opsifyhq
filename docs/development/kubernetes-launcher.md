@@ -55,6 +55,9 @@ rules:
 - apiGroups: ["batch"]
   resources: ["jobs"]
   verbs: ["get", "list", "watch", "create", "delete"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create", "patch", "delete"]   # per-launch env Secret; no read access
 ```
 
 The Helm chart creates a dedicated `ServiceAccount` and `Role`/`RoleBinding` for this.
@@ -86,7 +89,21 @@ The launcher adds `imagePullSecrets` to every pod it creates.
 - The launcher validates the token, then runs `kubectl create -f -` with the workload
   manifest (Deployment for long-lived profiles, Job for single executions).
 - Worker pods receive `ORBIT_WORKER_TOKEN` (a scoped worker token minted for that
-  launch) via env var. The token is revoked when the launch stops or fails.
+  launch). The token and all worker-profile env values are stored in a per-launch Secret
+  (`<workload>-env`, labelled `orbit.launch-id`) and referenced with `secretKeyRef`; they
+  never appear as plain `value` in the Job/Deployment spec. The launcher sets the workload
+  as the Secret's owner, so the Secret is garbage-collected when the workload is deleted
+  (stop, relaunch, Job TTL). It needs only `create`/`patch`/`delete` on `secrets`.
+  Secrets are only as private as your cluster's etcd: enable encryption at rest.
+- Docker launches pass the same values through a 0600 `--env-file` that is deleted right
+  after `docker run`; nothing secret is in argv. `docker inspect` on the host still shows
+  container env, so protect Docker socket access.
+- The token is revoked when the launch stops or fails, and, for single-execution
+  launches, when the execution reaches a terminal state (the API checks every 15 s).
+- Worker pods set `automountServiceAccountToken: false`; they have no Kubernetes API access.
+- Optional NetworkPolicy: set `networkPolicy.enabled=true` in the Helm chart to allow
+  ingress to the launcher (port 8090) only from the ORBIT API pods. It needs a CNI that
+  enforces NetworkPolicy and is off by default. Egress is not restricted.
 - The launcher never exposes kubectl or the Docker socket to the API or web app.
 EOF
 echo done
