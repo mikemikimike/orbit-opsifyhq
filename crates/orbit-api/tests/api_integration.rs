@@ -1305,3 +1305,182 @@ async fn same_agent_queues_on_different_harnesses() {
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(second["harnessKind"], "pi");
 }
+
+fn put_json(path: &str, token: &str, body: &Value) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn token_permissions_follow_the_owners_current_role() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let user = app
+        .store
+        .ensure_user(app.org_id, "demoted@test.local", "Demoted", UserRole::Owner)
+        .await
+        .unwrap();
+    let issued = orbit_security::issue_api_token();
+    let scopes: Vec<String> = orbit_security::Permission::all_for(UserRole::Owner)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    app.store
+        .create_api_token(
+            app.org_id,
+            user.id,
+            "explicit",
+            &issued.prefix,
+            &issued.hash,
+            &scopes,
+            None,
+        )
+        .await
+        .unwrap();
+    let (status, current) = send(
+        &app.router,
+        auth_get("/api/v1/settings/access", &issued.token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(
+        &app.router,
+        put_json("/api/v1/settings/access", &issued.token, &current),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner write allowed: {body}");
+
+    app.store
+        .set_user_role(app.org_id, user.id, UserRole::Viewer)
+        .await
+        .unwrap();
+
+    let (status, _) = send(
+        &app.router,
+        auth_get("/api/v1/settings/access", &issued.token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "viewer can still read");
+    let (status, body) = send(
+        &app.router,
+        put_json("/api/v1/settings/access", &issued.token, &current),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/api-tokens",
+            &issued.token,
+            json!({ "name": "escalate" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn tokens_cannot_be_minted_with_scopes_the_caller_lacks() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let user = app
+        .store
+        .ensure_user(app.org_id, "minter@test.local", "Minter", UserRole::Viewer)
+        .await
+        .unwrap();
+    let role = format!("Token minter {}", Uuid::now_v7());
+    app.store
+        .create_custom_role(
+            app.org_id,
+            &role,
+            &[
+                "agents:read".to_string(),
+                "settings:read".to_string(),
+                "settings:write".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+    app.store
+        .set_user_role_name(app.org_id, user.id, &role)
+        .await
+        .unwrap();
+    let token = token_for(&app.store, app.org_id, user.id, "minter").await;
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/api-tokens",
+            &token,
+            json!({ "name": "too much", "scopes": ["agents:read", "providers:write", "*"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let details = body["error"]["details"].to_string();
+    assert!(details.contains("providers:write"), "{details}");
+    assert!(!details.contains("'*'"), "{details}");
+    assert!(!details.contains("'agents:read'"), "{details}");
+
+    // `*` is allowed: it resolves to the caller's current permissions at request time.
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/api-tokens",
+            &token,
+            json!({ "name": "wildcard", "scopes": ["*"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/api-tokens",
+            &token,
+            json!({ "name": "ok", "scopes": ["agents:read"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = send(
+        &app.router,
+        auth_post("/api/v1/api-tokens", &token, json!({ "name": "default" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut got: Vec<String> = serde_json::from_value(body["scopes"].clone()).unwrap();
+    got.sort();
+    assert_eq!(got, ["agents:read", "settings:read", "settings:write"]);
+}
+
+#[tokio::test]
+async fn disabled_users_tokens_are_rejected() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let user = app
+        .store
+        .ensure_user(app.org_id, "off@test.local", "Off", UserRole::Owner)
+        .await
+        .unwrap();
+    let token = token_for(&app.store, app.org_id, user.id, "off").await;
+    let (status, _) = send(&app.router, auth_get("/api/v1/me", &token)).await;
+    assert_eq!(status, StatusCode::OK);
+    sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1")
+        .bind(user.id)
+        .execute(app.store.pool())
+        .await
+        .unwrap();
+    let (status, _) = send(&app.router, auth_get("/api/v1/me", &token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

@@ -23,6 +23,13 @@ The role name is stored on the user; at authentication time ORBIT resolves built
 permissions or the custom permission set. Deleting a role locks assigned users out until
 they are reassigned (403), rather than silently downgrading them.
 
+## API tokens
+
+API tokens never exceed their owner's current role: effective permissions are the token's
+scopes intersected with the owner's present permissions, so demoting a user immediately
+narrows their existing tokens. Minting a token with a scope you do not hold is rejected
+(422); `*` means "whatever my role grants". See [docs/development/rbac.md](../development/rbac.md).
+
 ## OIDC group mapping
 
 `roleClaim` + `groupRoles` map IdP groups to built-in roles; `syncRoles` re-evaluates on

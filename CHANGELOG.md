@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- API token scopes are now bounded by the owner's current role (a demoted user's tokens lose the extra permissions immediately), and creating a token with scopes the caller does not hold is rejected with 400 (#136).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

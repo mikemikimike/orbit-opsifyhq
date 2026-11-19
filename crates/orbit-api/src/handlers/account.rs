@@ -131,6 +131,22 @@ pub async fn create_api_token(
             ]));
         }
     }
+    // `*` means "everything my role grants" and is bounded at authentication time, so it
+    // is always allowed; explicit scopes must be held by the caller right now.
+    let held = auth.permissions();
+    let denied: Vec<orbit_domain::ValidationIssue> = scopes
+        .iter()
+        .filter(|scope| scope.as_str() != "*" && !orbit_security::scope_granted(&held, scope))
+        .map(|scope| {
+            orbit_domain::ValidationIssue::new(
+                "scopes",
+                format!("scope '{scope}' exceeds your current permissions"),
+            )
+        })
+        .collect();
+    if !denied.is_empty() {
+        return Err(ApiError::validation(denied));
+    }
     let expires_at = body
         .expires_in_days
         .filter(|days| *days > 0)

@@ -84,10 +84,27 @@ async fn resolve_api_token(state: &AppState, token: &str) -> Result<AuthContext,
         return Err(ApiError::forbidden("user is disabled"));
     }
     let (role, role_scopes) = resolve_role(state, user.org_id, &user.role).await?;
+    // Token scopes are bounded by the owner's CURRENT role so demotion takes effect
+    // immediately. An empty stored list keeps meaning "whatever the role grants".
     let scopes = if record.scopes.is_empty() {
         role_scopes
     } else {
-        record.scopes
+        let held: Vec<String> = if role_scopes.is_empty() {
+            orbit_security::Permission::all_for(role)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        } else {
+            role_scopes
+        };
+        let bounded = orbit_security::intersect_scopes(&record.scopes, &held);
+        if bounded.is_empty() {
+            // An empty list would fall back to the full role set, so deny explicitly.
+            return Err(ApiError::forbidden(
+                "API token has no permissions under the owner's current role",
+            ));
+        }
+        bounded
     };
     let store = state.store.clone();
     let token_id = record.id;
