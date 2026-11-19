@@ -6,6 +6,17 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- Compose publishes Postgres, NATS, API and web on `127.0.0.1` only; the NATS monitor
+  (8222) and the Docker-socket launcher (8090) are no longer published (#128).
+- Helm chart refuses to render an anonymous dev-auth Owner UI behind the ingress unless
+  `auth.acknowledgeInsecureDev=true`, and rejects `platform.environment=production` with
+  dev auth or the default bundled Postgres password (#128).
+- Added a production checklist to `docs/development/deployment.md` (#128).
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

@@ -91,7 +91,7 @@ docker compose -f deploy/compose/compose.yaml up -d
 - Web UI: http://localhost:3000
 - API: http://localhost:8080/api/v1 · docs: http://localhost:8080/docs
 - PostgreSQL: `localhost:5432` (`orbit`/`orbit`, db `orbit`)
-- NATS: `localhost:4222`, monitoring `http://localhost:8222`
+- NATS: `localhost:4222` (loopback only; the monitor port is not published)
 
 The stack seeds demo agents (mock harness). Open an agent → **Run agent** → watch the
 live execution timeline, or use **Work** to create a run through the wizard.

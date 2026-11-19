@@ -39,6 +39,8 @@ if kubectl --context "${KUBE_CONTEXT}" -n "${NAMESPACE}" get secret orbit-secret
   LAUNCHER_TOKEN=$(kubectl --context "${KUBE_CONTEXT}" -n "${NAMESPACE}" get secret orbit-secrets -o jsonpath='{.data.launcher-token}' 2>/dev/null | base64 -d 2>/dev/null || true)
 fi
 
+# Local microk8s only: dev auth behind the ingress is acknowledged explicitly
+# (auth.acknowledgeInsecureDev, see the chart guard in templates/_helpers.tpl).
 set -x
 helm --kube-context "${KUBE_CONTEXT}" upgrade --install "${RELEASE}" deploy/helm/orbit \
   --namespace "${NAMESPACE}" \
@@ -53,6 +55,7 @@ helm --kube-context "${KUBE_CONTEXT}" upgrade --install "${RELEASE}" deploy/helm
   --set platform.corsOrigins="http://${INGRESS_HOST}" \
   --set platform.publicBaseUrl="http://${INGRESS_HOST}" \
   --set platform.environment=development \
+  --set auth.acknowledgeInsecureDev=true \
   --set postgresql.storageClassName=hostpath \
   --set nats.storageClassName=hostpath \
   ${WORKER_TOKEN:+--set worker.enabled=true --set worker.token="${WORKER_TOKEN}"} \

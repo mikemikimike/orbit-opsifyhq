@@ -166,6 +166,9 @@ auth:
   # dev  = seeded local user (no IdP). Use only for local/test clusters.
   # oidc = bearer tokens validated against your OIDC provider's JWKS.
   mode: dev
+  # Rendering fails when the ingress is enabled with mode=dev + dev.allowAnonymous=true
+  # (an anonymous Owner UI) unless this is set. Only for throwaway local/test clusters.
+  acknowledgeInsecureDev: false
   dev:
     allowAnonymous: true
     token: orbit-dev-token
@@ -223,6 +226,7 @@ postgresql:
   image: postgres:17-alpine
   database: orbit
   user: orbit
+  # Default is for throwaway clusters only; rejected when platform.environment=production.
   password: orbit
   storage: 5Gi
   storageClassName: ""
@@ -287,7 +291,9 @@ externalNats:
 # ─── Platform ────────────────────────────────────────────────
 platform:
   # This default chart targets local/test clusters (bundled DB/NATS, dev auth).
-  # Use values-prod.example.yaml for a production deployment.
+  # Use values-prod.example.yaml for a production deployment. With
+  # environment=production the chart refuses auth.mode=dev and the default bundled
+  # Postgres password.
   environment: development
   seedDemo: true
   # Seed a launchable worker profile when a launcher is configured (requires
