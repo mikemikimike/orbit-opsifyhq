@@ -7,6 +7,7 @@ members = [
   "crates/orbit-events",
   "crates/orbit-security",
   "crates/orbit-harness",
+  "crates/orbit-kubernetes",
   "crates/orbit-api",
   "services/api",
   "services/worker",
@@ -29,6 +30,7 @@ orbit-store = { path = "crates/orbit-store" }
 orbit-events = { path = "crates/orbit-events" }
 orbit-security = { path = "crates/orbit-security" }
 orbit-harness = { path = "crates/orbit-harness" }
+orbit-kubernetes = { path = "crates/orbit-kubernetes" }
 orbit-api = { path = "crates/orbit-api" }
 
 anyhow = "1"

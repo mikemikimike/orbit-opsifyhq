@@ -1581,6 +1581,7 @@ dependencies = [
  "orbit-domain",
  "orbit-events",
  "orbit-harness",
+ "orbit-kubernetes",
  "orbit-security",
  "orbit-store",
  "pulldown-cmark",
@@ -1703,6 +1704,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbit-kubernetes"
+version = "0.22.1"
+dependencies = [
+ "base64 0.22.1",
+ "reqwest",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+]
+
+[[package]]
 name = "orbit-launcher"
 version = "0.22.1"
 dependencies = [
@@ -1803,6 +1815,7 @@ dependencies = [
  "orbit-domain",
  "orbit-events",
  "orbit-harness",
+ "orbit-kubernetes",
  "orbit-security",
  "orbit-store",
  "reqwest",

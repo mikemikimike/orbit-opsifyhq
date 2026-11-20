@@ -91,10 +91,35 @@ impl ApiConfig {
     }
 }
 
+/// The documented development key (base64 of this string) and the SHA-256 derived
+/// fallback. A production process must never encrypt real secrets with either.
+const DEVELOPMENT_MASTER_KEY: &[u8] = b"orbit-dev-master-key-32-bytes!!!";
+
+fn is_development_master_key(key: &str) -> bool {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(key.trim()) else {
+        return false;
+    };
+    if decoded == DEVELOPMENT_MASTER_KEY {
+        return true;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"orbit-development-master-key-do-not-use-in-production");
+    decoded == hasher.finalize().as_slice()
+}
+
 fn resolve_master_key(environment: &str) -> anyhow::Result<String> {
     if let Ok(key) = std::env::var("ORBIT_MASTER_KEY") {
-        if !key.trim().is_empty() {
-            return Ok(key);
+        let key = key.trim();
+        if !key.is_empty() {
+            if environment == "production" && is_development_master_key(key) {
+                anyhow::bail!(
+                    "ORBIT_MASTER_KEY is a published development key and cannot be used in \
+                     production; generate a new one with `openssl rand -base64 32`"
+                );
+            }
+            return Ok(key.to_string());
         }
     }
     if environment == "production" {
@@ -257,6 +282,22 @@ mod tests {
         )
         .expect("composed");
         assert_eq!(url, "postgres://orbit@db:5432/orbit?sslmode=disable");
+    }
+
+    #[test]
+    fn development_master_keys_are_rejected() {
+        use base64::Engine;
+        let published = base64::engine::general_purpose::STANDARD.encode(DEVELOPMENT_MASTER_KEY);
+        assert!(is_development_master_key(&published));
+        let mut hasher = sha2::Sha256::new();
+        use sha2::Digest;
+        hasher.update(b"orbit-development-master-key-do-not-use-in-production");
+        let derived = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
+        assert!(is_development_master_key(&derived));
+        assert!(!is_development_master_key(
+            &base64::engine::general_purpose::STANDARD.encode([42u8; 32])
+        ));
+        assert!(!is_development_master_key("not-base64"));
     }
 
     #[test]

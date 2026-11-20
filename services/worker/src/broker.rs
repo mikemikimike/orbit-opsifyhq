@@ -27,7 +27,7 @@ use orbit_store::{Approval, Connection, ExecutionRecord};
 use crate::client::WorkerClient;
 use crate::github::{self, GitHubClientConfig};
 use crate::gitlab::{self, GitLabClientConfig};
-use crate::kubernetes::KubernetesClientConfig;
+use orbit_kubernetes::KubernetesClientConfig;
 
 #[derive(Debug, Clone)]
 struct ToolSpec {

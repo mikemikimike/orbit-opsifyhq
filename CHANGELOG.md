@@ -6,6 +6,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- Creating a trigger now requires **use** on the target agent and use of every connection
+  and provider its current spec references, closing an IDOR that let an Operator attach a
+  trigger to a private agent (#135).
+- Agent Team queue endpoints now enforce team visibility: listing needs view and
+  enqueue/run/retry/requeue/cancel need use, so non-members get `404` and team viewers
+  cannot start the team's agents (#132).
+- Production refuses to start with either published development master key; the Helm
+  chart rejects the dev key when `platform.environment=production` (#107).
+
+### Added
+
+- Kubernetes connector: the connection Test button now parses ServiceAccount/kubeconfig
+  credentials, reports visible namespaces and RBAC errors, and kubeconfig
+  client-certificate auth is supported. The client moved to `orbit-kubernetes` so the API
+  and worker share the same parser and HTTP client (#45).
+
 ## [0.22.1] - 2026-11-20
 
 ### Fixed

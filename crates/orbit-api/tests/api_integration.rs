@@ -2921,3 +2921,201 @@ fn usage_total(body: &Value) -> i64 {
         .map(|d| d["executions"].as_i64().unwrap())
         .sum()
 }
+
+#[tokio::test]
+async fn trigger_creation_requires_use_on_the_target_agent() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let alice = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "trigger-alice@test.local",
+            "Alice",
+            UserRole::Owner,
+        )
+        .await
+        .unwrap();
+    let bob = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "trigger-bob@test.local",
+            "Bob",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let agent = create_demo_agent(&app.store, app.org_id, alice.id).await;
+    make_private(&app.store, app.org_id, "agents", agent, alice.id).await;
+    let bob_token = token_for(&app.store, app.org_id, bob.id, "trigger-bob").await;
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "trigger-alice").await;
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/triggers",
+            &bob_token,
+            json!({ "agentId": agent, "kind": "manual" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/triggers",
+            &alice_token,
+            json!({ "agentId": agent, "kind": "manual" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["agentId"], agent.to_string());
+}
+
+#[tokio::test]
+async fn team_queue_requires_team_view_and_use() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let alice = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "queue-alice@test.local",
+            "Alice",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let bob = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "queue-bob@test.local",
+            "Bob",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let charlie = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "queue-charlie@test.local",
+            "Charlie",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "alice").await;
+    let bob_token = token_for(&app.store, app.org_id, bob.id, "bob").await;
+    let charlie_token = token_for(&app.store, app.org_id, charlie.id, "charlie").await;
+
+    let team = app
+        .store
+        .create_agent_team(
+            app.org_id,
+            "Queue team",
+            "",
+            &json!({ "steps": [] }),
+            Some(alice.id),
+        )
+        .await
+        .unwrap();
+    app.store
+        .assign_resource_owner(app.org_id, "agent_teams", team.id, alice.id)
+        .await
+        .unwrap();
+    let access_team = app
+        .store
+        .create_access_team(
+            app.org_id,
+            "Queue viewers",
+            &format!("queue-{}", Uuid::now_v7()),
+            Some(alice.id),
+        )
+        .await
+        .unwrap();
+    app.store
+        .upsert_team_member(access_team.id, bob.id, "viewer")
+        .await
+        .unwrap();
+    app.store
+        .set_resource_visibility(
+            app.org_id,
+            "agent_teams",
+            team.id,
+            "team",
+            Some(access_team.id),
+        )
+        .await
+        .unwrap();
+
+    // A non-member cannot see the queue at all.
+    let (status, _) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/agent-teams/{}/queue", team.id),
+            &charlie_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agent-teams/{}/queue", team.id),
+            &charlie_token,
+            json!({ "items": [{ "externalKey": "x" }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A team viewer can read the queue but cannot enqueue or run.
+    let (status, _) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/agent-teams/{}/queue", team.id),
+            &bob_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agent-teams/{}/queue", team.id),
+            &bob_token,
+            json!({ "items": [{ "externalKey": "x" }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agent-teams/{}/queue", team.id),
+            &alice_token,
+            json!({ "items": [{ "externalKey": "item-1" }] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let item_id = body[0]["id"].as_str().unwrap();
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agent-teams/{}/queue/{item_id}/run", team.id),
+            &bob_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
