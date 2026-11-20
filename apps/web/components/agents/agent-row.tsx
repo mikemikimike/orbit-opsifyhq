@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Cable, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { AgentStatusBadge } from "@/components/ui/status-badge";
 import { relativeTime, titleCase } from "@/lib/utils";
 import { brandName, autonomyName } from "@/lib/presentation";
@@ -12,10 +13,14 @@ import type { AgentSummary } from "@/lib/types";
  */
 export function AgentRow({
   agent,
+  selected,
+  onSelect,
   onRestore,
   onDelete,
 }: {
   agent: AgentSummary;
+  selected?: boolean;
+  onSelect?: (selected: boolean) => void;
   onRestore?: (agent: AgentSummary) => void;
   onDelete?: (agent: AgentSummary) => void;
 }) {
@@ -23,7 +28,15 @@ export function AgentRow({
 
   return (
     <li className="group relative border-b last:border-b-0">
-      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-2 px-4 py-3.5 transition-colors group-hover:bg-muted/50 sm:px-5 md:grid-cols-[minmax(0,1fr)_7rem_11rem_6.5rem]">
+      <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-2 px-4 py-3.5 transition-colors group-hover:bg-muted/50 sm:px-5 md:grid-cols-[1.5rem_minmax(0,1fr)_7rem_11rem_6.5rem]">
+        {onSelect ? (
+          <Checkbox
+            aria-label={`Select ${agent.name}`}
+            className="relative z-10"
+            checked={Boolean(selected)}
+            onChange={(event) => onSelect(event.target.checked)}
+          />
+        ) : null}
         <div className="min-w-0">
           <p className="flex items-center gap-2">
             <Link
