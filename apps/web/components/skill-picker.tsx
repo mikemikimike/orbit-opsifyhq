@@ -87,15 +87,28 @@ export function SkillPicker({
             { value: "selected", label: "Selected", count: value.length },
           ]}
         />
-        {value.length ? (
+        <div className="ml-auto flex items-center gap-3">
           <button
             type="button"
-            onClick={() => onChange([])}
-            className="ml-auto rounded text-xs font-medium text-muted-foreground hover:text-foreground"
+            onClick={() => {
+              const visibleSlugs = visible.map((skill) => skill.slug);
+              onChange([...new Set([...value, ...visibleSlugs])]);
+            }}
+            disabled={visible.length === 0 || visible.every((skill) => value.includes(skill.slug))}
+            className="rounded text-xs font-medium text-primary underline-offset-4 hover:underline disabled:cursor-not-allowed disabled:text-muted-foreground disabled:no-underline"
           >
-            Clear
+            Select all{visible.length !== skills.length ? ` ${visible.length}` : ""}
           </button>
-        ) : null}
+          {value.length ? (
+            <button
+              type="button"
+              onClick={() => onChange([])}
+              className="rounded text-xs font-medium text-muted-foreground hover:text-foreground"
+            >
+              Select none
+            </button>
+          ) : null}
+        </div>
       </div>
 
       <ul className="max-h-[22rem] divide-y overflow-y-auto rounded-lg border bg-card">

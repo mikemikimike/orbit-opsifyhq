@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { ResourceAccessFields } from "@/components/resource-access-fields";
+import { ResourceAccessFields, type ResourceAccessHandle } from "@/components/resource-access-fields";
 import { cleanDescription } from "@/lib/presentation";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -75,6 +75,7 @@ function bundledPaths(skill: Skill): string[] {
 }
 
 export default function SkillsPage() {
+  const accessRef = useRef<ResourceAccessHandle>(null);
   const skills = useSkills();
   const teams = useAgentTeams();
   const queryClient = useQueryClient();
@@ -160,6 +161,11 @@ export default function SkillsPage() {
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
+
+  async function saveSkill() {
+    if ((await accessRef.current?.save()) === false) return;
+    save.mutate();
+  }
 
   const remove = useMutation({
     mutationFn: async (id: string) =>
@@ -515,13 +521,13 @@ export default function SkillsPage() {
               ) : null}
             </div>
           </div>
-          <ResourceAccessFields resource="skills" resourceId={editing?.id} />
+          <ResourceAccessFields ref={accessRef} resource="skills" resourceId={editing?.id} />
           <DialogFooter>
             <Button variant="outline" onClick={() => setOpen(false)}>
               Cancel
             </Button>
             <Button
-              onClick={() => save.mutate()}
+              onClick={() => void saveSkill()}
               loading={save.isPending}
               disabled={!name.trim() || !slug.trim() || !content.trim()}
             >

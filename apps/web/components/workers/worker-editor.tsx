@@ -5,7 +5,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ChevronLeft } from "lucide-react";
 import { toast } from "sonner";
 
-import { ResourceAccessFields } from "@/components/resource-access-fields";
+import { ResourceAccessFields, type ResourceAccessHandle } from "@/components/resource-access-fields";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
@@ -80,6 +80,7 @@ export function WorkerEditor({
   onClose: () => void;
   onCreated: (profile: WorkerProfile) => void;
 }) {
+  const accessRef = useRef<ResourceAccessHandle>(null);
   const editing = editor.profile;
   const attachMappingId = editor.attachMappingId ?? null;
   const queryClient = useQueryClient();
@@ -218,7 +219,7 @@ export function WorkerEditor({
   const issues = validateWorkerForm(values);
   const summaries = sectionSummaries(values, Boolean(editing));
 
-  function requestSave() {
+  async function requestSave() {
     if (issues.length) {
       // Open the first section with a problem rather than leaving a dead button.
       setAttempted(true);
@@ -226,6 +227,7 @@ export function WorkerEditor({
       if (first) goToSection(first);
       return;
     }
+    if ((await accessRef.current?.save()) === false) return;
     if (needsRelaunch) {
       setConfirmRelaunch(true);
       return;
@@ -235,7 +237,7 @@ export function WorkerEditor({
 
   const saveLabel = editing ? "Save changes" : "Create profile";
   const saveButton = (className?: string) => (
-    <Button onClick={requestSave} loading={save.isPending} size="lg" className={className}>
+    <Button onClick={() => void requestSave()} loading={save.isPending} size="lg" className={className}>
       {saveLabel}
     </Button>
   );
@@ -362,7 +364,7 @@ export function WorkerEditor({
           </SectionCard>
 
           <SectionCard id="sharing" active={active} onGo={goToSection}>
-            <ResourceAccessFields resource="worker_profiles" resourceId={editing?.id} />
+            <ResourceAccessFields ref={accessRef} resource="worker_profiles" resourceId={editing?.id} />
           </SectionCard>
         </div>
       </div>

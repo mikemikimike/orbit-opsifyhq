@@ -2,7 +2,7 @@
 
 export const dynamic = 'force-dynamic';
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Link from "next/link";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -23,7 +23,7 @@ import { exportResource } from "@/components/export-resource-button";
 import { ImportPortableButton } from "@/components/import-portable-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Disclosure } from "@/components/ui/disclosure";
-import { ResourceAccessFields } from "@/components/resource-access-fields";
+import { ResourceAccessFields, type ResourceAccessHandle } from "@/components/resource-access-fields";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
 import { Card } from "@/components/ui/card";
@@ -134,6 +134,7 @@ function FormSection({
 }
 
 export default function AgentTeamsPage() {
+  const accessRef = useRef<ResourceAccessHandle>(null);
   const teams = useAgentTeams();
   const [runsArchived, setRunsArchived] = useState<"active" | "archived" | "all">("active");
   const runs = useTeamRuns(
@@ -387,6 +388,11 @@ export default function AgentTeamsPage() {
     setTask(team.definition.instructions ?? "");
     setRepository(team.definition.repository ?? "");
     setAutoApprove(false);
+  }
+
+  async function saveTeam() {
+    if ((await accessRef.current?.save()) === false) return;
+    save.mutate();
   }
 
   const remove = useMutation({
@@ -1243,11 +1249,11 @@ export default function AgentTeamsPage() {
               </div>
             </FormSection>
           </div>
-          <ResourceAccessFields resource="agent_teams" resourceId={editing?.id} />
+          <ResourceAccessFields ref={accessRef} resource="agent_teams" resourceId={editing?.id} />
           <DialogFooter className="sm:items-center">
             {blocker ? <p className="text-[13px] text-muted-foreground sm:mr-auto">{blocker}</p> : null}
             <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-            <Button onClick={() => save.mutate()} loading={save.isPending} disabled={!canCreate}>
+            <Button onClick={() => void saveTeam()} loading={save.isPending} disabled={!canCreate}>
               {editing ? "Save changes" : "Create agent team"}
             </Button>
           </DialogFooter>
