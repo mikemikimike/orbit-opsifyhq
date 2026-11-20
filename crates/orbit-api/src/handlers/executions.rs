@@ -450,10 +450,15 @@ pub async fn stream_execution_events(
 
     let org_id = auth.org_id;
     let store = state.store.clone();
+    let shutdown = state.shutdown.clone();
     let stream = async_stream::stream! {
         let mut last = after_seq;
         let mut snapshot_sent = false;
         loop {
+            if shutdown.is_cancelled() {
+                yield Ok(Event::default().event("shutdown").data("{}"));
+                break;
+            }
             let execution = match store.get_execution(org_id, execution_id).await {
                 Ok(execution) => execution,
                 Err(err) => {
@@ -502,7 +507,10 @@ pub async fn stream_execution_events(
                     .data(serde_json::to_string(&execution).unwrap_or_default()));
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(700)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(700)) => {}
+                _ = shutdown.cancelled() => {}
+            }
         }
     };
 

@@ -44,7 +44,7 @@ validated with field-level `details` and recorded in the audit log.
 
 | Method & path | Purpose |
 |---|---|
-| `GET /healthz`, `GET /readyz` | liveness / dependency readiness |
+| `GET /healthz`, `GET /readyz` | liveness / readiness (database gates; event bus reported as degraded) |
 | `GET /metrics` | Prometheus metrics |
 | `GET /api/v1/meta` | platform version, auth mode, capabilities |
 | `GET /api/v1/docs` | embedded documentation index (categories and pages); authenticated |

@@ -16,6 +16,13 @@ JetStream.
 - Handlers are idempotent: dedupe table + SQL compare-and-set claiming.
 - No Kafka, Redis or Temporal in the MVP.
 
+## Update (v0.21.x, #125)
+Durable pull consumers with explicit ack and bounded redelivery were never implemented;
+the NATS driver publishes to the `ORBIT` stream (the JetStream ack is now confirmed in the background and logged on failure) and
+subscribes with plain core subscriptions. The bus is an accelerator only: PostgreSQL stays
+the source of truth, and `/readyz` no longer depends on bus health. The text above records
+the original intent.
+
 ## Consequences
 - Local dev and tests need no external broker; production gets at-least-once delivery.
 - The memory driver is explicitly non-durable and refuses to start when

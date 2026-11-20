@@ -42,6 +42,8 @@ pub struct AppState {
     pub archive_after_days: Option<u32>,
     /// Offline enterprise license (hot reloadable).
     pub license: LicenseHandle,
+    /// Cancelled on SIGTERM/SIGINT: stops background loops and ends SSE streams.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 impl AppState {

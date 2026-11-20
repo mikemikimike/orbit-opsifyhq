@@ -40,6 +40,7 @@ sha2.workspace = true
 reqwest.workspace = true
 async-stream.workspace = true
 croner.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
