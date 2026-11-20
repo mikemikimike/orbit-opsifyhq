@@ -44,11 +44,13 @@ fn resolve_dev(state: &AppState, token: Option<&str>) -> Result<AuthContext, Api
         .dev_identity
         .as_ref()
         .ok_or_else(|| ApiError::internal("dev identity was not initialized"))?;
-    let dev_token = token == Some(state.auth.dev.dev_token.as_str());
+    let dev_token = token.is_some_and(|t| constant_time_eq(t, &state.auth.dev.dev_token));
     let anonymous = state.auth.dev.allow_anonymous;
-    // In dev mode a presented token that is not the dev token is still accepted when
-    // anonymous access is enabled, so the web app works without token plumbing.
-    if !dev_token && !anonymous && token.is_none() {
+    // With anonymous access disabled only the exact dev token authenticates (a missing
+    // or wrong token is rejected). With anonymous access enabled any request, including
+    // one carrying a non-dev token, is accepted so the web app works without token
+    // plumbing.
+    if !dev_token && !anonymous {
         return Err(ApiError::unauthorized("authentication required"));
     }
     Ok(AuthContext {
@@ -65,6 +67,12 @@ fn resolve_dev(state: &AppState, token: Option<&str>) -> Result<AuthContext, Api
         scopes: vec![],
         token_id: None,
     })
+}
+
+/// Constant-time string equality (length is not hidden; the dev token length is not secret).
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn resolve_api_token(state: &AppState, token: &str) -> Result<AuthContext, ApiError> {

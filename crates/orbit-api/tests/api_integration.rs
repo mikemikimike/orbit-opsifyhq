@@ -213,6 +213,50 @@ async fn unauthenticated_requests_are_rejected_when_anonymous_disabled() {
 }
 
 #[tokio::test]
+async fn dev_auth_without_anonymous_requires_exact_dev_token() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let with_token = |token: &str| {
+        Request::builder()
+            .uri("/api/v1/agents")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, _) = send(&app.router, get("/api/v1/agents")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for wrong in [
+        "wrong-token",
+        "test-toke",
+        "test-token-x",
+        "orbit_sk_unknown",
+    ] {
+        let (status, body) = send(&app.router, with_token(wrong)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "token {wrong}");
+        assert_eq!(body["error"]["code"], "unauthorized");
+    }
+    let (status, _) = send(&app.router, with_token("test-token")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn dev_auth_with_anonymous_accepts_missing_and_non_dev_tokens() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, _) = send(&app.router, get("/api/v1/agents")).await;
+    assert_eq!(status, StatusCode::OK);
+    let req = Request::builder()
+        .uri("/api/v1/agents")
+        .header("authorization", "Bearer something-else")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(&app.router, req).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn agent_crud_validation_and_export() {
     let Some(app) = test_app(true).await else {
         return;
