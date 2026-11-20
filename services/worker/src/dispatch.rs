@@ -115,13 +115,8 @@ pub async fn run(
             std::env::var("ORBIT_LOG_FORMAT").unwrap_or_else(|_| "json".into()),
         ),
     ];
-    for (key, value) in &envs {
-        if value.is_empty() {
-            continue;
-        }
-        args.push("-e".into());
-        args.push(format!("{key}={value}"));
-    }
+    let (env_args, secret_env) = docker_env_args(&envs);
+    args.extend(env_args);
 
     // Override the image entrypoint so the auth import wrapper runs and then execs the
     // worker binary. Without this, `sh -c ...` would be passed as arguments to the
@@ -150,6 +145,8 @@ pub async fn run(
 
     let mut command = Command::new(&docker);
     command.args(&args);
+    // Secret values reach the docker CLI through its environment, never its argv.
+    command.envs(secret_env);
     // Inherit logs instead of piping: a per-execution container can produce a lot of
     // output, and an undrained pipe would deadlock the parent.
     command.stdout(std::process::Stdio::inherit());
@@ -224,4 +221,54 @@ pub async fn run(
         tracing::info!(execution_id = %execution.id, "per-execution container finished");
     }
     Ok(())
+}
+
+/// Variables whose values must not appear in the docker CLI's argv (visible in `ps`).
+const SECRET_ENV: &[&str] = &["ORBIT_WORKER_TOKEN"];
+
+/// Split container env into `docker run` arguments and the secret values that must be
+/// set in the docker child's environment. Secrets are passed as `-e NAME` (no value),
+/// which makes the docker CLI read the value from its own environment.
+fn docker_env_args(envs: &[(&str, String)]) -> (Vec<String>, Vec<(String, String)>) {
+    let mut args = Vec::new();
+    let mut secrets = Vec::new();
+    for (key, value) in envs {
+        if value.is_empty() {
+            continue;
+        }
+        args.push("-e".to_string());
+        if SECRET_ENV.contains(key) {
+            args.push((*key).to_string());
+            secrets.push(((*key).to_string(), value.clone()));
+        } else {
+            args.push(format!("{key}={value}"));
+        }
+    }
+    (args, secrets)
+}
+
+#[cfg(test)]
+mod docker_env_tests {
+    use super::*;
+
+    #[test]
+    fn worker_token_is_not_in_docker_argv() {
+        let envs: Vec<(&str, String)> = vec![
+            ("ORBIT_API_URL", "http://api".into()),
+            ("ORBIT_WORKER_TOKEN", "orbit_wk_supersecret".into()),
+            ("EMPTY", String::new()),
+        ];
+        let (args, secrets) = docker_env_args(&envs);
+        assert!(!args.iter().any(|a| a.contains("orbit_wk_supersecret")));
+        assert!(args.windows(2).any(|w| w == ["-e", "ORBIT_WORKER_TOKEN"]));
+        assert!(args.contains(&"ORBIT_API_URL=http://api".to_string()));
+        assert!(!args.iter().any(|a| a.starts_with("EMPTY")));
+        assert_eq!(
+            secrets,
+            vec![(
+                "ORBIT_WORKER_TOKEN".to_string(),
+                "orbit_wk_supersecret".to_string()
+            )]
+        );
+    }
 }

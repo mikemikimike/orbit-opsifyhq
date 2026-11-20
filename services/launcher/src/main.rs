@@ -242,6 +242,112 @@ async fn resolve_docker_image(state: &AppState, image: &str, tag: &str) -> Strin
     exact
 }
 
+/// Env values that must never appear in argv, Job/Deployment specs or logs: the worker
+/// token and every worker-profile env value (which may carry provider keys).
+fn docker_secret_env(request: &LaunchRequest) -> anyhow::Result<Vec<(String, String)>> {
+    let mut env = vec![(
+        "ORBIT_WORKER_TOKEN".to_string(),
+        request.worker_token.clone(),
+    )];
+    env.extend(profile_env(request)?);
+    Ok(env)
+}
+
+fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Worker-profile env as validated key/value pairs (`env` is an optional JSON object).
+fn profile_env(request: &LaunchRequest) -> anyhow::Result<Vec<(String, String)>> {
+    let Ok(env) = serde_json::from_value::<BTreeMap<String, String>>(request.env.clone()) else {
+        return Ok(Vec::new());
+    };
+    for key in env.keys() {
+        anyhow::ensure!(
+            valid_env_name(key),
+            "invalid worker profile env name '{key}'"
+        );
+    }
+    Ok(env.into_iter().collect())
+}
+
+/// The `--env` / `--env-file` portion of `docker run`. Contains no secret values.
+fn docker_env_args(
+    request: &LaunchRequest,
+    api_url: &str,
+    env_file: &std::path::Path,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    for (key, value) in [
+        ("ORBIT_API_URL", api_url.to_string()),
+        ("ORBIT_WORKER_PROFILE_ID", request.profile_id.to_string()),
+        ("ORBIT_WORKER_HARNESSES", request.harness_kind.clone()),
+        ("ORBIT_WORKER_TARGET", request.target.clone()),
+        ("ORBIT_EXECUTION_DRIVER", request.execution_driver.clone()),
+        ("ORBIT_WORKER_ID", request.worker_id.clone()),
+        ("ORBIT_WORKSPACE_ROOT", "/tmp/orbit-workspaces".to_string()),
+        (
+            "ORBIT_LOG_FORMAT",
+            std::env::var("ORBIT_LOG_FORMAT").unwrap_or_else(|_| "text".into()),
+        ),
+    ] {
+        args.push("--env".into());
+        args.push(format!("{key}={value}"));
+    }
+    if let Some(execution_id) = request.single_execution_id {
+        args.push("--env".into());
+        args.push(format!("ORBIT_SINGLE_EXECUTION_ID={execution_id}"));
+    }
+    args.push("--env-file".into());
+    args.push(env_file.display().to_string());
+    args
+}
+
+/// A 0600 `KEY=value` file for `docker run --env-file`, removed on drop.
+struct EnvFile {
+    path: std::path::PathBuf,
+}
+
+impl EnvFile {
+    fn write(launch_id: Uuid, env: &[(String, String)]) -> anyhow::Result<Self> {
+        use std::io::Write;
+        let mut contents = String::new();
+        for (key, value) in env {
+            anyhow::ensure!(
+                !value.contains(['\n', '\r', '\0']),
+                "env value for '{key}' contains a line break or NUL and cannot be passed safely"
+            );
+            contents.push_str(&format!("{key}={value}\n"));
+        }
+        let path = std::env::temp_dir().join(format!("orbit-launch-{launch_id}.env"));
+        let _ = std::fs::remove_file(&path);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        // From here on, Drop removes the file even if the write fails.
+        let guard = Self { path };
+        file.write_all(contents.as_bytes())?;
+        Ok(guard)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for EnvFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 async fn launch_docker(state: &AppState, request: &LaunchRequest) -> anyhow::Result<LaunchStatus> {
     let name = pod_name(request.launch_id);
     let _ = Command::new(&state.docker)
@@ -300,39 +406,11 @@ async fn launch_docker(state: &AppState, request: &LaunchRequest) -> anyhow::Res
         args.push("--memory".into());
         args.push(memory.to_string());
     }
-    args.extend([
-        "--env".into(),
-        format!("ORBIT_API_URL={api_url}"),
-        "--env".into(),
-        format!("ORBIT_WORKER_TOKEN={}", request.worker_token),
-        "--env".into(),
-        format!("ORBIT_WORKER_PROFILE_ID={}", request.profile_id),
-        "--env".into(),
-        format!("ORBIT_WORKER_HARNESSES={}", request.harness_kind),
-        "--env".into(),
-        format!("ORBIT_WORKER_TARGET={}", request.target),
-        "--env".into(),
-        format!("ORBIT_EXECUTION_DRIVER={}", request.execution_driver),
-        "--env".into(),
-        format!("ORBIT_WORKER_ID={}", request.worker_id),
-        "--env".into(),
-        "ORBIT_WORKSPACE_ROOT=/tmp/orbit-workspaces".into(),
-        "--env".into(),
-        format!(
-            "ORBIT_LOG_FORMAT={}",
-            std::env::var("ORBIT_LOG_FORMAT").unwrap_or_else(|_| "text".into())
-        ),
-    ]);
-    if let Ok(env) = serde_json::from_value::<BTreeMap<String, String>>(request.env.clone()) {
-        for (key, value) in env {
-            args.push("--env".into());
-            args.push(format!("{key}={value}"));
-        }
-    }
-    if let Some(execution_id) = request.single_execution_id {
-        args.push("--env".into());
-        args.push(format!("ORBIT_SINGLE_EXECUTION_ID={execution_id}"));
-    }
+    let secret_env = docker_secret_env(request)?;
+    // Secret values travel in a 0600 env-file that is removed right after `docker run`
+    // returns, never in argv (visible in `ps`) and never in the launcher's own logs.
+    let env_file = EnvFile::write(request.launch_id, &secret_env)?;
+    args.extend(docker_env_args(request, &api_url, env_file.path()));
     let command = "mkdir -p \"$HOME/.local/share/opencode\"; \
          if command -v opencode >/dev/null 2>&1 && [ -f /seed/auth-export.json ]; then \
            opencode auth import --standalone /seed/auth-export.json || true; \
@@ -371,6 +449,7 @@ async fn launch_docker(state: &AppState, request: &LaunchRequest) -> anyhow::Res
     args.push("-c".into());
     args.push(command.to_string());
     let output = Command::new(&state.docker).args(&args).output().await?;
+    drop(env_file);
     if !output.status.success() {
         anyhow::bail!(
             "docker run failed: {}",
@@ -474,15 +553,16 @@ fn kubernetes_resources(resources: &orbit_domain::WorkerResources) -> Option<Val
     (!spec.is_empty()).then_some(Value::Object(spec))
 }
 
-async fn launch_kubernetes(
-    state: &AppState,
+/// Container env for a worker pod. Non-secret values stay inline; the worker token and
+/// all worker-profile env values go into a per-launch Secret referenced with
+/// `secretKeyRef`, so they never appear in Job/Deployment specs. Returns the env list
+/// and the Secret `stringData`.
+fn kubernetes_env(
     request: &LaunchRequest,
-) -> anyhow::Result<LaunchStatus> {
-    let name = pod_name(request.launch_id);
-    let api_url = request.api_url.clone();
+    secret_name: &str,
+) -> anyhow::Result<(Vec<Value>, BTreeMap<String, String>)> {
     let mut env = vec![
-        json!({ "name": "ORBIT_API_URL", "value": api_url }),
-        json!({ "name": "ORBIT_WORKER_TOKEN", "value": request.worker_token }),
+        json!({ "name": "ORBIT_API_URL", "value": request.api_url }),
         json!({ "name": "ORBIT_WORKER_PROFILE_ID", "value": request.profile_id.to_string() }),
         json!({ "name": "ORBIT_WORKER_HARNESSES", "value": request.harness_kind }),
         json!({ "name": "ORBIT_WORKER_TARGET", "value": request.target }),
@@ -491,17 +571,66 @@ async fn launch_kubernetes(
         json!({ "name": "ORBIT_WORKSPACE_ROOT", "value": "/tmp/orbit-workspaces" }),
         json!({ "name": "HOME", "value": "/home/orbit" }),
     ];
-    if let Ok(extra) = serde_json::from_value::<BTreeMap<String, String>>(request.env.clone()) {
-        for (key, value) in extra {
-            env.push(json!({ "name": key, "value": value }));
-        }
-    }
     if let Some(execution_id) = request.single_execution_id {
         env.push(json!({
             "name": "ORBIT_SINGLE_EXECUTION_ID",
             "value": execution_id.to_string()
         }));
     }
+    let mut data = BTreeMap::new();
+    for (key, value) in docker_secret_env(request)? {
+        env.push(json!({
+            "name": key,
+            "valueFrom": { "secretKeyRef": { "name": secret_name, "key": key } }
+        }));
+        data.insert(key, value);
+    }
+    Ok((env, data))
+}
+
+/// Pod spec skeleton shared by Jobs and Deployments. Worker pods never need Kubernetes
+/// API access, so the service-account token is not mounted.
+fn base_pod_spec(container: Value, volumes: Vec<Value>) -> Value {
+    json!({
+        "automountServiceAccountToken": false,
+        "securityContext": {
+            "runAsNonRoot": true,
+            "seccompProfile": { "type": "RuntimeDefault" }
+        },
+        "containers": [container],
+        "volumes": volumes
+    })
+}
+
+fn kubernetes_secret_manifest(
+    namespace: &str,
+    name: &str,
+    launch_id: Uuid,
+    data: &BTreeMap<String, String>,
+) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": {
+            "name": name,
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/name": "orbit-worker",
+                "orbit.launch-id": launch_id.to_string()
+            }
+        },
+        "stringData": data
+    })
+}
+
+async fn launch_kubernetes(
+    state: &AppState,
+    request: &LaunchRequest,
+) -> anyhow::Result<LaunchStatus> {
+    let name = pod_name(request.launch_id);
+    let secret_name = format!("{name}-env");
+    let (mut env, secret_data) = kubernetes_env(request, &secret_name)?;
     let mut command = vec!["/usr/local/bin/orbit-worker".to_string()];
     let mut mounts = vec![json!({ "name": "tmp", "mountPath": "/tmp" })];
     let mut pod_volumes = vec![json!({ "name": "tmp", "emptyDir": {} })];
@@ -614,14 +743,7 @@ async fn launch_kubernetes(
         "app.kubernetes.io/name": "orbit-worker",
         "orbit.launch-id": request.launch_id.to_string()
     });
-    let mut pod_spec = json!({
-        "securityContext": {
-            "runAsNonRoot": true,
-            "seccompProfile": { "type": "RuntimeDefault" }
-        },
-        "containers": [container],
-        "volumes": pod_volumes
-    });
+    let mut pod_spec = base_pod_spec(container, pod_volumes);
     if let Some(secret) = &state.image_pull_secret {
         pod_spec["imagePullSecrets"] = json!([{ "name": secret }]);
     }
@@ -664,14 +786,19 @@ async fn launch_kubernetes(
     };
 
     // Clean up any previous incarnation (including legacy Pods from older launchers).
-    for resource_type in ["deployment", "job", "pod"] {
+    for resource_type in ["deployment", "job", "pod", "secret"] {
+        let target = if resource_type == "secret" {
+            &secret_name
+        } else {
+            &name
+        };
         let _ = Command::new(&state.kubectl)
             .args([
                 "-n",
                 &state.namespace,
                 "delete",
                 resource_type,
-                &name,
+                target,
                 "--ignore-not-found",
             ])
             .stdout(Stdio::null())
@@ -679,6 +806,33 @@ async fn launch_kubernetes(
             .status()
             .await;
     }
+    // The Secret goes first so the pod can resolve its `secretKeyRef`s; manifests are
+    // piped on stdin, never passed as arguments.
+    let secret_manifest = kubernetes_secret_manifest(
+        &state.namespace,
+        &secret_name,
+        request.launch_id,
+        &secret_data,
+    );
+    kubectl_create(state, &secret_manifest).await?;
+    if let Err(error) = kubectl_create(state, &manifest).await {
+        delete_secret(state, &secret_name).await;
+        return Err(error);
+    }
+    // Garbage-collect the Secret together with its workload (stop, relaunch, Job TTL).
+    if let Err(error) = own_secret(state, &manifest, &name, &secret_name).await {
+        tracing::warn!(%error, "could not set owner reference on worker env Secret; deleting it with the next relaunch");
+    }
+    tracing::info!(launch_id = %request.launch_id, workload = %name, "worker workload created");
+    Ok(LaunchStatus {
+        status: "starting".into(),
+        runtime_id: Some(name),
+        worker_id: Some(request.worker_id.clone()),
+        error: None,
+    })
+}
+
+async fn kubectl_create(state: &AppState, manifest: &Value) -> anyhow::Result<()> {
     let mut child = Command::new(&state.kubectl)
         .args(["-n", &state.namespace, "create", "-f", "-"])
         .stdin(Stdio::piped())
@@ -696,13 +850,79 @@ async fn launch_kubernetes(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    tracing::info!(launch_id = %request.launch_id, workload = %name, "worker workload created");
-    Ok(LaunchStatus {
-        status: "starting".into(),
-        runtime_id: Some(name),
-        worker_id: Some(request.worker_id.clone()),
-        error: None,
-    })
+    Ok(())
+}
+
+async fn delete_secret(state: &AppState, name: &str) {
+    let _ = Command::new(&state.kubectl)
+        .args([
+            "-n",
+            &state.namespace,
+            "delete",
+            "secret",
+            name,
+            "--ignore-not-found",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+}
+
+/// Make the worker env Secret owned by its Job/Deployment so Kubernetes deletes it with
+/// the workload.
+async fn own_secret(
+    state: &AppState,
+    workload: &Value,
+    workload_name: &str,
+    secret_name: &str,
+) -> anyhow::Result<()> {
+    let kind = workload["kind"].as_str().unwrap_or("Deployment");
+    let api_version = workload["apiVersion"].as_str().unwrap_or("apps/v1");
+    let uid = Command::new(&state.kubectl)
+        .args([
+            "-n",
+            &state.namespace,
+            "get",
+            &kind.to_ascii_lowercase(),
+            workload_name,
+            "-o",
+            "jsonpath={.metadata.uid}",
+        ])
+        .output()
+        .await?;
+    anyhow::ensure!(uid.status.success(), "could not read workload uid");
+    let uid = String::from_utf8_lossy(&uid.stdout).trim().to_string();
+    anyhow::ensure!(!uid.is_empty(), "workload uid is empty");
+    let patch = json!({
+        "metadata": { "ownerReferences": [{
+            "apiVersion": api_version,
+            "kind": kind,
+            "name": workload_name,
+            "uid": uid,
+            "blockOwnerDeletion": false
+        }] }
+    });
+    let output = Command::new(&state.kubectl)
+        .args([
+            "-n",
+            &state.namespace,
+            "patch",
+            "secret",
+            secret_name,
+            "--type",
+            "merge",
+            "-p",
+            &patch.to_string(),
+        ])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "kubectl patch failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 async fn kubernetes_status(state: &AppState, name: &str, launch_id: Uuid) -> LaunchStatus {
@@ -882,4 +1102,105 @@ async fn logs(
         Err(error) => format!("could not read logs: {error}"),
     };
     Ok(Json(Logs { logs }))
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    fn request(env: Value, single: Option<Uuid>) -> LaunchRequest {
+        LaunchRequest {
+            launch_id: Uuid::now_v7(),
+            profile_id: Uuid::now_v7(),
+            name: "p".into(),
+            harness_kind: "mock".into(),
+            target: "kubernetes".into(),
+            execution_driver: "process".into(),
+            image: "img".into(),
+            image_tag: "1".into(),
+            auth_secret_name: None,
+            env,
+            resources: Value::Null,
+            api_url: "http://api:8080".into(),
+            worker_token: "orbit_wk_supersecret".into(),
+            worker_id: "w1".into(),
+            ca_secret_name: None,
+            ca_secret_key: default_ca_key(),
+            single_execution_id: single,
+        }
+    }
+
+    #[test]
+    fn docker_args_contain_no_secret_values() {
+        let req = request(json!({ "OPENAI_API_KEY": "sk-profile-secret" }), None);
+        let args = docker_env_args(&req, "http://host:8080", std::path::Path::new("/tmp/x.env"));
+        let joined = args.join(" ");
+        assert!(!joined.contains("orbit_wk_supersecret"));
+        assert!(!joined.contains("sk-profile-secret"));
+        assert!(!joined.contains("ORBIT_WORKER_TOKEN"));
+        assert!(!joined.contains("OPENAI_API_KEY"));
+        assert!(args.windows(2).any(|w| w == ["--env-file", "/tmp/x.env"]));
+    }
+
+    #[test]
+    fn env_file_is_private_contains_secrets_and_is_removed() {
+        let req = request(json!({ "OPENAI_API_KEY": "sk-profile-secret" }), None);
+        let env = docker_secret_env(&req).unwrap();
+        let file = EnvFile::write(req.launch_id, &env).unwrap();
+        let path = file.path().to_path_buf();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("ORBIT_WORKER_TOKEN=orbit_wk_supersecret\n"));
+        assert!(contents.contains("OPENAI_API_KEY=sk-profile-secret\n"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(file);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn env_file_rejects_line_breaks_and_bad_names() {
+        let bad_value = request(json!({ "A": "x\nINJECTED=1" }), None);
+        let env = docker_secret_env(&bad_value).unwrap();
+        assert!(EnvFile::write(bad_value.launch_id, &env).is_err());
+        let bad_name = request(json!({ "A B": "x" }), None);
+        assert!(docker_secret_env(&bad_name).is_err());
+    }
+
+    #[test]
+    fn kubernetes_env_uses_secret_key_refs_not_values() {
+        let single = Some(Uuid::now_v7());
+        let req = request(json!({ "OPENAI_API_KEY": "sk-profile-secret" }), single);
+        let (env, data) = kubernetes_env(&req, "orbit-worker-x-env").unwrap();
+        let rendered = serde_json::to_string(&env).unwrap();
+        assert!(!rendered.contains("orbit_wk_supersecret"));
+        assert!(!rendered.contains("sk-profile-secret"));
+        for name in ["ORBIT_WORKER_TOKEN", "OPENAI_API_KEY"] {
+            let entry = env.iter().find(|e| e["name"] == name).unwrap();
+            assert!(entry.get("value").is_none());
+            assert_eq!(
+                entry["valueFrom"]["secretKeyRef"]["name"],
+                "orbit-worker-x-env"
+            );
+            assert_eq!(entry["valueFrom"]["secretKeyRef"]["key"], name);
+        }
+        assert_eq!(data["ORBIT_WORKER_TOKEN"], "orbit_wk_supersecret");
+        assert_eq!(data["OPENAI_API_KEY"], "sk-profile-secret");
+        let secret = kubernetes_secret_manifest("ns", "orbit-worker-x-env", req.launch_id, &data);
+        assert_eq!(secret["kind"], "Secret");
+        assert_eq!(
+            secret["metadata"]["labels"]["orbit.launch-id"],
+            req.launch_id.to_string()
+        );
+    }
+
+    #[test]
+    fn worker_pods_do_not_automount_the_service_account_token() {
+        let spec = base_pod_spec(json!({ "name": "worker" }), vec![]);
+        assert_eq!(spec["automountServiceAccountToken"], false);
+        assert_eq!(spec["securityContext"]["runAsNonRoot"], true);
+    }
 }

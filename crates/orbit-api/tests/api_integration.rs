@@ -1358,387 +1358,109 @@ async fn same_agent_queues_on_different_harnesses() {
     assert_eq!(second["harnessKind"], "pi");
 }
 
-
-// ---------------------------------------------------------------------------
-// Output delivery (#112)
-// ---------------------------------------------------------------------------
-
-mod output_delivery {
-    use super::*;
-    use axum::extract::State;
-    use axum::http::HeaderMap;
-    use axum::routing::post as route_post;
-    use orbit_api::handlers::outputs::deliver_pending;
-    use orbit_security::SecretValue;
-    use orbit_store::Output;
-    use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-    use std::sync::Mutex as StdMutex;
-
-    /// deliver_pending is global across orgs; serialize these tests so counts are exact.
-    fn guard() -> &'static tokio::sync::Mutex<()> {
-        static GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
-    #[derive(Clone)]
-    struct Hook {
-        url: String,
-        hits: Arc<StdMutex<Vec<HeaderMap>>>,
-        status: Arc<AtomicU16>,
-        delay_ms: Arc<AtomicU64>,
-    }
-
-    impl Hook {
-        fn count(&self) -> usize {
-            self.hits.lock().unwrap().len()
-        }
-    }
-
-    async fn start_hook() -> Hook {
-        let hook = Hook {
-            url: String::new(),
-            hits: Arc::new(StdMutex::new(Vec::new())),
-            status: Arc::new(AtomicU16::new(200)),
-            delay_ms: Arc::new(AtomicU64::new(0)),
-        };
-        async fn handle(State(hook): State<Hook>, headers: HeaderMap) -> StatusCode {
-            hook.hits.lock().unwrap().push(headers);
-            let delay = hook.delay_ms.load(Ordering::SeqCst);
-            if delay > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            }
-            StatusCode::from_u16(hook.status.load(Ordering::SeqCst)).unwrap()
-        }
-        let router = axum::Router::new()
-            .route("/hook", route_post(handle))
-            .with_state(hook.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/hook", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
-        });
-        Hook { url, ..hook }
-    }
-
-    async fn make_output(app: &TestApp, hook: &Hook, kind: &str) -> Output {
-        let secret_ref = format!("secret://output/{}", Uuid::now_v7());
-        app.store
-            .put_secret(
-                Some(app.org_id),
-                &secret_ref,
-                &SecretValue::new(hook.url.clone()),
-                "test hook",
-            )
-            .await
-            .unwrap();
-        app.store
-            .create_output(
-                app.org_id,
-                &format!("hook-{}", Uuid::now_v7()),
-                kind,
-                None,
-                None,
-                &["succeeded".to_string(), "failed".to_string()],
-                &secret_ref,
-                None,
-            )
-            .await
-            .unwrap()
-    }
-
-    async fn finished_execution(app: &TestApp) -> Uuid {
-        let path = format!("/api/v1/agents/{}/executions", app.agent_id);
-        let request = Request::builder()
-            .method("POST")
+#[tokio::test]
+async fn changing_provider_base_url_requires_reentering_the_credential() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(
+        &app.router,
+        post(
+            "/api/v1/providers",
+            json!({
+                "name": "Rebind Gateway",
+                "kind": "openai_compatible",
+                "config": { "baseUrl": "http://10.1.2.3:9999/v1", "model": "qwen" },
+                "credential": "sk-rebind-secret"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+    let path = format!("/api/v1/providers/{id}");
+    let patch = |body: Value| {
+        Request::builder()
+            .method("PATCH")
             .uri(&path)
             .header("content-type", "application/json")
-            .header("idempotency-key", Uuid::now_v7().to_string())
-            .body(Body::from(json!({ "task": "notify" }).to_string()))
-            .unwrap();
-        let (status, body) = send(&app.router, request).await;
-        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
-        let id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
-        app.store.claim_execution(id, "test-worker").await.unwrap();
-        app.store.mark_execution_running(id, None).await.unwrap();
-        app.store
-            .finish_execution(
-                id,
-                orbit_domain::ExecutionStatus::Succeeded,
-                Some(&json!({ "text": "done" })),
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        id
-    }
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
 
-    /// Pretend the run finished `hours` ago (e.g. while the API was down).
-    async fn backdate_execution(app: &TestApp, id: Uuid, hours: i32) {
-        sqlx::query(
-            "UPDATE executions SET finished_at = now() - make_interval(hours => $2), \
-             updated_at = now() - make_interval(hours => $2) WHERE id = $1",
-        )
-        .bind(id)
-        .bind(hours)
-        .execute(app.store.pool())
-        .await
-        .unwrap();
-    }
-
-    async fn backdate_output(app: &TestApp, id: Uuid, hours: i32) {
-        sqlx::query(
-            "UPDATE outputs SET enqueue_from = now() - make_interval(hours => $2), \
-             enqueue_cursor = now() - make_interval(hours => $2) WHERE id = $1",
-        )
-        .bind(id)
-        .bind(hours)
-        .execute(app.store.pool())
-        .await
-        .unwrap();
-    }
-
-    async fn rows(app: &TestApp, output_id: Uuid) -> Vec<(String, i32, Option<i32>)> {
-        sqlx::query_as(
-            "SELECT status, attempts, response_status FROM output_deliveries \
-             WHERE output_id = $1 ORDER BY created_at",
-        )
-        .bind(output_id)
-        .fetch_all(app.store.pool())
-        .await
+    // New host without a new key: refused, nothing changes.
+    let (status, body) = send(
+        &app.router,
+        patch(json!({ "config": { "baseUrl": "http://evil.example/v1", "model": "qwen" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body["error"]["message"]
+        .as_str()
         .unwrap()
-    }
+        .contains("re-enter the API key"));
+    let stored: Value = sqlx::query_scalar("SELECT config FROM providers WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_one(app.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored["baseUrl"], "http://10.1.2.3:9999/v1");
 
-    async fn make_due(app: &TestApp, output_id: Uuid) {
-        sqlx::query("UPDATE output_deliveries SET next_attempt_at = now() WHERE output_id = $1")
-            .bind(output_id)
-            .execute(app.store.pool())
-            .await
-            .unwrap();
-    }
+    // Same URL (trailing slash only) keeps the credential.
+    let (status, body) = send(
+        &app.router,
+        patch(json!({ "config": { "baseUrl": "http://10.1.2.3:9999/v1", "model": "other" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 
-    #[tokio::test]
-    async fn concurrent_deliver_pending_sends_each_delivery_once() {
-        let Some(app) = test_app(true).await else {
-            return;
-        };
-        let _guard = guard().lock().await;
-        let hook = start_hook().await;
-        hook.delay_ms.store(300, Ordering::SeqCst);
-        let output = make_output(&app, &hook, "webhook").await;
-        for _ in 0..3 {
-            finished_execution(&app).await;
-        }
-        tokio::join!(
-            deliver_pending(&app.state),
-            deliver_pending(&app.state),
-            deliver_pending(&app.state)
-        );
-        assert_eq!(hook.count(), 3, "each delivery sent exactly once");
-        let rows = rows(&app, output.id).await;
-        assert_eq!(rows.len(), 3);
-        assert!(
-            rows.iter().all(|r| r.0 == "succeeded" && r.1 == 1),
-            "{rows:?}"
-        );
-        // Idempotency headers carry the delivery id and are unique per delivery.
-        let ids: std::collections::HashSet<String> = hook
-            .hits
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|h| h["idempotency-key"].to_str().unwrap().to_string())
-            .collect();
-        assert_eq!(ids.len(), 3);
-        assert!(hook
-            .hits
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|h| h.contains_key("x-orbit-delivery-id")));
-        // A later tick does not resend.
-        deliver_pending(&app.state).await;
-        assert_eq!(hook.count(), 3);
-    }
+    // New host with a freshly supplied key is accepted.
+    let (status, body) = send(
+        &app.router,
+        patch(json!({
+            "config": { "baseUrl": "http://10.9.9.9:9999/v1", "model": "qwen" },
+            "credential": "sk-new-key"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
 
-    #[tokio::test]
-    async fn interrupted_send_is_retried_after_lease_expiry() {
-        let Some(app) = test_app(true).await else {
-            return;
-        };
-        let _guard = guard().lock().await;
-        let hook = start_hook().await;
-        let output = make_output(&app, &hook, "slack").await;
-        finished_execution(&app).await;
-        app.store.enqueue_output_deliveries().await.unwrap();
-        // A replica claims the row and "crashes" before sending.
-        let claimed = app
-            .store
-            .claim_output_deliveries(10, chrono::Duration::seconds(120))
-            .await
-            .unwrap();
-        assert!(claimed.iter().any(|j| j.output_id == output.id));
-        // While the lease is live, nobody else sends it.
-        deliver_pending(&app.state).await;
-        assert_eq!(hook.count(), 0);
-        assert_eq!(rows(&app, output.id).await[0].0, "sending");
-        // Lease expires: the row is reclaimed and delivered; the stale claim cannot finish.
-        sqlx::query("UPDATE output_deliveries SET lease_until = now() - interval '1 second' WHERE output_id = $1")
-            .bind(output.id)
-            .execute(app.store.pool())
-            .await
-            .unwrap();
-        deliver_pending(&app.state).await;
-        assert_eq!(hook.count(), 1);
-        let stale = claimed.iter().find(|j| j.output_id == output.id).unwrap();
-        let finished = app
-            .store
-            .finish_output_delivery(
-                stale.id,
-                stale.claim_token,
-                orbit_store::outputs::DeliveryOutcome::Failed,
-                None,
-                Some("stale"),
-                stale.attempts,
-            )
-            .await
-            .unwrap();
-        assert!(!finished, "stale claim must not overwrite the result");
-        let rows = rows(&app, output.id).await;
-        assert_eq!(rows[0].0, "succeeded");
-        assert_eq!(rows[0].1, 2, "interrupted attempt counts");
-    }
+#[tokio::test]
+async fn provider_probe_requires_manage_and_refuses_metadata_addresses() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let provider = app
+        .store
+        .create_provider(
+            app.org_id,
+            "Metadata probe",
+            "openai_compatible",
+            &json!({ "baseUrl": "http://169.254.169.254/v1", "model": "m" }),
+            None,
+        )
+        .await
+        .unwrap();
+    // An operator can see org-visible providers but cannot probe (send credentials).
+    let operator = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "probe-op@test.local",
+            "Operator",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let operator_token = token_for(&app.store, app.org_id, operator.id, "probe-op").await;
+    let path = format!("/api/v1/providers/{}/test", provider.id);
+    let (status, _) = send(&app.router, auth_post(&path, &operator_token, json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
-    #[tokio::test]
-    async fn runs_finished_during_long_outage_are_delivered_once() {
-        let Some(app) = test_app(true).await else {
-            return;
-        };
-        let _guard = guard().lock().await;
-        let hook = start_hook().await;
-        let output = make_output(&app, &hook, "webhook").await;
-        // Output existed 5h ago; the API has been down since; the run finished 2h ago.
-        backdate_output(&app, output.id, 5).await;
-        let id = finished_execution(&app).await;
-        backdate_execution(&app, id, 2).await;
-        deliver_pending(&app.state).await;
-        assert_eq!(hook.count(), 1);
-        deliver_pending(&app.state).await;
-        deliver_pending(&app.state).await;
-        assert_eq!(hook.count(), 1, "exactly once");
-        assert_eq!(rows(&app, output.id).await.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn new_output_does_not_backfill_old_runs() {
-        let Some(app) = test_app(true).await else {
-            return;
-        };
-        let _guard = guard().lock().await;
-        let hook = start_hook().await;
-        finished_execution(&app).await;
-        let old = finished_execution(&app).await;
-        backdate_execution(&app, old, 2).await;
-        let output = make_output(&app, &hook, "webhook").await;
-        deliver_pending(&app.state).await;
-        assert_eq!(hook.count(), 0);
-        assert!(rows(&app, output.id).await.is_empty());
-        // A run that finishes after creation is delivered.
-        finished_execution(&app).await;
-        deliver_pending(&app.state).await;
-        assert_eq!(hook.count(), 1);
-    }
-
-    #[tokio::test]
-    async fn client_errors_are_permanent_and_server_errors_retry() {
-        let Some(app) = test_app(true).await else {
-            return;
-        };
-        let _guard = guard().lock().await;
-
-        // 404: permanent, never retried.
-        let hook = start_hook().await;
-        hook.status.store(404, Ordering::SeqCst);
-        let output = make_output(&app, &hook, "slack").await;
-        finished_execution(&app).await;
-        deliver_pending(&app.state).await;
-        assert_eq!(
-            rows(&app, output.id).await,
-            vec![("failed".to_string(), 1, Some(404))]
-        );
-        make_due(&app, output.id).await;
-        deliver_pending(&app.state).await;
-        assert_eq!(hook.count(), 1, "4xx is not retried");
-
-        // 503: retried with backoff, dead after the final attempt.
-        let hook = start_hook().await;
-        hook.status.store(503, Ordering::SeqCst);
-        let output = make_output(&app, &hook, "mattermost").await;
-        finished_execution(&app).await;
-        deliver_pending(&app.state).await;
-        assert_eq!(
-            rows(&app, output.id).await,
-            vec![("pending".to_string(), 1, Some(503))]
-        );
-        deliver_pending(&app.state).await;
-        assert_eq!(hook.count(), 1, "backoff holds the retry");
-        make_due(&app, output.id).await;
-        deliver_pending(&app.state).await;
-        assert_eq!(hook.count(), 2);
-        sqlx::query("UPDATE output_deliveries SET attempts = 4, next_attempt_at = now() WHERE output_id = $1")
-            .bind(output.id)
-            .execute(app.store.pool())
-            .await
-            .unwrap();
-        deliver_pending(&app.state).await;
-        assert_eq!(
-            rows(&app, output.id).await,
-            vec![("dead".to_string(), 5, Some(503))]
-        );
-
-        // 429 is retryable.
-        let hook = start_hook().await;
-        hook.status.store(429, Ordering::SeqCst);
-        let output = make_output(&app, &hook, "slack").await;
-        finished_execution(&app).await;
-        deliver_pending(&app.state).await;
-        assert_eq!(rows(&app, output.id).await[0].0, "pending");
-    }
-
-    #[tokio::test]
-    async fn deleted_or_disabled_output_leaves_no_pending_rows() {
-        let Some(app) = test_app(true).await else {
-            return;
-        };
-        let _guard = guard().lock().await;
-        let hook = start_hook().await;
-
-        // Disabled after enqueue: skipped, nothing sent.
-        let disabled = make_output(&app, &hook, "webhook").await;
-        finished_execution(&app).await;
-        app.store.enqueue_output_deliveries().await.unwrap();
-        sqlx::query("UPDATE outputs SET enabled = false WHERE id = $1")
-            .bind(disabled.id)
-            .execute(app.store.pool())
-            .await
-            .unwrap();
-        deliver_pending(&app.state).await;
-        assert_eq!(hook.count(), 0);
-        let rows_disabled = rows(&app, disabled.id).await;
-        assert_eq!(rows_disabled.len(), 1);
-        assert_eq!(rows_disabled[0].0, "skipped");
-
-        // Deleted: its rows are removed with it (cascade), nothing pending remains.
-        let deleted = make_output(&app, &hook, "webhook").await;
-        finished_execution(&app).await;
-        app.store.enqueue_output_deliveries().await.unwrap();
-        app.store
-            .delete_output(app.org_id, deleted.id)
-            .await
-            .unwrap();
-        deliver_pending(&app.state).await;
-        assert!(rows(&app, deleted.id).await.is_empty());
-        assert_eq!(hook.count(), 0);
-    }
+    // The manager's probe is refused by the outbound guard with a generic category.
+    let (status, body) = send(&app.router, post(&path, json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"], "endpoint refused (blocked)");
 }

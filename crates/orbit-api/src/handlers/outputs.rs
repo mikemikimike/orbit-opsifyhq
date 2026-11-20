@@ -342,7 +342,12 @@ pub async fn send(
             })
         }
     };
-    let client = orbit_security::client_with_custom_ca(std::time::Duration::from_secs(15));
+    guard_webhook_url(&url).await.map_err(|error| SendError {
+        status: None,
+        message: error.message,
+        retryable: false,
+    })?;
+    let client = orbit_security::guarded_client(std::time::Duration::from_secs(15));
     let payload = if output.kind == "webhook" {
         serde_json::json!({
             "event": execution.map(|e| format!("execution.{}", e.status)).unwrap_or_else(|| "test".into()),
@@ -544,4 +549,14 @@ fn summary(execution: &ExecutionRecord) -> String {
             .unwrap_or("task"),
         output
     )
+}
+
+/// Refuse webhook targets in loopback, link-local/metadata or other blocked ranges
+/// (see `ORBIT_OUTBOUND_*`). Private ranges are allowed by default.
+async fn guard_webhook_url(url: &str) -> Result<(), ApiError> {
+    orbit_security::check_outbound_url(url, &orbit_security::OutboundPolicy::from_env())
+        .await
+        .map_err(|error| {
+            ApiError::validation(vec![ValidationIssue::new("webhookUrl", error.to_string())])
+        })
 }

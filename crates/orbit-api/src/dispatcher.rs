@@ -302,10 +302,13 @@ impl WorkSourceConnection {
                 .to_string(),
             other => anyhow::bail!("unsupported work source provider '{other}'"),
         };
+        orbit_security::check_outbound_url(&base_url, &orbit_security::OutboundPolicy::from_env())
+            .await
+            .map_err(|error| anyhow::anyhow!("work source baseUrl refused: {error}"))?;
         Ok(Self {
             base_url,
             token,
-            client: orbit_security::client_with_custom_ca(std::time::Duration::from_secs(20)),
+            client: orbit_security::guarded_client(std::time::Duration::from_secs(20)),
         })
     }
 }

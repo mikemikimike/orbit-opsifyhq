@@ -45,6 +45,9 @@ curl -X POST "$API/api/v1/outputs/$OUTPUT_ID/test" \
   -H "Authorization: Bearer $ORBIT_TOKEN"
 ```
 
+Webhook URLs are checked against the outbound network policy (loopback, link-local and
+cloud-metadata targets are refused; see [Providers](providers.md#outbound-network-policy)).
+
 ## Delivery
 
 Delivery is **at-least-once** and driven by a background outbox loop on every API replica.

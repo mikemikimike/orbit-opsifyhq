@@ -110,6 +110,12 @@ spec:
               value: {{ .Values.platform.publicBaseUrl | quote }}
             - name: ORBIT_WORKER_API_URL
               value: "http://{{ include "orbit.apiHost" . }}:{{ .Values.api.port }}"
+            - name: ORBIT_OUTBOUND_ALLOW_PRIVATE
+              value: {{ .Values.outbound.allowPrivate | quote }}
+            {{- with .Values.outbound.allowedHosts }}
+            - name: ORBIT_OUTBOUND_ALLOWED_HOSTS
+              value: {{ . | quote }}
+            {{- end }}
             {{- if .Values.caCertificates.enabled }}
             - name: ORBIT_CA_SECRET_NAME
               value: {{ .Values.caCertificates.secretName | quote }}

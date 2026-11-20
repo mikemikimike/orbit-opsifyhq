@@ -1579,3 +1579,148 @@ async fn concurrent_event_appends_get_dense_unique_seq() {
     let seqs: Vec<i64> = stored.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, (1..=N).collect::<Vec<_>>());
 }
+
+#[tokio::test]
+async fn single_execution_launch_tokens_are_revoked_when_execution_is_terminal() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, version) = store
+        .create_agent(org, Some(user), &definition("Launch Token Agent"))
+        .await
+        .unwrap();
+    let execution = store
+        .create_execution(NewExecution {
+            org_id: org,
+            agent_id: agent.id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: HarnessKind::Mock,
+            trigger_source: TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: serde_json::json!({ "task": "t", "payload": {} }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: Some(user),
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+    let profile = store
+        .create_worker_profile(
+            org,
+            "Launch Token Profile",
+            "mock",
+            "docker",
+            "process",
+            "orbit-worker",
+            "0.1.0",
+            "all",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            false,
+            false,
+            false,
+            false,
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+    let single = orbit_security::issue_worker_token();
+    let single_record = store
+        .create_worker_token(org, None, "single", &single.prefix, &single.hash, &[])
+        .await
+        .unwrap();
+    let persistent = orbit_security::issue_worker_token();
+    let persistent_record = store
+        .create_worker_token(
+            org,
+            None,
+            "persistent",
+            &persistent.prefix,
+            &persistent.hash,
+            &[],
+        )
+        .await
+        .unwrap();
+    let single_launch = store
+        .create_worker_launch(
+            org,
+            profile.id,
+            "single",
+            "docker",
+            "img:1",
+            Some(single_record.id),
+            Some(user),
+        )
+        .await
+        .unwrap();
+    store
+        .create_worker_launch(
+            org,
+            profile.id,
+            "persistent",
+            "docker",
+            "img:1",
+            Some(persistent_record.id),
+            Some(user),
+        )
+        .await
+        .unwrap();
+    store
+        .set_worker_launch_single_execution(single_launch.id, execution.id)
+        .await
+        .unwrap();
+
+    // Execution still queued: nothing is revoked.
+    assert!(store
+        .revoke_finished_single_execution_tokens()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .find_worker_token_by_hash(&single.hash)
+        .await
+        .unwrap()
+        .is_some());
+
+    store
+        .finish_execution(
+            execution.id,
+            ExecutionStatus::Succeeded,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let revoked = store
+        .revoke_finished_single_execution_tokens()
+        .await
+        .unwrap();
+    assert!(revoked.contains(&single_record.id));
+    assert!(!revoked.contains(&persistent_record.id));
+    assert!(store
+        .find_worker_token_by_hash(&single.hash)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .find_worker_token_by_hash(&persistent.hash)
+        .await
+        .unwrap()
+        .is_some());
+}
