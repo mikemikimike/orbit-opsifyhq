@@ -22,7 +22,7 @@
 
 use uuid::Uuid;
 
-use orbit_domain::{AgentSpec, HarnessKind, ModelManagement, ValidationIssue};
+use orbit_domain::{AgentSpec, HarnessKind, ValidationIssue};
 use orbit_store::Agent;
 
 use crate::access::AccessScope;
@@ -80,19 +80,33 @@ pub async fn require_spec_references_use(
             .await?;
         }
     }
-    if spec.model.management == ModelManagement::Platform {
-        if let Some(name) = &spec.model.provider {
-            if let Some(provider) = state.store.get_provider_by_name(org_id, name).await? {
-                access
-                    .require_use(
-                        "provider",
-                        provider.owner_user_id,
-                        provider.owner_team_id,
-                        &provider.visibility,
-                    )
-                    .map_err(|error| with_field(error, "spec.model.provider"))?;
-            }
-        }
+    // Both management modes: a harness-managed model that names a provider still gets
+    // that provider's credential injected by the worker context (issue #193).
+    if let Some(name) = &spec.model.provider {
+        require_provider_use(state, org_id, access, name, "spec.model.provider").await?;
+    }
+    Ok(())
+}
+
+/// Require use rights on a provider named in a model binding. Names that match no
+/// provider row are harness-local (nothing platform-owned to protect) and pass; the
+/// platform-managed path rejects unknown names separately.
+pub async fn require_provider_use(
+    state: &AppState,
+    org_id: Uuid,
+    access: &AccessScope,
+    name: &str,
+    path: &str,
+) -> Result<(), ApiError> {
+    if let Some(provider) = state.store.get_provider_by_name(org_id, name).await? {
+        access
+            .require_use(
+                "provider",
+                provider.owner_user_id,
+                provider.owner_team_id,
+                &provider.visibility,
+            )
+            .map_err(|error| with_field(error, path))?;
     }
     Ok(())
 }
