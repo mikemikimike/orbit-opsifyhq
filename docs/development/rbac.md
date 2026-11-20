@@ -42,6 +42,26 @@ At authentication time ORBIT resolves the stored role name:
 Custom roles currently apply to organization-level actions only. Roles are visible through
 `GET /api/v1/me` via the effective `permissions` list.
 
+## Resource access checks on top of roles
+
+Roles gate organization-level actions; resource access (`AccessScope`, ADR 0011) gates the
+individual agent, connection, provider or team. Running something needs **use** (team
+`lead`/`member`, the owner, or admin), not just **view**. Notably:
+
+- Every execution path (execute, rerun, runtime, scheduled triggers, team runs and queue
+  starts) runs the shared preflight in `crates/orbit-api/src/preflight.rs`: agent use,
+  use of every referenced connection and platform provider, harness availability and the
+  hourly quota. Scheduler and runtime ticks re-check this for the stored owner at run time.
+- Agent create/update/import require use of every connection and provider the spec binds.
+- Cancelling an execution and creating a team run require use.
+- Tool policies for an agent require manage on that agent; org-wide policies require
+  `settings:write`.
+- `GET /api/v1/export/{resource}/{id}` requires the read permission of the resource kind
+  (`providers:read`, `connections:read`, `harnesses:read` for worker profiles and teams,
+  `settings:read` for tool policies, `agents:read` otherwise) plus visibility.
+
+See [the access matrix](../security/idor-matrix.md).
+
 ## Not implemented yet (issue #15)
 
 - Resource-level permissions (per agent/connection/team)

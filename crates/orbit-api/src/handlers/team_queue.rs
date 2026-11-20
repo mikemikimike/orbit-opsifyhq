@@ -160,6 +160,18 @@ pub(crate) async fn start_queue_item(
         "queueItemId": item.id,
         "externalKey": item.external_key,
     });
+    // Shared execution preflight (#140) before any run row is created.
+    let access = crate::access::AccessScope::load(state, auth).await?;
+    let step_agent_ids: Vec<Uuid> = definition.steps.iter().map(|step| step.agent_id).collect();
+    crate::preflight::authorize_team_run(
+        state,
+        auth.org_id,
+        &access,
+        team,
+        &step_agent_ids,
+        &crate::handlers::teams::team_connection_ids(&definition),
+    )
+    .await?;
     let run = state
         .store
         .create_team_run(auth.org_id, team.id, &input, Some(auth.user_id))
