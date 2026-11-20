@@ -39,7 +39,7 @@ pub async fn enqueue(
     crate::extract::ApiJson(body): crate::extract::ApiJson<EnqueueRequest>,
 ) -> Result<(StatusCode, Json<Vec<TeamQueueItem>>), ApiError> {
     auth.require(Permission::ExecutionsCreate)?;
-    let _team = state.store.get_agent_team(auth.org_id, team_id).await?;
+    crate::handlers::teams::require_team_use(&state, &auth, team_id).await?;
     if body.items.is_empty() {
         return Err(ApiError::validation(vec![ValidationIssue::new(
             "items",
@@ -81,7 +81,7 @@ pub async fn list(
     Path(team_id): Path<Uuid>,
 ) -> Result<Json<Vec<TeamQueueItem>>, ApiError> {
     auth.require(Permission::HarnessesRead)?;
-    let _team = state.store.get_agent_team(auth.org_id, team_id).await?;
+    crate::handlers::teams::require_team_view(&state, &auth, team_id).await?;
     Ok(Json(
         state
             .store
@@ -105,7 +105,7 @@ pub async fn run_item(
             .count_all_executions_since(auth.org_id, since)
             .await?,
     )?;
-    let team = state.store.get_agent_team(auth.org_id, team_id).await?;
+    let team = crate::handlers::teams::require_team_use(&state, &auth, team_id).await?;
     let item = state
         .store
         .get_team_queue_item(auth.org_id, item_id)
@@ -293,7 +293,7 @@ async fn fetch_item(
     team_id: Uuid,
     item_id: Uuid,
 ) -> Result<TeamQueueItem, ApiError> {
-    let _team = state.store.get_agent_team(auth.org_id, team_id).await?;
+    crate::handlers::teams::require_team_use(state, auth, team_id).await?;
     let item = state
         .store
         .get_team_queue_item(auth.org_id, item_id)
