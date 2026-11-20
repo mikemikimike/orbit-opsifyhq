@@ -30,19 +30,19 @@ The default values assume a private registry and an nginx ingress:
 
 ```bash
 # 1. Build (linux/amd64) and push images to your registry
-TAG=0.7.0 ./scripts/build-images.sh
-PUSH_REGISTRY=registry.example.com:5000 TAG=0.7.0 ./scripts/push-images.sh
+TAG=<version> ./scripts/build-images.sh
+PUSH_REGISTRY=registry.example.com:5000 TAG=<version> ./scripts/push-images.sh
 
 # 2. Deploy. The launcher is enabled by default and the API mints worker tokens per
 #    launch, so no worker token is needed.
-KUBE_CONTEXT=your-cluster NAMESPACE=orbit TAG=0.7.0 ./scripts/deploy.sh
+KUBE_CONTEXT=your-cluster NAMESPACE=orbit TAG=<version> ./scripts/deploy.sh
 
 # Equivalent explicit Helm command
 helm --kube-context your-cluster upgrade --install orbit deploy/helm/orbit \
   --namespace orbit --create-namespace \
   -f deploy/helm/orbit/values.yaml \
   --set imageRegistry=registry.example.com:5000 \
-  --set api.tag=0.7.0 --set worker.tag=0.7.0 --set web.tag=0.7.0
+  --set api.tag=<version> --set worker.tag=<version> --set web.tag=<version>
 ```
 
 After the API is up it seeds one launchable mock worker profile and the launcher starts
@@ -154,7 +154,7 @@ default list simply hides archived runs, and the UI can switch to Active/Archive
 audit logs forever) deletes audit log entries older than that window once a day. Unlike
 archiving, this permanently removes rows; set `0` if compliance requires indefinite retention.
 
-Image tags default to the chart `appVersion`, so `--version 0.7.0` pulls `orbit-*:0.7.0`
+Image tags default to the chart `appVersion`, so `--version <version>` pulls `orbit-*:<version>`
 — the same tags CI publishes for that release. Override per component with
 `--set api.tag=…`, `worker.tag`, `web.tag`, `launcher.tag`, `opencodeWorker.tag` or
 `piWorker.tag`.
