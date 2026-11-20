@@ -9,7 +9,7 @@ fullnameOverride: ""
 
 # Registry prefix for the ORBIT images. The value must include the repository
 # segment: the published images are ghcr.io/<owner>/<repo>/orbit-<component>, so with
-# `ghcr.io/opsifyhq/orbit` the chart renders `ghcr.io/opsifyhq/orbit/orbit-api:0.7.0`.
+# `ghcr.io/opsifyhq/orbit` the chart renders `ghcr.io/opsifyhq/orbit/orbit-api:<appVersion>`.
 # Set this to your own mirror (e.g. `registry.example.com:5000`) when not using GHCR.
 imageRegistry: ghcr.io/opsifyhq/orbit
 imagePullPolicy: IfNotPresent
@@ -218,6 +218,10 @@ auth:
     # Re-evaluate the stored role on every login when the claim maps to a role.
     # A token without the claim never downgrades an existing user.
     syncRoles: false
+    # Link a first login to an existing (invited) user by email only when the token has
+    # email_verified=true; a missing claim then also blocks linking. email_verified=false
+    # always blocks linking.
+    requireVerifiedEmail: false
 
 # ─── Secrets ─────────────────────────────────────────────────
 # For production set secrets.create=false and secrets.existingSecret to a Secret you
@@ -350,6 +354,12 @@ serviceAccount:
   name: ""
 
 podAnnotations: {}
+
+# Most time (seconds), in total, a run may spend paused waiting for human approvals.
+# Job activeDeadlineSeconds and the Docker dispatch backstop are timeout + this budget +
+# grace; once it is used up, further approvals are denied and the run ends as timed_out.
+# Sets ORBIT_MAX_APPROVAL_WAIT_SECONDS on the launcher and workers.
+maxApprovalWaitSeconds: 3600
 
 # Extra environment variables for all backend workloads (list of env objects).
 extraEnv: []

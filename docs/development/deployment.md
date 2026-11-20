@@ -30,19 +30,19 @@ The default values assume a private registry and an nginx ingress:
 
 ```bash
 # 1. Build (linux/amd64) and push images to your registry
-TAG=0.7.0 ./scripts/build-images.sh
-PUSH_REGISTRY=registry.example.com:5000 TAG=0.7.0 ./scripts/push-images.sh
+TAG=<version> ./scripts/build-images.sh
+PUSH_REGISTRY=registry.example.com:5000 TAG=<version> ./scripts/push-images.sh
 
 # 2. Deploy. The launcher is enabled by default and the API mints worker tokens per
 #    launch, so no worker token is needed.
-KUBE_CONTEXT=your-cluster NAMESPACE=orbit TAG=0.7.0 ./scripts/deploy.sh
+KUBE_CONTEXT=your-cluster NAMESPACE=orbit TAG=<version> ./scripts/deploy.sh
 
 # Equivalent explicit Helm command
 helm --kube-context your-cluster upgrade --install orbit deploy/helm/orbit \
   --namespace orbit --create-namespace \
   -f deploy/helm/orbit/values.yaml \
   --set imageRegistry=registry.example.com:5000 \
-  --set api.tag=0.7.0 --set worker.tag=0.7.0 --set web.tag=0.7.0
+  --set api.tag=<version> --set worker.tag=<version> --set web.tag=<version>
 ```
 
 After the API is up it seeds one launchable mock worker profile and the launcher starts
@@ -154,7 +154,7 @@ default list simply hides archived runs, and the UI can switch to Active/Archive
 audit logs forever) deletes audit log entries older than that window once a day. Unlike
 archiving, this permanently removes rows; set `0` if compliance requires indefinite retention.
 
-Image tags default to the chart `appVersion`, so `--version 0.7.0` pulls `orbit-*:0.7.0`
+Image tags default to the chart `appVersion`, so `--version <version>` pulls `orbit-*:<version>`
 — the same tags CI publishes for that release. Override per component with
 `--set api.tag=…`, `worker.tag`, `web.tag`, `launcher.tag`, `opencodeWorker.tag` or
 `piWorker.tag`.
@@ -221,6 +221,7 @@ ENTRYPOINT ["/usr/local/bin/orbit-worker"]
 | `ORBIT_WORKSPACE_ROOT` | no | Writable scratch dir (default `/tmp/orbit-workspaces`) |
 | `ORBIT_WORKER_POLL_MS` | no | Poll interval in ms (default `1000`) |
 | `ORBIT_WORKER_CONCURRENCY` | no | Max concurrent executions (default `4`) |
+| `ORBIT_MAX_APPROVAL_WAIT_SECONDS` | no | Most time (seconds), in total, a run may spend paused waiting for approvals (default `3600`). Past it, further approvals are denied and the run ends as `timed_out`. Set the same value on the launcher: Job `activeDeadlineSeconds` and the Docker dispatch backstop are `timeout + this budget + grace`. |
 | `ORBIT_WORKER_PROFILE_ID` | no | Load a worker profile (agents, skills, auth) |
 
 ### Obtaining the binary

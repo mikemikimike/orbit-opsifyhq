@@ -183,7 +183,7 @@ export default function WorkPage() {
         const { startTeamRun } = await import("@/lib/teams");
         const result = await startTeamRun(who, task.trim(), repository.trim() || undefined, false, harness || undefined);
         toast.success("Team run started");
-        router.push(`/agent-teams?run=${result.run.id}`);
+        router.push(`/agent-teams/runs/${result.run.id}`);
       }
     } catch (error) {
       toast.error(errorMessage(error));

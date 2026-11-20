@@ -2,13 +2,20 @@
 #
 # - External PostgreSQL and NATS (no bundled stateful services)
 # - OIDC authentication with externally managed secrets
-# - Private registry, pinned image tags, multiple replicas
+# - Private registry, multiple replicas
 # - TLS ingress at orbit.example.com
 #
 # Usage:
 #   helm upgrade --install orbit ./deploy/helm/orbit \
 #     --namespace orbit --create-namespace \
 #     -f deploy/helm/orbit/values-prod.example.yaml
+#
+# Image tags: this file sets no `tag:` for any component. An empty tag follows
+# `Chart.appVersion`, so the images always match the chart you install.
+# To pin explicitly, pass `--set api.tag=<version>` (likewise `worker.tag`, `web.tag`,
+# `launcher.tag`, `opencodeWorker.tag`, `piWorker.tag`) or add `tag: "<version>"` under
+# the component. scripts/check-versions.sh fails CI if a shipped values file pins a tag
+# that differs from `appVersion`.
 
 nameOverride: ""
 fullnameOverride: ""
@@ -19,7 +26,6 @@ imagePullSecrets: []
 
 api:
   image: orbit-api
-  tag: "0.7.0"
   replicas: 2
   port: 8080
   resources:
@@ -35,7 +41,6 @@ worker:
   # Enable this only for a fixed worker, and add `worker-token` to the external Secret.
   enabled: false
   image: orbit-worker
-  tag: "0.7.0"
   replicas: 2
   concurrency: 8
   pollIntervalMs: 500
@@ -47,7 +52,6 @@ opencodeWorker:
   # with authSecretName=orbit-opencode-auth; the launcher mints the token per launch.
   enabled: false
   image: orbit-worker-opencode
-  tag: "0.7.0"
   replicas: 1
   concurrency: 2
   harnesses: opencode
@@ -74,7 +78,6 @@ opencodeWorker:
 piWorker:
   enabled: false
   image: orbit-worker-pi
-  tag: "0.7.0"
   replicas: 1
   concurrency: 2
   harnesses: pi
@@ -93,7 +96,6 @@ piWorker:
 
 web:
   image: orbit-web
-  tag: "0.7.0"
   replicas: 2
   port: 3000
   resources:
@@ -130,6 +132,7 @@ auth:
     autoCreateTeams: false
     requireMappedGroup: false
     syncRoles: false
+    requireVerifiedEmail: false
 
 # Manage secrets externally (Vault, External Secrets, sealed-secrets, …).
 # Required keys: database-url, master-key, launcher-token when the launcher is enabled,
@@ -164,7 +167,6 @@ launcher:
   # should be generated with: openssl rand -base64 36
   enabled: true
   image: orbit-launcher
-  tag: "0.7.0"
 
 platform:
   environment: production

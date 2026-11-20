@@ -5,20 +5,17 @@ Enforced by `crates/orbit-api/src/access.rs` (`AccessScope`). Invisible resource
 
 | Resource | List filter | Get | Write | Execution/approval |
 |---|---|---|---|---|
-
 | Agents | yes | yes | yes | parent visibility |
 | Agent versions (`/agents/{id}/versions`) | — | parent visibility (404) | — | — |
 | Agent export / agent executions list | — | parent visibility (404) | — | — |
 | Agent runtime / activate / pause | — | manage (404 if invisible) | manage | — |
 | Skills | yes | yes | yes | — |
 | Connections | yes | yes | yes | **use** required on every run path (see preflight) |
-| Providers | yes | yes | yes | **use** required when an agent binds it (platform-managed models) |
+| Providers | yes | yes | yes | **use** required when an agent binds it, in both platform- and harness-managed models (incl. team subagents); the worker context re-checks the run principal before returning the credential |
 | Worker profiles | yes | yes | yes | claims scoped by owning team |
-
 | Triggers | yes | yes | yes | create needs **use** on the target agent and its spec references; fire re-checks the owner |
 | Tool policies | yes | yes | yes | — |
 | Executions | via agent | via agent | cancel via agent | events/SSE via agent |
-
 | Approvals | via execution → agent | — | decision inherits execution | — |
 | Dashboard summary | agent/execution/approval/connection/trigger counts, recent executions and usage filtered in SQL (`ResourceAccess`, joined via agent) | — | — | pending approvals via execution → agent |
 | Access teams | member list | member | lead/owner/admin | — |

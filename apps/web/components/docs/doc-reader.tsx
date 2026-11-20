@@ -111,6 +111,25 @@ export function DocReader({ markdown, slug }: { markdown: string; slug: string }
       h4: heading("h4", "mb-1 mt-4 text-sm font-semibold first:mt-0", ids),
       a: DocLink,
       img: ({ src, alt }) => <DocImage src={typeof src === "string" ? src : undefined} alt={alt} />,
+      // Reference tables (permissions, access matrix, settings) are dense: give them room
+      // and headers that do not wrap; anything still too wide scrolls inside its frame.
+      table: ({ node: _node, ...props }) => (
+        <div className="my-5 overflow-x-auto rounded-lg border">
+          <table className="w-full border-collapse text-[13px] leading-6 [&_tbody_tr:last-child>td]:border-b-0" {...props} />
+        </div>
+      ),
+      th: ({ node: _node, ...props }) => (
+        <th
+          className="whitespace-nowrap border-b bg-subtle px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground"
+          {...props}
+        />
+      ),
+      // `overflow-wrap: anywhere` lets long tokens (paths like `a/b/c/d`) wrap, so one cell
+      // cannot force the whole table wider than the page; the minimum width keeps words
+      // whole on phones, where the table scrolls sideways inside its frame instead.
+      td: ({ node: _node, ...props }) => (
+        <td className="min-w-28 border-b px-3 py-2 align-top [overflow-wrap:anywhere]" {...props} />
+      ),
     };
   }, [markdown]);
 

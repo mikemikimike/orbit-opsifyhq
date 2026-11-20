@@ -1721,6 +1721,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "orbit-contracts",
  "orbit-domain",
  "serde",
  "serde_json",

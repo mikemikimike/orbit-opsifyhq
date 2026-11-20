@@ -574,6 +574,12 @@ pub async fn rerun_execution(
             .await?,
     )?;
     let mut input = original.input.clone();
+    // #194: an approval override only survives a rerun by someone who may decide approvals.
+    if !auth.can(Permission::ApprovalsDecide) {
+        orbit_domain::strip_approval_overrides(&mut input);
+    } else if let Some(object) = input.as_object_mut() {
+        object.remove(orbit_domain::LEGACY_AUTONOMY_OVERRIDE_KEY);
+    }
     if let Some(object) = input.as_object_mut() {
         object.insert("rerunOf".into(), serde_json::json!(original.id));
     }

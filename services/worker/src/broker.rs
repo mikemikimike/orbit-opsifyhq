@@ -1172,7 +1172,26 @@ async fn request_approval_action(
         );
     }
 
-    let wait_seconds = APPROVAL_WAIT_SECONDS;
+    // Cumulative approval time is capped: once the budget is used up no further pause is
+    // granted and the call is denied; further waiting then counts toward the run timeout.
+    let Some(wait_seconds) = approval_wait_seconds(state.pause.remaining_budget()) else {
+        record_event(
+            state,
+            "tool_call",
+            LogLevel::Warn,
+            &format!("denied tool call {capability}: approval wait budget exhausted"),
+            json!({
+                "capability": capability,
+                "reason": "the run used up its approval wait budget",
+                "decision": "deny",
+                "arguments": truncate_json(arguments, 4000),
+            }),
+        )
+        .await;
+        anyhow::bail!(
+            "capability '{capability}' requires approval; denied because this run has used up its approval wait budget and will time out"
+        );
+    };
     let approval = state
         .client
         .create_approval(state.execution.id, action, wait_seconds)
@@ -1209,7 +1228,7 @@ async fn request_approval_action(
             .await_approval(state.execution.id, approval.id, wait_seconds)
             .await?
     };
-    if decided.status == "rejected" {
+    if is_remembered_denial(&decided.status) {
         state
             .rejected
             .lock()
@@ -1246,6 +1265,25 @@ async fn request_approval_action(
 /// How long an approval request stays open. It no longer has to fit inside the
 /// execution timeout, because the run's clock is paused while it waits.
 const APPROVAL_WAIT_SECONDS: u64 = 900;
+
+/// Seconds to wait for one approval: the per-request window, capped by the remaining
+/// approval budget. `None` when the budget is used up (a budgetless clock never is).
+fn approval_wait_seconds(remaining_budget: Option<Duration>) -> Option<u64> {
+    match remaining_budget {
+        None => Some(APPROVAL_WAIT_SECONDS),
+        Some(remaining) => match remaining.as_secs() {
+            0 => None,
+            seconds => Some(seconds.min(APPROVAL_WAIT_SECONDS)),
+        },
+    }
+}
+
+/// Decisions after which the same action must not be asked again in this run: an
+/// unanswered (expired) request counts like a rejection, so the model cannot re-request
+/// it endlessly and hold the run open.
+fn is_remembered_denial(status: &str) -> bool {
+    matches!(status, "rejected" | "expired")
+}
 
 /// Identity of an action for "already rejected" checks: the capability plus its
 /// arguments, with object keys in a stable order.
@@ -1384,6 +1422,45 @@ fn truncate_json(value: &Value, limit: usize) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_wait_is_capped_by_the_remaining_budget() {
+        // No budget: the per-request window applies.
+        assert_eq!(approval_wait_seconds(None), Some(APPROVAL_WAIT_SECONDS));
+        // Plenty left: still the per-request window.
+        assert_eq!(
+            approval_wait_seconds(Some(Duration::from_secs(3600))),
+            Some(APPROVAL_WAIT_SECONDS)
+        );
+        // Less than a window left: capped.
+        assert_eq!(
+            approval_wait_seconds(Some(Duration::from_secs(120))),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn exhausted_budget_denies_further_pauses() {
+        assert_eq!(approval_wait_seconds(Some(Duration::ZERO)), None);
+        assert_eq!(
+            approval_wait_seconds(Some(Duration::from_millis(900))),
+            None
+        );
+        let clock = orbit_contracts::PauseClock::with_budget(Duration::from_millis(50));
+        {
+            let _paused = clock.pause();
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        assert_eq!(approval_wait_seconds(clock.remaining_budget()), None);
+    }
+
+    #[test]
+    fn expired_approvals_are_remembered_like_rejected_ones() {
+        assert!(is_remembered_denial("rejected"));
+        assert!(is_remembered_denial("expired"));
+        assert!(!is_remembered_denial("approved"));
+        assert!(!is_remembered_denial("pending"));
+    }
 
     #[test]
     fn tool_names_are_stable_and_mcp_friendly() {

@@ -47,13 +47,14 @@ export function Markdown({
           ),
           table: (props) => (
             <div className="my-2.5 overflow-x-auto rounded-md border">
-              <table className="w-full border-collapse text-[13px]" {...props} />
+              {/* The last row drops its bottom border (the wrapper already draws one). */}
+              <table className="w-full border-collapse text-[13px] [&_tbody_tr:last-child>td]:border-b-0" {...props} />
             </div>
           ),
           th: (props) => (
             <th className="border-b bg-subtle px-3 py-1.5 text-left font-medium text-muted-foreground" {...props} />
           ),
-          td: (props) => <td className="border-b px-3 py-1.5 align-top last:border-b-0" {...props} />,
+          td: (props) => <td className="border-b px-3 py-1.5 align-top" {...props} />,
           ...components,
         }}
       >

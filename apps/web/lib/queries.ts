@@ -29,8 +29,9 @@ import type {
   WorkerLaunch,
   AgentTeam,
   TeamRun,
+  TeamRunDetail,
 } from "./types";
-import { listAgentTeams, listTeamRuns } from "./teams";
+import { getAgentTeam, getTeamRun, listAgentTeams, listTeamQueue, listTeamRuns, type TeamQueueItem } from "./teams";
 import { workerLaunches } from "./launcher";
 
 export function unwrap<T>(result: {
@@ -75,7 +76,10 @@ export const queryKeys = {
   workerProfiles: ["worker-profiles"] as const,
   workerLaunches: ["worker-launches"] as const,
   agentTeams: ["agent-teams"] as const,
+  agentTeam: (id: string) => ["agent-teams", id] as const,
+  teamQueue: (id: string) => ["agent-teams", id, "queue"] as const,
   teamRuns: ["team-runs"] as const,
+  teamRun: (id: string) => ["team-runs", "detail", id] as const,
 };
 
 export function useMeta() {
@@ -385,6 +389,37 @@ export function useAgentTeams() {
   return useQuery<AgentTeam[]>({
     queryKey: queryKeys.agentTeams,
     queryFn: listAgentTeams,
+  });
+}
+
+export function useAgentTeam(teamId: string) {
+  return useQuery<AgentTeam>({
+    queryKey: queryKeys.agentTeam(teamId),
+    queryFn: () => getAgentTeam(teamId),
+    enabled: Boolean(teamId),
+  });
+}
+
+/** The team's work queue; polls while anything is pending or running. */
+export function useTeamQueue(teamId: string) {
+  return useQuery<TeamQueueItem[]>({
+    queryKey: queryKeys.teamQueue(teamId),
+    queryFn: () => listTeamQueue(teamId),
+    enabled: Boolean(teamId),
+    refetchInterval: (query) =>
+      query.state.data?.some((item) => item.status === "pending" || item.status === "running") ? 4_000 : false,
+  });
+}
+
+const TERMINAL_RUN = new Set(["succeeded", "completed", "failed", "cancelled", "timed_out", "rejected"]);
+
+/** One run and its steps; polls until the run is finished. */
+export function useTeamRun(runId: string) {
+  return useQuery<TeamRunDetail>({
+    queryKey: queryKeys.teamRun(runId),
+    queryFn: () => getTeamRun(runId),
+    enabled: Boolean(runId),
+    refetchInterval: (query) => (query.state.data && TERMINAL_RUN.has(query.state.data.run.status) ? false : 3_000),
   });
 }
 

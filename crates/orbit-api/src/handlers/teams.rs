@@ -920,7 +920,7 @@ pub(crate) async fn start_step(
         team_payload["subagents"] =
             serde_json::Value::Array(native_subagents(state, run.org_id, definition).await?);
     }
-    let input = serde_json::json!({
+    let mut input = serde_json::json!({
         "task": task_text,
         "payload": {
             "teamRunId": run.id,
@@ -939,8 +939,18 @@ pub(crate) async fn start_step(
             "receivedAt": chrono::Utc::now(),
         },
         "team": team_payload,
-        "autonomyOverride": if run.input.get("autoApprove").and_then(|value| value.as_bool()) == Some(true) { 4 } else { 0 }
     });
+    // #194: set only here, server-side, after the run was authorised with approvals:decide.
+    // The worker caps it at the step agent's own level (never raises it).
+    if run
+        .input
+        .get("autoApprove")
+        .and_then(|value| value.as_bool())
+        == Some(true)
+    {
+        input[orbit_domain::APPROVAL_OVERRIDE_KEY] =
+            serde_json::json!(orbit_domain::APPROVAL_OVERRIDE_AUTO);
+    }
     let execution = state
         .store
         .create_execution(orbit_store::executions::NewExecution {
@@ -993,6 +1003,12 @@ pub async fn create_run(
     crate::extract::ApiJson(body): crate::extract::ApiJson<CreateTeamRunRequest>,
 ) -> Result<(StatusCode, Json<TeamRunDetail>), ApiError> {
     auth.require(Permission::ExecutionsCreate)?;
+    // #194: auto-approve skips human review, so it needs the right to decide approvals.
+    if body.auto_approve && !auth.can(Permission::ApprovalsDecide) {
+        return Err(ApiError::forbidden(
+            "autoApprove requires the approvals:decide permission",
+        ));
+    }
     let since = chrono::Utc::now() - chrono::Duration::hours(24);
     state.enforce_limit(
         "executions_per_day",

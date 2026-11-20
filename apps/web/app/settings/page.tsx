@@ -44,7 +44,7 @@ import {
   useMeta,
   useHarnesses,
 } from "@/lib/queries";
-import { errorMessage } from "@orbit/api-client";
+import { errorMessage, type components } from "@orbit/api-client";
 import { formatDate, formatDateTime, relativeTime, titleCase } from "@/lib/utils";
 import { humanizeIdentifier } from "@/lib/presentation";
 
@@ -469,44 +469,37 @@ function SsoTab() {
   );
 }
 
+type OidcSettings = components["schemas"]["OidcSettings"];
+
+const oidcQueryKey = ["settings", "oidc"] as const;
+
 function OidcSettingsForm() {
-  const [issuer, setIssuer] = useState("");
-  const [clientId, setClientId] = useState("");
-  const [redirectUri, setRedirectUri] = useState("");
-  const [scopes, setScopes] = useState("openid profile email");
-  const [audience, setAudience] = useState("");
-  const [jwksUrl, setJwksUrl] = useState("");
-  const [autoProvision, setAutoProvision] = useState(true);
-  const [defaultRole, setDefaultRole] = useState("viewer");
-  const [emailClaim, setEmailClaim] = useState("email");
-  const [requireMappedGroup, setRequireMappedGroup] = useState(false);
-  const [loaded, setLoaded] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const settings = useQuery({
+    queryKey: oidcQueryKey,
+    queryFn: async () => unwrap(await api.GET("/api/v1/settings/oidc")),
+  });
 
-  const load = async () => {
-    try {
-      const { data } = await api.GET("/api/v1/settings/oidc");
-      if (data) {
-        setIssuer(data.issuer ?? "");
-        setClientId(data.clientId ?? "");
-        setRedirectUri(data.redirectUri ?? "");
-        setScopes(data.scopes || "openid profile email");
-        setAudience(data.audience ?? "");
-        setJwksUrl(data.jwksUrl ?? "");
-        setAutoProvision(data.autoProvision ?? true);
-        setDefaultRole(data.defaultRole || "viewer");
-        setEmailClaim(data.emailClaim || "email");
-        setRequireMappedGroup((data as { requireMappedGroup?: boolean }).requireMappedGroup ?? false);
-      }
-    } catch (error) {
-      toast.error(errorMessage(error));
-    } finally {
-      setLoaded(true);
-    }
-  };
-
-  if (!loaded) {
-    void load();
+  if (settings.isError) {
+    return (
+      <Callout
+        tone="danger"
+        title="Could not load the sign-in settings"
+      >
+        <p>{errorMessage(settings.error)}</p>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="mt-3"
+          loading={settings.isFetching}
+          onClick={() => void settings.refetch()}
+        >
+          Try again
+        </Button>
+      </Callout>
+    );
+  }
+  if (!settings.data) {
     return (
       <div className="space-y-4" aria-busy="true">
         <Skeleton className="h-9" />
@@ -515,38 +508,54 @@ function OidcSettingsForm() {
       </div>
     );
   }
+  return <OidcSettingsEditor loaded={settings.data} />;
+}
 
-  async function save() {
+function OidcSettingsEditor({ loaded }: { loaded: OidcSettings }) {
+  const queryClient = useQueryClient();
+  const [issuer, setIssuer] = useState(loaded.issuer ?? "");
+  const [clientId, setClientId] = useState(loaded.clientId ?? "");
+  const [redirectUri, setRedirectUri] = useState(loaded.redirectUri ?? "");
+  const [scopes, setScopes] = useState(loaded.scopes || "openid profile email");
+  const [audience, setAudience] = useState(loaded.audience ?? "");
+  const [jwksUrl, setJwksUrl] = useState(loaded.jwksUrl ?? "");
+  const [autoProvision, setAutoProvision] = useState(loaded.autoProvision ?? true);
+  const [defaultRole, setDefaultRole] = useState(loaded.defaultRole || "viewer");
+  const [emailClaim, setEmailClaim] = useState(loaded.emailClaim || "email");
+  const [requireMappedGroup, setRequireMappedGroup] = useState(loaded.requireMappedGroup ?? false);
+
+  const saveSettings = useMutation({
+    mutationFn: async (edited: Partial<OidcSettings>) =>
+      // Send the whole loaded object with the edits on top, so fields this form does not
+      // render (role claim, group/team mappings, sync) are never reset by a save.
+      unwrap(await api.PUT("/api/v1/settings/oidc", { body: { settings: { ...loaded, ...edited } } })),
+    onSuccess: (saved) => {
+      queryClient.setQueryData(oidcQueryKey, saved);
+      toast.success("Sign-in settings saved. Restart the API to apply them.");
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+  const saving = saveSettings.isPending;
+
+  function save() {
     // These values take effect on the next restart; a typo here locks people out.
     if (issuer.trim() && !/^https?:\/\/\S+$/.test(issuer.trim())) {
       toast.error("The issuer must be a full URL, for example https://accounts.example.com");
       document.getElementById("oidc-issuer")?.focus();
       return;
     }
-    setSaving(true);
-    try {
-      await api.PUT("/api/v1/settings/oidc", {
-        body: {
-          settings: {
-            issuer,
-            clientId,
-            redirectUri,
-            scopes,
-            audience,
-            jwksUrl,
-            autoProvision,
-            defaultRole,
-            emailClaim,
-            requireMappedGroup,
-          },
-        },
-      });
-      toast.success("Sign-in settings saved. Restart the API to apply them.");
-    } catch (error) {
-      toast.error(errorMessage(error));
-    } finally {
-      setSaving(false);
-    }
+    saveSettings.mutate({
+      issuer,
+      clientId,
+      redirectUri,
+      scopes,
+      audience,
+      jwksUrl,
+      autoProvision,
+      defaultRole,
+      emailClaim,
+      requireMappedGroup,
+    });
   }
 
   return (
@@ -554,7 +563,7 @@ function OidcSettingsForm() {
       className="space-y-5"
       onSubmit={(event) => {
         event.preventDefault();
-        void save();
+        save();
       }}
     >
       <Field label="Issuer URL" htmlFor="oidc-issuer" hint="The address of your identity provider.">

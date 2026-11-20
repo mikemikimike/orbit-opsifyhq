@@ -114,8 +114,8 @@ the browser.
 
 ```bash
 # build and push linux/amd64 images to your registry
-REGISTRY=registry.example.com:5000 TAG=0.7.0 ./scripts/build-images.sh
-PUSH_REGISTRY=registry.example.com:5000 TAG=0.7.0 ./scripts/push-images.sh
+REGISTRY=registry.example.com:5000 TAG=<version> ./scripts/build-images.sh
+PUSH_REGISTRY=registry.example.com:5000 TAG=<version> ./scripts/push-images.sh
 
 # deploy (ingress host defaults to orbit.example.com)
 helm upgrade --install orbit deploy/helm/orbit \

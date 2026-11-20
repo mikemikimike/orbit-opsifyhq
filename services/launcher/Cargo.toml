@@ -12,6 +12,7 @@ name = "orbit-launcher"
 path = "src/main.rs"
 
 [dependencies]
+orbit-contracts.workspace = true
 orbit-domain.workspace = true
 anyhow.workspace = true
 axum.workspace = true

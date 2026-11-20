@@ -31,7 +31,7 @@ export function DocView({ slug }: { slug: string }) {
             currentTitle={page.data?.title}
           />
         </aside>
-        <article className="min-w-0 max-w-3xl">
+        <article className="min-w-0 max-w-4xl">
           {index.isError ? (
             <Callout tone="danger" title="Documentation could not be loaded">
               {errorMessage(index.error)}

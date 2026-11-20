@@ -194,7 +194,9 @@ async fn resolve_oidc(state: &AppState, token: Option<&str>) -> Result<AuthConte
             }
             let seats = state.store.count_active_users(state.default_org_id).await?;
             state.enforce_limit("seats", seats)?;
-            state
+            let link_by_email =
+                may_link_by_email(identity.email_verified, oidc.require_verified_email);
+            match state
                 .store
                 .upsert_oidc_user(
                     state.default_org_id,
@@ -203,8 +205,21 @@ async fn resolve_oidc(state: &AppState, token: Option<&str>) -> Result<AuthConte
                     identity.email.as_deref(),
                     identity.name.as_deref(),
                     target_role,
+                    link_by_email,
                 )
-                .await?
+                .await
+            {
+                Ok(user) => user,
+                Err(orbit_store::StoreError::Conflict(message)) => {
+                    tracing::warn!(
+                        issuer = %identity.issuer,
+                        subject = %identity.subject,
+                        "refused OIDC login: {message}"
+                    );
+                    return Err(ApiError::forbidden(message));
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
     };
     if user.status != "active" {
@@ -334,6 +349,15 @@ pub fn oidc_public_config(state: &AppState) -> serde_json::Value {
 /// Role an existing user should be changed to on OIDC login, if any. Only a matched group
 /// mapping may change the stored role; unmapped groups, an absent claim or sync being off
 /// leave it (including admin-assigned and custom roles) untouched.
+/// Email-based linking to an existing user needs a non-false `email_verified` claim; with
+/// `require_verified_email` the claim must be present and true.
+fn may_link_by_email(email_verified: Option<bool>, require_verified_email: bool) -> bool {
+    match email_verified {
+        Some(verified) => verified,
+        None => !require_verified_email,
+    }
+}
+
 fn synced_role(
     current: &str,
     mapped: Option<UserRole>,
@@ -347,6 +371,16 @@ fn synced_role(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn email_linking_needs_a_non_false_verified_claim() {
+        assert!(may_link_by_email(Some(true), false));
+        assert!(may_link_by_email(Some(true), true));
+        assert!(!may_link_by_email(Some(false), false));
+        assert!(!may_link_by_email(Some(false), true));
+        assert!(may_link_by_email(None, false));
+        assert!(!may_link_by_email(None, true));
+    }
 
     #[test]
     fn unmapped_groups_keep_existing_role() {

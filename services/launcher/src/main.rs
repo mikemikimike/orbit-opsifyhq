@@ -389,6 +389,12 @@ fn docker_env_args(
     if let Some(execution_id) = request.single_execution_id {
         args.push("--env".into());
         args.push(format!("ORBIT_SINGLE_EXECUTION_ID={execution_id}"));
+        args.push("--env".into());
+        args.push(format!(
+            "{}={}",
+            orbit_contracts::MAX_APPROVAL_WAIT_ENV,
+            orbit_contracts::max_approval_wait_seconds()
+        ));
     }
     args.push("--env-file".into());
     args.push(env_file.display().to_string());
@@ -666,6 +672,11 @@ fn kubernetes_env(
             "name": "ORBIT_SINGLE_EXECUTION_ID",
             "value": execution_id.to_string()
         }));
+        // The in-pod broker enforces the same approval budget the Job deadline allows for.
+        env.push(json!({
+            "name": orbit_contracts::MAX_APPROVAL_WAIT_ENV,
+            "value": orbit_contracts::max_approval_wait_seconds().to_string()
+        }));
     }
     let mut data = BTreeMap::new();
     for (key, value) in docker_secret_env(request)? {
@@ -849,6 +860,7 @@ async fn launch_kubernetes(
                 "backoffLimit": 0,
                 "activeDeadlineSeconds": mapping::job_deadline_seconds(
                     request.timeout_seconds,
+                    orbit_contracts::max_approval_wait_seconds(),
                     default_job_deadline_seconds(),
                 ),
                 "template": {
@@ -1207,6 +1219,45 @@ async fn logs(
         Err(error) => format!("could not read logs: {error}"),
     };
     Ok(Json(Logs { logs }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dns_label_safe(name: &str) -> bool {
+        name.len() <= 63
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && name.ends_with(|c: char| c.is_ascii_alphanumeric())
+    }
+
+    #[test]
+    fn back_to_back_launches_get_distinct_names() {
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        assert_ne!(pod_name(a), pod_name(b));
+    }
+
+    #[test]
+    fn names_are_dns_safe_and_short_enough_for_pod_suffixes() {
+        let name = pod_name(Uuid::now_v7());
+        assert!(dns_label_safe(&name), "{name}");
+        // Deployment pods append `-<10 char hash>-<5 char suffix>`.
+        assert!(name.len() + 17 <= 63, "{name}");
+        assert!(dns_label_safe(&legacy_pod_name(Uuid::now_v7())));
+    }
+
+    #[test]
+    fn legacy_label_must_match_exact_launch() {
+        let id = Uuid::now_v7();
+        assert!(label_matches_launch(&format!("{id}\n"), id));
+        assert!(!label_matches_launch(&Uuid::now_v7().to_string(), id));
+        assert!(!label_matches_launch("", id));
+        assert_ne!(legacy_pod_name(id), pod_name(id));
+    }
 }
 
 #[cfg(test)]

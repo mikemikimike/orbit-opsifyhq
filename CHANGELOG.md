@@ -6,6 +6,53 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Added
+
+- Provider quick-start presets for OpenRouter, DeepSeek, Google Gemini and Azure OpenAI,
+  plus native Anthropic provider support (Messages protocol for OpenCode/Pi and model
+  discovery) (#232).
+- Bulk **Access control** for agents and skills: multi-select, filtered Select all, one
+  dialog for visibility/owning team, and a server-side bulk sharing endpoint with
+  per-resource failures (#238).
+- Kubernetes connector Test connection, shared client and client-certificate kubeconfig
+  auth, with live kind tests for namespaces, pods, events and logs (#45).
+- Embedded docs now follow the app navigation and render tables correctly (#234).
+
+### Changed
+
+- Agent Team screens follow the rest of the app: list, team page, Team Studio, run page,
+  queue and run dialog (#241).
+- Skill picker has Select all / Select none; resource forms flush access edits before the
+  resource save, and Sharing is labelled Access control (RBAC) (#236, #237).
+- Worker profiles show team-scoped claims and explain that profile visibility is not claim
+  scope (#245).
+
+### Fixed
+
+- OIDC logins can no longer bind an email to a user already linked to another identity
+  (#192), and saving sign-in settings preserves mappings and surfaces failures (#197,
+  #230).
+- Team-run autoApprove is capped at the agent's own autonomy, so Observe/Recommend agents
+  cannot be raised to level 4 (#194, #227).
+- Harness-managed models now require use of the provider, closing a cross-team credential
+  path (#193, #226).
+- Approval waits are counted in Job/container deadlines, so runs waiting for a human are
+  not killed (#196, #229).
+- Native OpenCode `task`/`subagent` dispatch is an internal action; subagents start at
+  lower autonomy while their own tool calls remain individually policy-checked (#246).
+- Stale worker heartbeat rows are pruned after 24 hours, and production/example values no
+  longer pin stale image tags (#198, #239).
+- Environment mappings now have ownership/visibility, filtered lists and manage/use checks
+  (#240).
+- Restored 41 regression tests lost while integrating the earlier PR backlog (#191, #224).
+
+### Security
+
+- Worker-side git ignores repository hooks, filters, textconv and global/system config and
+  runs with a cleared allowlisted environment (#195, #228).
+
 ## [0.23.0] - 2026-11-20
 
 ### Changed
@@ -21,7 +68,6 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   mode when no tool-policy rule matches. L4/Auto no longer asks for every call; L3/Auto
   still requires approval and L1/L2 still deny writes. Explicit rules can only tighten
   this decision.
-
 
 ### Security
 
@@ -167,12 +213,10 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 - Agent YAML download uses the same-origin API proxy instead of opening/fetching the
   internal `NEXT_PUBLIC_ORBIT_API_URL` host, which browsers cannot reach.
 
-
 ### Added
 
 - OIDC `requireMappedGroup` / `ORBIT_OIDC_REQUIRE_MAPPED_GROUP`: deny users whose IdP
   groups match no role or access-team mapping and show a dedicated no-access page.
-
 
 ### Changed
 
@@ -338,29 +382,24 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   `/home/orbit/.pi/agent` by an init container. Pi no longer fails with
   "Credential store read failed ... read-only file system".
 
-
 ### Added
 
 - Run dialogs for agents and Agent Teams expose an optional harness override, so one
   agent can run on OpenCode or Pi without changing its definition.
 
-
 ### Documentation
 
 - ADR 0012: agents become harness-agnostic; harness is selected per execution/team step.
-
 
 ### Added
 
 - Worker-profile `nativeToolPermissions` JSON map (OpenCode `permission`), e.g. `bash:
   deny`, `shell: allow`, `edit: ask`. Editable in the worker profile UI.
 
-
 ### Changed
 
 - Team roles: `lead`/`member` can use team resources, `viewer` is read-only. Execution
   creation enforces use access for the agent and referenced connections.
-
 
 ### Added
 
@@ -368,18 +407,15 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   regardless of org visibility. Migration adds existing users to the Default team.
 - Settings → Access policy toggle and `GET/PUT /api/v1/settings/access`.
 
-
 ### Added
 
 - Settings → Users & roles UI: organization role assignment and custom-role CRUD with
   permission checkboxes (owner/admin only).
 
-
 ### Added
 
 - OIDC `emailClaim` / `ORBIT_OIDC_EMAIL_CLAIM` selects the unique identity/email claim
   (default `email`); use `name` when multiple IdP accounts share an email.
-
 
 ### Added
 

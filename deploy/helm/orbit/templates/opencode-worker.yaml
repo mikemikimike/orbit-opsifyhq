@@ -102,6 +102,8 @@ spec:
               value: {{ .Values.opencodeWorker.concurrency | quote }}
             - name: ORBIT_WORKER_POLL_MS
               value: {{ .Values.worker.pollIntervalMs | quote }}
+            - name: ORBIT_MAX_APPROVAL_WAIT_SECONDS
+              value: {{ .Values.maxApprovalWaitSeconds | quote }}
             - name: ORBIT_WORKSPACE_ROOT
               value: "/tmp/orbit-workspaces"
             - name: ORBIT_LOG_FORMAT

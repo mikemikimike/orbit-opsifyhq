@@ -45,7 +45,7 @@ for AI agents. It identifies assets, threat actors, attack vectors, and mitigati
 - Autonomy is platform-enforced (`evaluate_capability`), not prompt-based
 - Capability allowlists are enforced by the tool broker, not the harness
 - External content is marked as untrusted in the execution input
-- Write actions require approval (autonomy L3) or are auto-approved only at L4
+- Write actions require approval (autonomy L3) or are auto-approved only at L4 (team-run `autoApprove` never raises the level; it needs `approvals:decide`)
 
 ### 3. Agent privilege escalation
 
@@ -116,6 +116,11 @@ for AI agents. It identifies assets, threat actors, attack vectors, and mitigati
 - Agent memory is only reachable through a bound execution and uses that execution's
   agent; entries are capped at 64 KiB
 - `workspaceSubdir` / `sessionDir` are relative paths confined to the execution workspace
+- Worker-side git (`repo.checkout`/`commit`/`push`) runs through a single builder that clears the
+  environment to an allowlist (no `ORBIT_WORKER_TOKEN`/`ORBIT_API_URL`), disables system and
+  global git config, overrides hooks, fsmonitor, ssh command and external diff, uses
+  `--no-verify`, and refuses to run when the workspace's git config defines filter, textconv,
+  merge-driver, credential, include or similar program-executing entries (#195)
 
 ## Recommendations for production
 

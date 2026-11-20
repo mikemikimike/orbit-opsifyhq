@@ -28,7 +28,7 @@ crates/orbit-security/ Auth abstractions, permissions, secret encryption
 crates/orbit-harness/  Harness registry + adapters (mock, opencode and pi available)
 crates/orbit-api/      HTTP router, handlers, OpenAPI, SSE
 deploy/                Compose, Docker files, Helm chart, seed data
-docs/                  Architecture, ADRs, development and deployment docs
+docs/                  Architecture, ADRs, development and deployment docs (sidebar: docs/navigation.yaml)
 ```
 
 ## Commands
