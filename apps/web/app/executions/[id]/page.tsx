@@ -7,7 +7,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Ban, Bot, CloudOff, Copy, RefreshCw, RotateCw, ShieldX } from "lucide-react";
+import { Ban, Bot, Check, CloudOff, Copy, RefreshCw, RotateCw, ShieldX, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { executionTask, executionTitle } from "@/components/executions/execution-row";
@@ -49,6 +49,7 @@ import { brandName, capabilityLabel, humanizeIdentifier } from "@/lib/presentati
 import { describeEvent, dispatchedModel, isKeyEvent, lastAgentMessage } from "@/lib/execution-events";
 import { Badge } from "@/components/ui/badge";
 import { Markdown } from "@/components/ui/markdown";
+import { ApprovalDetails } from "@/components/approvals/approval-details";
 import type { ExecutionEventRecord, ExecutionRecord } from "@/lib/types";
 
 export default function ExecutionDetailPage() {
@@ -117,6 +118,35 @@ export default function ExecutionDetailPage() {
       toast.success("Execution queued");
       void queryClient.invalidateQueries({ queryKey: queryKeys.executions() });
       router.push(`/executions/${created.id}`);
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  const decideApproval = useMutation({
+    mutationFn: async ({
+      approvalId,
+      decision,
+    }: {
+      approvalId: string;
+      decision: "approved" | "rejected";
+    }) =>
+      unwrap(
+        await api.POST(
+          decision === "approved"
+            ? "/api/v1/approvals/{approval_id}/approve"
+            : "/api/v1/approvals/{approval_id}/reject",
+          {
+            params: { path: { approval_id: approvalId } },
+            body: {},
+          },
+        ),
+      ),
+    onSuccess: (_, variables) => {
+      toast.success(variables.decision === "approved" ? "Approved" : "Rejected");
+      void queryClient.invalidateQueries({ queryKey: queryKeys.approvals("pending") });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.approvals(undefined) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.execution(executionId) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
@@ -382,9 +412,44 @@ export default function ExecutionDetailPage() {
           tone="warning"
           title="Paused: waiting for approval"
           action={
-            <Button asChild size="sm">
-              <Link href="/approvals">Review</Link>
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                className="text-destructive hover:border-destructive/50 hover:bg-destructive/10"
+                loading={
+                  decideApproval.isPending &&
+                  decideApproval.variables?.approvalId === pendingApproval.id &&
+                  decideApproval.variables?.decision === "rejected"
+                }
+                disabled={decideApproval.isPending}
+                onClick={() =>
+                  decideApproval.mutate({
+                    approvalId: pendingApproval.id,
+                    decision: "rejected",
+                  })
+                }
+              >
+                <X /> Reject
+              </Button>
+              <Button
+                size="sm"
+                loading={
+                  decideApproval.isPending &&
+                  decideApproval.variables?.approvalId === pendingApproval.id &&
+                  decideApproval.variables?.decision === "approved"
+                }
+                disabled={decideApproval.isPending}
+                onClick={() =>
+                  decideApproval.mutate({
+                    approvalId: pendingApproval.id,
+                    decision: "approved",
+                  })
+                }
+              >
+                <Check /> Approve
+              </Button>
+            </div>
           }
         >
           The agent wants to{" "}
@@ -395,6 +460,9 @@ export default function ExecutionDetailPage() {
           </span>
           . Nothing happens until someone approves or rejects it
           {pendingApproval.expiresAt ? `, and the request expires ${relativeTime(pendingApproval.expiresAt)}` : ""}.
+          <div className="mt-3">
+            <ApprovalDetails approval={pendingApproval} />
+          </div>
         </Callout>
       ) : null}
 

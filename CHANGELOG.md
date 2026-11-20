@@ -8,14 +8,6 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ## [Unreleased]
 
-### Fixed
-
-- Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval
-  mode when no tool-policy rule matches. L4/Auto no longer asks for every call; L3/Auto
-  still requires approval and L1/L2 still deny writes. Explicit rules can only tighten
-  this decision.
-
-
 ### Security
 
 - Team-run `autoApprove` no longer forces autonomy level 4 on every step agent (#194).
@@ -27,6 +19,25 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   rerunning user holds `approvals:decide`. Note: at L3 with `Auto` mode, writes still need
   approval by design (only L4 runs them unattended), so the override matters for L4
   agents configured with `Always`/`Writes` approval mode.
+
+## [0.23.0] - 2026-11-20
+
+### Changed
+
+- Execution detail pages can approve or reject a pending tool call inline, with the exact
+  action details, instead of navigating to Approvals first.
+- Approvals are one click: the card's Approve/Reject buttons decide immediately and show a
+  per-button loading state. The redundant confirmation dialog was removed.
+
+### Fixed
+
+- Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval
+  mode when no tool-policy rule matches. L4/Auto no longer asks for every call; L3/Auto
+  still requires approval and L1/L2 still deny writes. Explicit rules can only tighten
+  this decision.
+
+
+### Security
 
 - Creating a trigger now requires **use** on the target agent and use of every connection
   and provider its current spec references, closing an IDOR that let an Operator attach a

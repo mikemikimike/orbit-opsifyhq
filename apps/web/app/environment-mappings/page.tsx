@@ -42,6 +42,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
+import { ResourceAccessFields } from "@/components/resource-access-fields";
 import { Segmented } from "@/components/ui/segmented";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -565,6 +566,7 @@ export default function EnvironmentMappingsPage() {
                 ) : null}
               </div>
             </div>
+            <ResourceAccessFields resource="env_mappings" resourceId={editing?.id} />
             <DialogFooter className="sm:items-center">
               <span className="text-[13px] text-muted-foreground sm:mr-auto" aria-live="polite">
                 {problem ?? ""}
