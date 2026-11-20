@@ -245,6 +245,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/agents/{agent_id}/runtime": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get"];
+        put?: never;
+        post: operations["start"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/agents/{agent_id}/runtime/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["stop"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/agents/{agent_id}/versions": {
         parameters: {
             query?: never;
@@ -437,6 +469,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/docs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Documentation index: categories and their pages. */
+        get: operations["index"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/docs/assets/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** An embedded documentation image (architecture diagrams, brand assets). */
+        get: operations["get_asset"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/docs/{slug}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A documentation page: Markdown plus metadata, or rendered HTML. */
+        get: operations["get_page"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/env-mappings": {
         parameters: {
             query?: never;
@@ -592,6 +675,38 @@ export interface paths {
         get: operations["list_harnesses"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["import_portable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/import/opencode": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["import_markdown"];
         delete?: never;
         options?: never;
         head?: never;
@@ -824,6 +939,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/settings/approvals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_approvals"];
+        put: operations["update_approvals"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/settings/harness": {
         parameters: {
             query?: never;
@@ -848,6 +979,14 @@ export interface paths {
             cookie?: never;
         };
         get: operations["get_oidc"];
+        /**
+         * Update the OIDC sign-in settings.
+         * @description This is a merge: only the fields present in `settings` change, and absent fields
+         *     (including `roleClaim`, `groupRoles`, `teamGroups`, `autoCreateTeams`,
+         *     `requireMappedGroup` and `syncRoles`) are preserved. To clear a mapping, send it
+         *     explicitly (for example `"groupRoles": {}`). The merged result is validated before
+         *     it is stored.
+         */
         put: operations["update_oidc"];
         post?: never;
         delete?: never;
@@ -1479,10 +1618,48 @@ export interface components {
             /** Format: int64 */
             total: number;
         };
+        AgentRuntime: {
+            /** Format: uuid */
+            agentId: string;
+            /**
+             * Format: int32
+             * @description Failed executions in a row; reset when an execution succeeds.
+             */
+            consecutiveFailures: number;
+            /** Format: date-time */
+            createdAt: string;
+            /** Format: uuid */
+            createdBy?: string | null;
+            /**
+             * Format: uuid
+             * @description Last failed execution already counted and backed off from.
+             */
+            failedExecutionId?: string | null;
+            harnessKind: string;
+            /** Format: uuid */
+            id: string;
+            /** Format: int32 */
+            intervalSeconds: number;
+            lastError?: string | null;
+            /** Format: uuid */
+            lastExecutionId?: string | null;
+            /** Format: date-time */
+            lastHeartbeatAt: string;
+            /** Format: date-time */
+            nextRunAt: string;
+            /** Format: uuid */
+            orgId: string;
+            status: string;
+            /** Format: date-time */
+            stoppedAt?: string | null;
+            task: string;
+            /** Format: date-time */
+            updatedAt: string;
+        };
         AgentSpec: {
             autonomy?: components["schemas"]["AutonomySpec"];
             connectors?: components["schemas"]["ConnectorBinding"][];
-            harness?: null | components["schemas"]["HarnessSpec"];
+            harness?: components["schemas"]["HarnessSpec"] | null;
             /** @description Harness-specific options keyed by harness kind (`opencode`, `pi`, …). */
             harnessConfig?: {
                 [key: string]: unknown;
@@ -1634,6 +1811,13 @@ export interface components {
             agentId: string;
             agentName: string;
             executionStatus: string;
+        };
+        ApprovalsSettings: {
+            /**
+             * @description Four-eyes: the user who requested an execution cannot approve or reject the
+             *     approvals that execution raises. Default `false`.
+             */
+            approvalsRequireDifferentApprover?: boolean;
         };
         AuditLogPage: {
             items: components["schemas"]["AuditLogRecord"][];
@@ -1805,7 +1989,7 @@ export interface components {
              *     and materializes the remaining agents as harness-native subagents.
              */
             mode?: string;
-            model?: null | components["schemas"]["TeamModelOverride"];
+            model?: components["schemas"]["TeamModelOverride"] | null;
             name: string;
             /** @description Multi-repository workspace. When empty, `repository`/`branch` are used. */
             repositories?: components["schemas"]["RepositorySpec"][];
@@ -1822,7 +2006,7 @@ export interface components {
              * @description Per-step wall-clock timeout; defaults to 1 hour for team runs.
              */
             timeoutSeconds?: number | null;
-            workSource?: null | components["schemas"]["WorkSourceDefinition"];
+            workSource?: components["schemas"]["WorkSourceDefinition"] | null;
             /**
              * Format: uuid
              * @description Worker profile used for automatic launch.
@@ -1886,6 +2070,10 @@ export interface components {
             token: string;
             tokenPrefix: string;
         };
+        CredentialsNotice: {
+            note: string;
+            required: boolean;
+        };
         CustomRole: {
             /** Format: date-time */
             createdAt: string;
@@ -1925,7 +2113,40 @@ export interface components {
             /** Format: int64 */
             totalConnections: number;
         };
-        /** @enum {string} */
+        DocCategory: {
+            id: string;
+            pages: components["schemas"]["DocSummary"][];
+            title: string;
+        };
+        DocIndex: {
+            categories: components["schemas"]["DocCategory"][];
+        };
+        DocPageView: {
+            category: string;
+            description: string;
+            /** @description Markdown with relative links rewritten to documentation routes. */
+            markdown: string;
+            /** @description Source path inside `docs/`. */
+            path: string;
+            slug: string;
+            title: string;
+            url: string;
+        };
+        DocSummary: {
+            description: string;
+            slug: string;
+            title: string;
+            /** @description API route of the page, e.g. `/api/v1/docs/architecture/overview`. */
+            url: string;
+        };
+        /**
+         * @description Requested network egress mode.
+         *
+         *     **Not yet enforced by the platform.** The value is validated and recorded on the
+         *     agent spec only; no ORBIT component restricts outbound traffic. Enforce egress at
+         *     the network layer (for example a Kubernetes NetworkPolicy).
+         * @enum {string}
+         */
         EgressMode: "default" | "allowlist" | "denied";
         EnqueueRequest: {
             items: components["schemas"]["QueueItemInput"][];
@@ -2109,6 +2330,52 @@ export interface components {
         };
         /** @enum {string} */
         ImplementationStatus: "available" | "scaffolded" | "planned";
+        /** @enum {string} */
+        ImportAction: "create" | "update";
+        ImportItemReport: {
+            action?: components["schemas"]["ImportAction"] | null;
+            credentialsRequired: boolean;
+            /**
+             * Format: uuid
+             * @description Id of the created/updated resource. Only set after a real import.
+             */
+            id?: string | null;
+            issues: components["schemas"]["ValidationIssue"][];
+            kind: string;
+            name: string;
+            status: components["schemas"]["ImportItemStatus"];
+            unresolvedReferences: components["schemas"]["UnresolvedReference"][];
+            /** @description Non-blocking notes: ignored fields, credentials to set, dropped secrets. */
+            warnings: string[];
+        };
+        /** @enum {string} */
+        ImportItemStatus: "ok" | "conflict" | "invalid" | "unresolved_references";
+        /** @enum {string} */
+        ImportMode: "create" | "update" | "upsert";
+        ImportReport: {
+            /** @description True when changes were written. */
+            applied: boolean;
+            dryRun: boolean;
+            items: components["schemas"]["ImportItemReport"][];
+            mode: components["schemas"]["ImportMode"];
+            /** @description True when every item can be (or was) applied. */
+            valid: boolean;
+        };
+        ImportRequest: {
+            /** @description Activate a newly imported agent immediately. */
+            activate?: boolean;
+            content: string;
+            filename?: string;
+            /** @description `agent` or `skill`. */
+            kind: string;
+        };
+        ImportResponse: {
+            /** Format: uuid */
+            id: string;
+            kind: string;
+            name: string;
+            warnings: string[];
+        };
         Instructions: {
             /** @description Additional operator constraints, appended to the trusted instruction block. */
             constraints?: string[];
@@ -2126,6 +2393,7 @@ export interface components {
             agents: number | null;
             /**
              * Format: int64
+             * @description Signed claims spell it `executions_per_day` (ADR 0010); the API returns camelCase.
              * @default null
              */
             executionsPerDay: number | null;
@@ -2206,6 +2474,8 @@ export interface components {
         MetaResponse: {
             apiVersion: string;
             auth: unknown;
+            /** @description Route of the embedded documentation index (authenticated). */
+            docsUrl: string;
             environment: string;
             eventsDriver: string;
             features: components["schemas"]["MetaFeatures"];
@@ -2223,9 +2493,17 @@ export interface components {
             };
             provider?: string | null;
         };
+        /**
+         * @description Desired network egress policy for an agent.
+         *
+         *     **Recorded but not yet enforced by the platform.** Neither the worker nor any
+         *     harness adapter reads these values; enforce egress at the network layer (for
+         *     example a Kubernetes NetworkPolicy).
+         */
         NetworkPolicy: {
+            /** @description Hostnames or `*.suffix` patterns. A bare `*` is rejected. Recorded but not yet enforced. */
             allowedHosts?: string[];
-            mode?: null | components["schemas"]["EgressMode"];
+            mode?: components["schemas"]["EgressMode"] | null;
         };
         OidcSettings: {
             audience?: string;
@@ -2243,6 +2521,8 @@ export interface components {
             issuer?: string;
             jwksUrl?: string;
             redirectUri?: string;
+            /** @description Deny users whose groups match no role/team mapping. */
+            requireMappedGroup?: boolean;
             /** @description Claim carrying IdP groups/roles (default `groups`). */
             roleClaim?: string;
             scopes?: string;
@@ -2301,6 +2581,21 @@ export interface components {
          * @enum {string}
          */
         PlacementTarget: "auto" | "local" | "docker" | "kubernetes";
+        /** @description The generic envelope. `spec` is validated against the typed spec of `kind`. */
+        PortableDocument: {
+            apiVersion: string;
+            credentials?: components["schemas"]["CredentialsNotice"] | null;
+            kind: string;
+            metadata: components["schemas"]["PortableMetadata"];
+            spec?: unknown;
+        };
+        PortableMetadata: {
+            description?: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+        };
         ProbeProviderRequest: {
             config: unknown;
             credential?: string | null;
@@ -2386,7 +2681,7 @@ export interface components {
             maxOutputTokens?: number | null;
             /** Format: int32 */
             memoryMb?: number;
-            network?: null | components["schemas"]["NetworkPolicy"];
+            network?: components["schemas"]["NetworkPolicy"] | null;
             /** Format: int64 */
             timeoutSeconds?: number;
         };
@@ -2424,6 +2719,15 @@ export interface components {
             /** Format: int32 */
             version: number;
             visibility: string;
+        };
+        StartRuntimeRequest: {
+            harness?: string | null;
+            /**
+             * Format: int32
+             * @description Delay between monitor runs. Default 60 seconds, minimum 5.
+             */
+            intervalSeconds?: number | null;
+            task?: string | null;
         };
         TeamMember: {
             /** Format: date-time */
@@ -2530,7 +2834,7 @@ export interface components {
         TeamStepInput: {
             /** Format: uuid */
             agentId: string;
-            model?: null | components["schemas"]["TeamModelOverride"];
+            model?: components["schemas"]["TeamModelOverride"] | null;
         };
         /**
          * @description Fields a rule can match on. Every configured field must match (AND). An empty matcher
@@ -2543,7 +2847,8 @@ export interface components {
              */
             capability: string | null;
             /**
-             * @description Regular expression against shell commands (`command`, `cmd`).
+             * @description Regular expression against shell commands (`command`, `cmd`). Best-effort, not a
+             *     sandbox; deny and require-approval rules match when no command can be extracted.
              * @default null
              */
             commandRegex: string | null;
@@ -2553,9 +2858,10 @@ export interface components {
              */
             connection: string | null;
             /** @default null */
-            effect: null | components["schemas"]["CapabilityEffect"];
+            effect: components["schemas"]["CapabilityEffect"] | null;
             /**
-             * @description Glob against path-like arguments (`path`, `file_path`, `paths`, …).
+             * @description Glob against path-like arguments (`path`, `file_path`, `paths`, …). Deny and
+             *     require-approval rules also match when no path can be extracted (fail closed).
              * @default null
              */
             pathGlob: string | null;
@@ -2625,13 +2931,14 @@ export interface components {
         /** @enum {string} */
         TriggerSource: "manual" | "schedule" | "webhook" | "connector_event" | "agent_event" | "api";
         TriggerSpec: {
-            /** @description Standard 5-field cron expression, evaluated in UTC. */
+            /** @description Standard 5-field cron expression, evaluated in `timezone` (UTC when omitted). */
             cron: string;
             /**
              * @description What the agent is asked to do each time the schedule fires. Without it the
              *     run gets a generic "perform your configured task" prompt.
              */
             task?: string | null;
+            /** @description IANA timezone name such as `Europe/Amsterdam`; defaults to UTC. */
             timezone?: string | null;
             /** @enum {string} */
             type: "schedule";
@@ -2647,8 +2954,16 @@ export interface components {
             /** @enum {string} */
             type: "manual";
         };
+        UnresolvedReference: {
+            /** @description Referenced kind, for example `skill`, `agent`, `connection`, `connector`. */
+            kind: string;
+            /** @description Where it was found, for example `spec.skills[1]`. */
+            path: string;
+            /** @description The name/slug as written in the document. */
+            reference: string;
+        };
         UpdateAgentRequest: {
-            definition?: null | components["schemas"]["AgentDefinition"];
+            definition?: components["schemas"]["AgentDefinition"] | null;
             description?: string | null;
             labels?: unknown;
             name?: string | null;
@@ -2661,6 +2976,11 @@ export interface components {
             scopes?: string[] | null;
         };
         UpdateOidcRequest: {
+            /**
+             * @description Partial or full OIDC settings. Fields that are absent keep their stored value.
+             *     Kept as raw JSON so "absent" can be told apart from "empty"; the schema is
+             *     still `OidcSettings`.
+             */
             settings: components["schemas"]["OidcSettings"];
         };
         UpdateProviderRequest: {
@@ -3344,6 +3664,73 @@ export interface operations {
             };
         };
     };
+    get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentRuntime"];
+                };
+            };
+        };
+    };
+    start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StartRuntimeRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentRuntime"];
+                };
+            };
+        };
+    };
+    stop: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentRuntime"];
+                };
+            };
+        };
+    };
     list_versions: {
         parameters: {
             query?: never;
@@ -3666,6 +4053,97 @@ export interface operations {
             };
         };
     };
+    index: {
+        parameters: {
+            query?: {
+                /** @description `json` (default), `markdown` or `html`. `Accept: text/html` also selects HTML. */
+                format?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Categories and pages (JSON), or an HTML index with `format=html` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocIndex"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_asset: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Asset path relative to the docs root, e.g. `architecture/orbit-overview.png` */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The asset bytes with their content type */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unknown asset */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_page: {
+        parameters: {
+            query?: {
+                /** @description `json` (default), `markdown` or `html`. `Accept: text/html` also selects HTML. */
+                format?: string | null;
+            };
+            header?: never;
+            path: {
+                /** @description Page slug from the index, e.g. `architecture/overview` */
+                slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Metadata and Markdown (JSON), raw Markdown (`format=markdown`) or HTML (`format=html` / `Accept: text/html`) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocPageView"];
+                };
+            };
+            /** @description Unknown page */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list: {
         parameters: {
             query?: never;
@@ -3886,9 +4364,13 @@ export interface operations {
     };
     export_resource: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description `json` (default), `yaml` (portable envelope) or `markdown` (skills: SKILL.md). */
+                format?: string | null;
+            };
             header?: never;
             path: {
+                /** @description agents, skills, connections, providers, worker_profiles, agent_teams, triggers or tool_policies */
                 resource: string;
                 resource_id: string;
             };
@@ -3896,7 +4378,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Secret-free resource export */
+            /** @description Secret-free resource export (JSON, portable YAML or SKILL.md) */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3920,6 +4402,82 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HarnessView"][];
+                };
+            };
+        };
+    };
+    import_portable: {
+        parameters: {
+            query?: {
+                /** @description `create` (default: a name conflict is a 409), `update` or `upsert`. */
+                mode?: components["schemas"]["ImportMode"] | null;
+                /** @description Validate and report only; nothing is written. */
+                dryRun?: boolean | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description SKILL.md, a YAML/JSON portable document, or a multi-document bundle. May be wrapped as {"content", "filename"} JSON. */
+        requestBody: {
+            content: {
+                "application/yaml": string;
+            };
+        };
+        responses: {
+            /** @description Dry-run report, or an import that only updated resources */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportReport"];
+                };
+            };
+            /** @description Imported */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportReport"];
+                };
+            };
+            /** @description Name conflict in create mode */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation errors or unresolved references */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    import_markdown: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImportRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportResponse"];
                 };
             };
         };
@@ -4363,6 +4921,48 @@ export interface operations {
             };
         };
     };
+    get_approvals: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalsSettings"];
+                };
+            };
+        };
+    };
+    update_approvals: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ApprovalsSettings"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApprovalsSettings"];
+                };
+            };
+        };
+    };
     get_harness: {
         parameters: {
             query?: never;
@@ -4443,6 +5043,14 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["OidcSettings"];
+                };
+            };
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorEnvelope"];
                 };
             };
         };
