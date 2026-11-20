@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Cable,
@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { ResourceAccessFields } from "@/components/resource-access-fields";
+import { ResourceAccessFields, type ResourceAccessHandle } from "@/components/resource-access-fields";
 import { Badge } from "@/components/ui/badge";
 import { Disclosure } from "@/components/ui/disclosure";
 import { Button } from "@/components/ui/button";
@@ -92,6 +92,7 @@ const defaultConfig = (slug: string) => {
 };
 
 export default function ConnectionsPage() {
+  const accessRef = useRef<ResourceAccessHandle>(null);
   const connections = useConnections();
   const connectors = useConnectors();
   const queryClient = useQueryClient();
@@ -308,6 +309,11 @@ export default function ConnectionsPage() {
       );
     },
   });
+
+  async function saveConnection() {
+    if ((await accessRef.current?.save()) === false) return;
+    save.mutate();
+  }
 
   const remove = useMutation({
     mutationFn: async (id: string) =>
@@ -556,7 +562,7 @@ export default function ConnectionsPage() {
             className="space-y-4"
             onSubmit={(event) => {
               event.preventDefault();
-              if (name.trim() && !save.isPending) save.mutate();
+              if (name.trim() && !save.isPending) void saveConnection();
             }}
           >
             <div className="grid gap-4 sm:grid-cols-2">
@@ -716,7 +722,7 @@ export default function ConnectionsPage() {
                 </Field>
               </Disclosure>
 
-            <ResourceAccessFields resource="connections" resourceId={editing?.id} />
+            <ResourceAccessFields ref={accessRef} resource="connections" resourceId={editing?.id} />
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setOpen(false)}>
                 Cancel

@@ -5,7 +5,7 @@ import Link from "next/link";
 import { ArrowDown, ArrowUp, ChevronLeft, ChevronRight, Plus, X } from "lucide-react";
 import { toast } from "sonner";
 
-import { ResourceAccessFields } from "@/components/resource-access-fields";
+import { ResourceAccessFields, type ResourceAccessHandle } from "@/components/resource-access-fields";
 import { SkillPicker } from "@/components/skill-picker";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
@@ -41,7 +41,7 @@ const SECTION_TITLES: Record<SectionId, string> = {
   skills: "Skills",
   access: "Connections and environment",
   runtime: "Worker and limits",
-  sharing: "Sharing",
+  sharing: "Access control",
 };
 
 const SECTION_ORDER: SectionId[] = ["goal", "agents", "workspace", "skills", "access", "runtime", "sharing"];
@@ -235,6 +235,7 @@ export function TeamForm({
   const harnesses = useHarnesses();
 
   const [draft, setDraft] = useState<Draft>(() => draftFrom(team));
+  const accessRef = useRef<ResourceAccessHandle>(null);
   const set = <K extends keyof Draft>(key: K, value: Draft[K]) => setDraft((current) => ({ ...current, [key]: value }));
   const patchWorkSource = (patch: Partial<WorkSource>) =>
     setDraft((current) => ({ ...current, workSource: current.workSource ? { ...current.workSource, ...patch } : null }));
@@ -314,6 +315,8 @@ export function TeamForm({
       toast.error(issues.length === 1 ? issues[0].message : "Fix the highlighted sections");
       return;
     }
+    // Access is stored separately from the team; flush its edits with the same Save.
+    if ((await accessRef.current?.save()) === false) return;
     await onSubmit(toInput(draft));
   }
 
@@ -1053,20 +1056,32 @@ export function TeamForm({
             />
           </FormSection>
 
-          {active === "sharing" ? (
+          {/* Kept mounted while other sections are open, so access edits survive until Save. */}
+          {team ? (
+            <Card id="section-sharing" className="scroll-mt-20" hidden={active !== "sharing"}>
+              <CardHeader>
+                <h2 className="text-[15px] font-semibold leading-6">{SECTION_TITLES.sharing}</h2>
+                <p className="text-[13px] text-muted-foreground">Who can see, run and change this team. Saved together with the team.</p>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                <ResourceAccessFields ref={accessRef} resource="agent_teams" resourceId={team.id} />
+                <div className="flex items-center justify-between gap-3 border-t pt-4">
+                  <Button type="button" variant="ghost" onClick={() => go("runtime")}>
+                    <ChevronLeft /> {SECTION_TITLES.runtime}
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          ) : active === "sharing" ? (
             <Card id="section-sharing" className="scroll-mt-20">
               <CardHeader>
                 <h2 className="text-[15px] font-semibold leading-6">{SECTION_TITLES.sharing}</h2>
-                <p className="text-[13px] text-muted-foreground">
-                  {team ? "Who can see, run and change this team. Saved on its own." : "Available once the team is created."}
-                </p>
+                <p className="text-[13px] text-muted-foreground">Available once the team is created.</p>
               </CardHeader>
               <CardContent className="space-y-5">
-                {team ? (
-                  <ResourceAccessFields resource="agent_teams" resourceId={team.id} />
-                ) : (
-                  <p className="text-sm text-muted-foreground">Create the team first, then choose who can see and use it.</p>
-                )}
+                <p className="text-sm text-muted-foreground">
+                  Create the team first. Until then it is visible to the whole organization.
+                </p>
                 <div className="flex items-center justify-between gap-3 border-t pt-4">
                   <Button type="button" variant="ghost" onClick={() => go("runtime")}>
                     <ChevronLeft /> {SECTION_TITLES.runtime}

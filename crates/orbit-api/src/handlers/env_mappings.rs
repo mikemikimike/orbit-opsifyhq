@@ -143,7 +143,13 @@ pub async fn list(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<EnvMapping>>, ApiError> {
     auth.require(Permission::SettingsRead)?;
-    Ok(Json(state.store.list_env_mappings(auth.org_id).await?))
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    Ok(Json(
+        state
+            .store
+            .list_env_mappings(auth.org_id, Some(&access.store_access()))
+            .await?,
+    ))
 }
 
 #[utoipa::path(post, path = "/api/v1/env-mappings", tag = "env-mappings", request_body = EnvMappingRequest, responses((status = 201, body = EnvMapping)))]
@@ -158,6 +164,10 @@ pub async fn create(
     let mapping = state
         .store
         .create_env_mapping(auth.org_id, &name, &description, &mappings)
+        .await?;
+    state
+        .store
+        .assign_resource_owner(auth.org_id, "env_mappings", mapping.id, auth.user_id)
         .await?;
     audit::record(
         &state,
@@ -179,6 +189,14 @@ pub async fn update(
     crate::extract::ApiJson(body): crate::extract::ApiJson<EnvMappingRequest>,
 ) -> Result<Json<EnvMapping>, ApiError> {
     auth.require(Permission::SettingsWrite)?;
+    let existing = state.store.get_env_mapping(auth.org_id, mapping_id).await?;
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    access.require_manage(
+        "environment mapping",
+        existing.owner_user_id,
+        existing.owner_team_id,
+        &existing.visibility,
+    )?;
     let (name, description, mappings) = validated(&body)?;
     validate_references(&state, &auth, &mappings).await?;
     let mapping = state
@@ -204,6 +222,14 @@ pub async fn delete(
     Path(mapping_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     auth.require(Permission::SettingsWrite)?;
+    let existing = state.store.get_env_mapping(auth.org_id, mapping_id).await?;
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    access.require_manage(
+        "environment mapping",
+        existing.owner_user_id,
+        existing.owner_team_id,
+        &existing.visibility,
+    )?;
     state
         .store
         .delete_env_mapping(auth.org_id, mapping_id)
@@ -227,14 +253,48 @@ pub async fn profile_mappings(
     Path(profile_id): Path<Uuid>,
 ) -> Result<Json<Vec<EnvMapping>>, ApiError> {
     auth.require(Permission::HarnessesRead)?;
-    state
+    let profile = state
         .store
         .get_worker_profile(auth.org_id, profile_id)
         .await?;
-    Ok(Json(
-        state
-            .store
-            .list_worker_profile_env_mappings(profile_id)
-            .await?,
-    ))
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    access.require_view(
+        "worker profile",
+        profile.owner_user_id,
+        profile.owner_team_id,
+        &profile.visibility,
+    )?;
+    let mut mappings = state
+        .store
+        .list_worker_profile_env_mappings(profile_id)
+        .await?;
+    mappings.retain(|mapping| {
+        access.can_view(
+            mapping.owner_user_id,
+            mapping.owner_team_id,
+            &mapping.visibility,
+        )
+    });
+    Ok(Json(mappings))
+}
+
+/// Every mapping attached to a worker profile must be visible and usable by the caller.
+/// Enforced before the profile write so an access change cannot expose a secret through
+/// an existing attachment.
+pub(crate) async fn validate_profile_mapping_ids(
+    state: &AppState,
+    auth: &AuthContext,
+    ids: &[Uuid],
+) -> Result<(), ApiError> {
+    let access = crate::access::AccessScope::load(state, auth).await?;
+    for id in ids {
+        let mapping = state.store.get_env_mapping(auth.org_id, *id).await?;
+        access.require_use(
+            "environment mapping",
+            mapping.owner_user_id,
+            mapping.owner_team_id,
+            &mapping.visibility,
+        )?;
+    }
+    Ok(())
 }

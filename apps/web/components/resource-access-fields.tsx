@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useId, useState } from "react";
+import { forwardRef, useEffect, useId, useImperativeHandle, useState } from "react";
 import { Lock } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -24,17 +24,20 @@ const VISIBILITY_OPTIONS = [
   { value: "private", title: "Private", description: "Only you and admins." },
 ] as const;
 
+export type ResourceAccessHandle = {
+  /** Flush pending access edits. Returns false when the access save failed. */
+  save: () => Promise<boolean>;
+};
+
+type ResourceAccessProps = { resource: string; resourceId?: string };
+
 /**
- * Who can see and use a shareable resource. Lives in the resource's edit form and
- * saves on its own, because access is stored separately from the resource itself.
+ * Who can see and use a shareable resource. Lives in the resource's edit form. Access is
+ * stored separately from the resource, so the parent form calls the exposed `save()`
+ * before saving the resource itself.
  */
-export function ResourceAccessFields({
-  resource,
-  resourceId,
-}: {
-  resource: string;
-  resourceId?: string;
-}) {
+export const ResourceAccessFields = forwardRef<ResourceAccessHandle, ResourceAccessProps>(
+  function ResourceAccessFields({ resource, resourceId }, ref) {
   const queryClient = useQueryClient();
   const labelId = useId();
   const teamFieldId = useId();
@@ -83,6 +86,30 @@ export function ResourceAccessFields({
     onError: (error) => toast.error(errorMessage(error)),
   });
 
+  const changed =
+    sharing.data !== undefined &&
+    (sharing.data.visibility !== visibility || (sharing.data.ownerTeamId ?? "") !== teamId);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      async save() {
+        if (!enabled || !resourceId || !changed || license.isLoading) return true;
+        if (visibility === "team" && !teamId) {
+          toast.error("Choose the team that owns this resource");
+          return false;
+        }
+        try {
+          await save.mutateAsync();
+          return true;
+        } catch {
+          return false;
+        }
+      },
+    }),
+    [changed, enabled, license.isLoading, resourceId, save, teamId, visibility],
+  );
+
   if (license.isLoading) return null;
 
   if (!enabled) {
@@ -108,10 +135,6 @@ export function ResourceAccessFields({
 
   const ownerTeam = (teams.data ?? []).find((team) => team.id === teamId);
   const isolated = Boolean(policy.data?.teamIsolation && ownerTeam);
-
-  const changed =
-    sharing.data !== undefined &&
-    (sharing.data.visibility !== visibility || (sharing.data.ownerTeamId ?? "") !== teamId);
 
   return (
     <div className="space-y-3 rounded-lg border p-3 sm:p-4">
@@ -186,4 +209,4 @@ export function ResourceAccessFields({
       )}
     </div>
   );
-}
+});

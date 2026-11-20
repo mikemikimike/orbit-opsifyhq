@@ -29,7 +29,7 @@ export const SECTION_TITLES: Record<SectionId, string> = {
   permissions: "Permissions",
   environment: "Environment",
   resources: "Resources",
-  sharing: "Sharing",
+  sharing: "Access control",
 };
 
 export const SECTION_DESCRIPTIONS: Record<SectionId, string> = {
@@ -39,7 +39,7 @@ export const SECTION_DESCRIPTIONS: Record<SectionId, string> = {
   permissions: "Which tools the worker may use. Everything is off until you allow it.",
   environment: "Credentials the worker fetches at startup and injects into its process and every script it spawns.",
   resources: "Requests and limits for the worker container.",
-  sharing: "Who can see and use this profile. Saved on its own, separately from the rest.",
+  sharing: "Who can see and use this profile. Saved together with the profile.",
 };
 
 export function isSectionId(value: string): value is SectionId {

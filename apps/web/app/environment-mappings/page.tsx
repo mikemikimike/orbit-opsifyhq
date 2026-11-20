@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
 import {
@@ -42,6 +42,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
+import { ResourceAccessFields, type ResourceAccessHandle } from "@/components/resource-access-fields";
 import { Segmented } from "@/components/ui/segmented";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -99,6 +100,7 @@ function toRows(mapping: EnvMappingRecord): Row[] {
 }
 
 export default function EnvironmentMappingsPage() {
+  const accessRef = useRef<ResourceAccessHandle>(null);
   const queryClient = useQueryClient();
   const confirm = useConfirm();
   const mappings = useEnvMappings();
@@ -163,6 +165,11 @@ export default function EnvironmentMappingsPage() {
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
+
+  async function saveMapping() {
+    if ((await accessRef.current?.save()) === false) return;
+    save.mutate();
+  }
 
   const remove = useMutation({
     mutationFn: deleteEnvMapping,
@@ -419,7 +426,7 @@ export default function EnvironmentMappingsPage() {
             className="contents"
             onSubmit={(event) => {
               event.preventDefault();
-              if (!problem && !save.isPending) save.mutate();
+              if (!problem && !save.isPending) void saveMapping();
             }}
           >
             <div className="space-y-5">
@@ -565,6 +572,7 @@ export default function EnvironmentMappingsPage() {
                 ) : null}
               </div>
             </div>
+            <ResourceAccessFields ref={accessRef} resource="env_mappings" resourceId={editing?.id} />
             <DialogFooter className="sm:items-center">
               <span className="text-[13px] text-muted-foreground sm:mr-auto" aria-live="polite">
                 {problem ?? ""}

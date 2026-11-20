@@ -472,6 +472,26 @@ async fn revoke_finished_launch_tokens(state: &AppState) {
 }
 
 async fn reap(state: &AppState) {
+    // Workers killed by the cluster (SIGKILL, eviction, node loss) cannot call `offline`.
+    // Keep their row long enough to explain the gap, then prune it so the UI does not
+    // accumulate ghost workers forever.
+    let heartbeat_retention_hours = std::env::var("ORBIT_WORKER_STALE_RETENTION_HOURS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 1)
+        .unwrap_or(24);
+    match state
+        .store
+        .delete_stale_worker_heartbeats(heartbeat_retention_hours)
+        .await
+    {
+        Ok(count) if count > 0 => {
+            tracing::info!(count, "pruned stale worker heartbeats");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "pruning stale worker heartbeats failed"),
+    }
+
     match state
         .store
         .reap_orphaned_executions(HEARTBEAT_STALE_SECONDS)

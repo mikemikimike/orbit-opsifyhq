@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Boxes,
@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-import { ResourceAccessFields } from "@/components/resource-access-fields";
+import { ResourceAccessFields, type ResourceAccessHandle } from "@/components/resource-access-fields";
 import { Badge } from "@/components/ui/badge";
 import { Disclosure } from "@/components/ui/disclosure";
 import { Button } from "@/components/ui/button";
@@ -184,6 +184,7 @@ function testStatus(result: TestResult | undefined): StatusMeta {
 }
 
 export default function ModelsPage() {
+  const accessRef = useRef<ResourceAccessHandle>(null);
   const providers = useProviders();
   const queryClient = useQueryClient();
   const confirm = useConfirm();
@@ -266,6 +267,11 @@ export default function ModelsPage() {
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
+
+  async function saveProvider() {
+    if ((await accessRef.current?.save()) === false) return;
+    save.mutate();
+  }
 
   const remove = useMutation({
     mutationFn: async (id: string) =>
@@ -916,12 +922,12 @@ export default function ModelsPage() {
             )}
           </div>
 
-          <ResourceAccessFields resource="providers" resourceId={editing?.id} />
+          <ResourceAccessFields ref={accessRef} resource="providers" resourceId={editing?.id} />
           <DialogFooter>
             <Button variant="outline" onClick={closeDialog}>
               Cancel
             </Button>
-            <Button onClick={() => save.mutate()} loading={save.isPending} disabled={!form.name.trim()}>
+            <Button onClick={() => void saveProvider()} loading={save.isPending} disabled={!form.name.trim()}>
               {editing ? "Save changes" : "Add provider"}
             </Button>
           </DialogFooter>
