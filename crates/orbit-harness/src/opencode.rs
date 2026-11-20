@@ -546,7 +546,13 @@ fn write_open_code_provider_config(
     }
 
     let mut provider = serde_json::Map::new();
-    provider.insert("npm".into(), serde_json::json!("@ai-sdk/openai-compatible"));
+    provider.insert(
+        "npm".into(),
+        serde_json::json!(match endpoint.protocol {
+            orbit_contracts::ModelProtocol::AnthropicMessages => "@ai-sdk/anthropic",
+            orbit_contracts::ModelProtocol::OpenAiCompatible => "@ai-sdk/openai-compatible",
+        }),
+    );
     provider.insert("name".into(), serde_json::json!(provider_name));
     let mut options = serde_json::Map::new();
     options.insert("baseURL".into(), serde_json::json!(endpoint.base_url));
@@ -1485,6 +1491,7 @@ mod config_tests {
             endpoint: Some(orbit_contracts::ModelEndpoint {
                 base_url: "http://llm.internal/v1".into(),
                 model: "internal-model".into(),
+                protocol: Default::default(),
                 headers: std::collections::BTreeMap::from([(
                     "Authorization".into(),
                     "Bearer header-secret-value".into(),
@@ -1617,5 +1624,40 @@ mod config_tests {
         assert_eq!(config["permission"]["write"], "allow");
         assert!(config["permission"].get("x").is_none());
         assert_eq!(config["tools"]["bash"], false);
+    }
+
+    #[test]
+    fn anthropic_platform_provider_uses_the_native_sdk() {
+        let dir =
+            std::env::temp_dir().join(format!("orbit-opencode-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = orbit_contracts::ResolvedModel {
+            selection: orbit_contracts::ModelSelection::Platform {
+                provider_id: uuid::Uuid::now_v7(),
+                provider_name: "claude".into(),
+                model: "claude-sonnet-4-5".into(),
+            },
+            endpoint: Some(orbit_contracts::ModelEndpoint {
+                base_url: "https://api.anthropic.com/v1".into(),
+                model: "claude-sonnet-4-5".into(),
+                protocol: orbit_contracts::ModelProtocol::AnthropicMessages,
+                headers: Default::default(),
+                request_params: serde_json::json!({}),
+                compat: Default::default(),
+                context_window: None,
+                max_output_tokens: None,
+            }),
+            credential: None,
+        };
+        write_open_code_provider_config(&dir, &model, 0).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("opencode.json")).unwrap())
+                .unwrap();
+        assert_eq!(config["provider"]["claude"]["npm"], "@ai-sdk/anthropic");
+        assert_eq!(
+            config["provider"]["claude"]["options"]["baseURL"],
+            "https://api.anthropic.com/v1"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

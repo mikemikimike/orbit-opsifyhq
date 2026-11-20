@@ -58,7 +58,7 @@ import { relativeTime } from "@/lib/utils";
 
 interface ProviderForm {
   name: string;
-  kind: "openai_compatible" | "harness_managed";
+  kind: "openai_compatible" | "anthropic" | "harness_managed";
   baseUrl: string;
   model: string;
   models: string;
@@ -94,8 +94,11 @@ const EMPTY_FORM: ProviderForm = {
 
 const KIND_LABEL: Record<string, string> = {
   openai_compatible: "OpenAI-compatible",
+  anthropic: "Anthropic",
   harness_managed: "Harness-managed",
 };
+
+const ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
 
 const HARNESS_LABEL: Record<string, string> = {
   opencode: "OpenCode",
@@ -165,7 +168,14 @@ export default function ModelsPage() {
     mutationFn: async () => {
       const catalog = parseModels(form.models);
       const config =
-        form.kind === "openai_compatible"
+        form.kind === "anthropic"
+          ? {
+              baseUrl: form.baseUrl.trim().replace(/\/$/, "") || ANTHROPIC_BASE_URL,
+              model: form.model.trim(),
+              ...(form.contextWindow ? { contextWindow: Number(form.contextWindow) } : {}),
+              ...(form.maxOutputTokens ? { maxOutputTokens: Number(form.maxOutputTokens) } : {}),
+            }
+          : form.kind === "openai_compatible"
           ? {
               baseUrl: form.baseUrl.trim().replace(/\/$/, ""),
               model: form.model.trim(),
@@ -295,20 +305,27 @@ export default function ModelsPage() {
         method: "POST",
         body: JSON.stringify({
           kind: form.kind,
-          config: {
-            baseUrl: form.baseUrl.trim().replace(/\/$/, ""),
-            headers: {},
-            compat: {
-              chatCompletions: true,
-              responsesApi: false,
-              tools: form.tools,
-              streaming: form.streaming,
-              jsonMode: form.jsonMode,
-              vision: form.vision,
-              embeddings: false,
-              modelsEndpoint: form.modelsEndpoint,
-            },
-          },
+          config:
+            form.kind === "anthropic"
+              ? {
+                  baseUrl: form.baseUrl.trim().replace(/\/$/, "") || ANTHROPIC_BASE_URL,
+                  model: form.model.trim() || "discover",
+                }
+              : {
+                  baseUrl: form.baseUrl.trim().replace(/\/$/, ""),
+                  model: form.model.trim() || "discover",
+                  headers: {},
+                  compat: {
+                    chatCompletions: true,
+                    responsesApi: false,
+                    tools: form.tools,
+                    streaming: form.streaming,
+                    jsonMode: form.jsonMode,
+                    vision: form.vision,
+                    embeddings: false,
+                    modelsEndpoint: form.modelsEndpoint,
+                  },
+                },
           credential: form.credential.trim() || undefined,
         }),
       });
@@ -389,13 +406,14 @@ export default function ModelsPage() {
   }
 
   const modelChoices = parseModels(form.models);
+  const isEndpoint = form.kind !== "harness_managed";
   const isOpenAi = form.kind === "openai_compatible";
 
   return (
     <div className="space-y-6">
       <PageHeader
         title="Model providers"
-        description="Where agents get their models: any OpenAI-compatible endpoint, or a provider managed by a harness. Credentials are encrypted and never shown again."
+        description="Where agents get their models: an OpenAI-compatible endpoint, the native Anthropic API, or a provider managed by a harness. Credentials are encrypted and never shown again."
         actions={
           <div className="flex flex-wrap gap-2">
             <ImportPortableButton />
@@ -436,7 +454,7 @@ export default function ModelsPage() {
               const config = (provider.config ?? {}) as Record<string, unknown>;
               const catalog = catalogOf(config);
               const result = results[provider.id];
-              const testable = provider.kind === "openai_compatible";
+              const testable = provider.kind !== "harness_managed";
               const model = String(config.model ?? "");
               return (
                 <div
@@ -564,20 +582,30 @@ export default function ModelsPage() {
           </DialogHeader>
 
           <div className="space-y-4">
-            <div role="radiogroup" aria-label="Provider type" className="grid gap-2 sm:grid-cols-2">
+            <div role="radiogroup" aria-label="Provider type" className="grid gap-2 sm:grid-cols-3">
               <ChoiceCard
-                selected={isOpenAi}
+                selected={form.kind === "openai_compatible"}
                 disabled={Boolean(editing)}
-                onSelect={() => setForm({ ...form, kind: "openai_compatible" })}
+                onSelect={() => setForm({ ...form, kind: "openai_compatible", baseUrl: "" })}
                 icon={<Server />}
-                title="OpenAI-compatible endpoint"
+                title="OpenAI-compatible"
                 description="vLLM, LiteLLM, a gateway, or any /v1 API."
               />
               <ChoiceCard
-                selected={!isOpenAi}
+                selected={form.kind === "anthropic"}
+                disabled={Boolean(editing)}
+                onSelect={() =>
+                  setForm({ ...form, kind: "anthropic", baseUrl: ANTHROPIC_BASE_URL })
+                }
+                icon={<Cpu />}
+                title="Anthropic"
+                description="The native Claude Messages API."
+              />
+              <ChoiceCard
+                selected={form.kind === "harness_managed"}
                 disabled={Boolean(editing)}
                 onSelect={() => setForm({ ...form, kind: "harness_managed" })}
-                icon={<Cpu />}
+                icon={<Boxes />}
                 title="Harness-managed"
                 description="The harness signs in itself, for example OpenCode Go."
               />
@@ -592,7 +620,7 @@ export default function ModelsPage() {
               />
             </Field>
 
-            {isOpenAi ? (
+            {isEndpoint ? (
               <>
                 <Field
                   label="Base URL"
@@ -713,6 +741,7 @@ export default function ModelsPage() {
                         />
                       </Field>
                     </div>
+                    {isOpenAi ? (
                     <div className="grid gap-2 sm:grid-cols-2">
                       {COMPAT_FLAGS.map((flag) => (
                         <CheckboxField
@@ -724,6 +753,7 @@ export default function ModelsPage() {
                         />
                       ))}
                     </div>
+                    ) : null}
                   </Disclosure>
               </>
             ) : (

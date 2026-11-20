@@ -1,11 +1,17 @@
 # Providers and models
 
-ORBIT supports two provider kinds:
+ORBIT supports three provider kinds:
 
 | Kind | Auth | Use |
 |---|---|---|
 | `openai_compatible` | ORBIT stores an encrypted credential and injects it into the harness | vLLM, LiteLLM, gateways, OpenRouter-style endpoints |
+| `anthropic` | ORBIT stores an encrypted Anthropic API key | Native Anthropic Messages API (`/v1/messages`) |
 | `harness_managed` | The harness owns credentials (e.g. `opencode auth export`) | Provider inventories managed by OpenCode/Pi |
+
+`anthropic` is resolved to the native Anthropic protocol: OpenCode uses
+`@ai-sdk/anthropic` and Pi uses `anthropic-messages`. The base URL defaults to
+`https://api.anthropic.com/v1`; model discovery probes `/models` with `x-api-key` and
+`anthropic-version`. The key is still encrypted, write-only and sent only to that base URL.
 
 ## Models
 
