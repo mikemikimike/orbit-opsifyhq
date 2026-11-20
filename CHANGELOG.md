@@ -10,6 +10,18 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ### Added
 
+- Launcher workload names and worker ids are unique per launch (#106).
+- API token scopes are bounded by the owner's current role, including custom-role changes
+  and demotions (#136).
+- OpenCode enforces autonomy for native tools (#110).
+- Agent Studio preserves `harnessConfig` when saving (#109).
+- Dashboard summary only counts agents the caller can see (#133).
+- Agent version history requires agent visibility (#134).
+- Schedule triggers claim atomically, support timezones, reconcile managed triggers and
+  repair stuck `next_run_at` values (#111).
+- CI runs `cargo audit` directly so the result fails only on real advisories, not on a
+  check-run permissions error (#127).
+
 - Embedded in-app documentation with working links (#44).
 - Portable YAML/Markdown export and import for agents, skills, triggers, connections,
   providers, worker profiles, agent teams and tool policies (#80).

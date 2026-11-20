@@ -296,7 +296,7 @@ async fn execution_lifecycle_and_events() {
         .unwrap();
     assert_eq!(events.len(), 2);
 
-    let summary = store.dashboard_summary(org).await.unwrap();
+    let summary = store.dashboard_summary(org, None).await.unwrap();
     assert_eq!(summary.total_agents, 1);
     assert!(summary.executions_24h >= 1);
 }
@@ -2093,4 +2093,247 @@ async fn prune_audit_logs_removes_only_rows_older_than_cutoff() {
     let (rows, _) = store.list_audit_logs(org, 10, None, None).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].action, "test.recent");
+}
+
+fn schedule_config(cron: &str, timezone: Option<&str>) -> serde_json::Value {
+    serde_json::json!({ "cron": cron, "timezone": timezone })
+}
+
+async fn backdate_next_run(store: &Store, trigger_id: uuid::Uuid) {
+    sqlx::query("UPDATE triggers SET next_run_at = now() - interval '1 minute' WHERE id = $1")
+        .bind(trigger_id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn claimed_schedule_trigger_always_has_next_run() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, _) = store
+        .create_agent(org, Some(user), &definition("Claim Atomic"))
+        .await
+        .unwrap();
+    let trigger = store
+        .create_trigger(
+            org,
+            agent.id,
+            "schedule",
+            None,
+            schedule_config("*/5 * * * *", None),
+            true,
+        )
+        .await
+        .unwrap();
+    backdate_next_run(&store, trigger.id).await;
+
+    // Simulate a crash: claim, then never fire or reschedule. (The claim is global, so
+    // another test's claim may have taken the row; the invariant holds either way.)
+    let _ = store.claim_due_triggers(1000).await.unwrap();
+
+    let after = store.get_trigger(org, trigger.id).await.unwrap();
+    assert!(after.enabled);
+    assert!(after.last_fired_at.is_some(), "trigger was not claimed");
+    let next = after.next_run_at.expect("next_run_at must never be NULL");
+    assert!(next > chrono::Utc::now());
+}
+
+#[tokio::test]
+async fn stuck_schedule_triggers_are_repaired() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, _) = store
+        .create_agent(org, Some(user), &definition("Stuck Repair"))
+        .await
+        .unwrap();
+    let trigger = store
+        .create_trigger(
+            org,
+            agent.id,
+            "schedule",
+            None,
+            schedule_config("0 9 * * *", Some("Europe/Amsterdam")),
+            true,
+        )
+        .await
+        .unwrap();
+    // The pre-fix crash state.
+    sqlx::query("UPDATE triggers SET next_run_at = NULL WHERE id = $1")
+        .bind(trigger.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    store.repair_stuck_schedule_triggers().await.unwrap();
+
+    let after = store.get_trigger(org, trigger.id).await.unwrap();
+    assert!(after.next_run_at.unwrap() > chrono::Utc::now());
+}
+
+#[tokio::test]
+async fn enabling_a_schedule_trigger_recomputes_next_run() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, _) = store
+        .create_agent(org, Some(user), &definition("Enable Recompute"))
+        .await
+        .unwrap();
+    let trigger = store
+        .create_trigger(
+            org,
+            agent.id,
+            "schedule",
+            None,
+            schedule_config("0 * * * *", None),
+            true,
+        )
+        .await
+        .unwrap();
+    store
+        .set_trigger_enabled(org, trigger.id, false)
+        .await
+        .unwrap();
+    // Stale (past) value, as left by long disablement.
+    backdate_next_run(&store, trigger.id).await;
+    let enabled = store
+        .set_trigger_enabled(org, trigger.id, true)
+        .await
+        .unwrap();
+    assert!(enabled.next_run_at.unwrap() > chrono::Utc::now());
+
+    // Stuck (NULL) value, as left by the old crash.
+    store
+        .set_trigger_enabled(org, trigger.id, false)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE triggers SET next_run_at = NULL WHERE id = $1")
+        .bind(trigger.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let enabled = store
+        .set_trigger_enabled(org, trigger.id, true)
+        .await
+        .unwrap();
+    assert!(enabled.next_run_at.unwrap() > chrono::Utc::now());
+}
+
+#[tokio::test]
+async fn timezone_is_applied_when_scheduling() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, _) = store
+        .create_agent(org, Some(user), &definition("Timezone"))
+        .await
+        .unwrap();
+    let utc = store
+        .create_trigger(
+            org,
+            agent.id,
+            "schedule",
+            None,
+            schedule_config("0 9 * * *", None),
+            true,
+        )
+        .await
+        .unwrap();
+    let ams = store
+        .create_trigger(
+            org,
+            agent.id,
+            "schedule",
+            None,
+            schedule_config("0 9 * * *", Some("Europe/Amsterdam")),
+            true,
+        )
+        .await
+        .unwrap();
+    use chrono::Timelike;
+    assert_eq!(utc.next_run_at.unwrap().hour(), 9);
+    let ams_hour = ams.next_run_at.unwrap().hour();
+    assert!(ams_hour == 8 || ams_hour == 7, "got {ams_hour}");
+}
+
+#[tokio::test]
+async fn agent_version_sync_keeps_api_triggers_and_stable_ids() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let spec_trigger = |cron: &str| TriggerSpec::Schedule {
+        cron: cron.into(),
+        timezone: None,
+        task: Some("spec task".into()),
+    };
+    let mut first = definition("Managed Sync");
+    first.spec.triggers = vec![spec_trigger("0 * * * *"), spec_trigger("30 * * * *")];
+    let (agent, _) = store.create_agent(org, Some(user), &first).await.unwrap();
+
+    let api_trigger = store
+        .create_trigger(
+            org,
+            agent.id,
+            "webhook",
+            None,
+            serde_json::json!({ "name": "operator" }),
+            true,
+        )
+        .await
+        .unwrap();
+    let before = store
+        .list_triggers(org, Some(agent.id), None)
+        .await
+        .unwrap();
+    let unchanged_id = before
+        .iter()
+        .find(|t| t.config["cron"] == "0 * * * *")
+        .unwrap()
+        .id;
+
+    // New version: first spec trigger unchanged, second changed.
+    let mut second = definition("Managed Sync");
+    second.spec.triggers = vec![spec_trigger("0 * * * *"), spec_trigger("45 * * * *")];
+    store
+        .add_agent_version(org, agent.id, Some(user), &second)
+        .await
+        .unwrap();
+
+    let after = store
+        .list_triggers(org, Some(agent.id), None)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 3);
+    assert!(
+        after.iter().any(|t| t.id == api_trigger.id),
+        "API-created trigger was deleted by sync"
+    );
+    assert!(
+        after.iter().any(|t| t.id == unchanged_id),
+        "unchanged spec trigger got a new id"
+    );
+    assert!(after.iter().any(|t| t.config["cron"] == "45 * * * *"));
+    assert!(!after.iter().any(|t| t.config["cron"] == "30 * * * *"));
+
+    // Removing all spec triggers removes only the managed rows.
+    let mut third = definition("Managed Sync");
+    third.spec.triggers = vec![];
+    store
+        .add_agent_version(org, agent.id, Some(user), &third)
+        .await
+        .unwrap();
+    let after = store
+        .list_triggers(org, Some(agent.id), None)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].id, api_trigger.id);
 }

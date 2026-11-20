@@ -390,7 +390,7 @@ pub(crate) async fn launch_profile_internal(
             return Err(error.into());
         }
     };
-    let worker_id = format!("worker-{}", &launch.id.to_string()[..8]);
+    let worker_id = launch_worker_id(launch.id);
     let mut timeout_seconds = None;
     if let Some(execution_id) = single_execution_id {
         // Lets the background reaper revoke this launch's token when the execution ends.
@@ -617,4 +617,23 @@ pub async fn archive_launch(
             .archive_worker_launch(auth.org_id, launch_id)
             .await?,
     ))
+}
+
+/// Worker id for a launch: `worker-` plus the full UUID without hyphens. The first 8 hex
+/// chars of a UUIDv7 are timestamp bits shared by every launch within ~65 s (issue #106).
+pub(crate) fn launch_worker_id(launch_id: uuid::Uuid) -> String {
+    format!("worker-{}", launch_id.simple())
+}
+
+#[cfg(test)]
+mod worker_id_tests {
+    use super::launch_worker_id;
+
+    #[test]
+    fn back_to_back_launches_get_distinct_worker_ids() {
+        let a = uuid::Uuid::now_v7();
+        let b = uuid::Uuid::now_v7();
+        assert_ne!(launch_worker_id(a), launch_worker_id(b));
+        assert!(launch_worker_id(a).len() <= 63);
+    }
 }

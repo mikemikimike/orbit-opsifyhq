@@ -14,7 +14,15 @@ pub async fn dashboard_summary(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<DashboardResponse>, ApiError> {
     auth.require(Permission::AgentsRead)?;
-    let summary = state.store.dashboard_summary(auth.org_id).await?;
-    let usage = state.store.usage_rollup(auth.org_id, 14).await?;
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    let scope = access.store_access();
+    let summary = state
+        .store
+        .dashboard_summary(auth.org_id, Some(&scope))
+        .await?;
+    let usage = state
+        .store
+        .usage_rollup(auth.org_id, 14, Some(&scope))
+        .await?;
     Ok(Json(DashboardResponse { summary, usage }))
 }

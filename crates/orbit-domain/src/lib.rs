@@ -10,6 +10,7 @@ pub mod execution;
 pub mod harness_kind;
 pub mod ids;
 pub mod pagination;
+pub mod schedule;
 pub mod tool_policy;
 pub mod worker_resources;
 
@@ -20,6 +21,7 @@ pub use execution::*;
 pub use harness_kind::*;
 pub use ids::*;
 pub use pagination::*;
+pub use schedule::{next_occurrence, parse_timezone, validate_schedule, ScheduleError};
 pub use tool_policy::*;
 pub use worker_resources::*;
 

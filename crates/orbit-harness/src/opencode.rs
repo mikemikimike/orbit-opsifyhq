@@ -16,8 +16,8 @@ use orbit_contracts::{
     InstructionsBlock, SessionRequest,
 };
 use orbit_domain::{
-    ExecutionMode, ExecutionStatus, HarnessKind, ImplementationStatus, LogLevel, Usage,
-    ValidationReport,
+    AutonomyLevel, ExecutionMode, ExecutionStatus, HarnessKind, ImplementationStatus, LogLevel,
+    Usage, ValidationReport,
 };
 
 /// OpenCode harness adapter.
@@ -96,8 +96,10 @@ impl OpenCodeSettings {
         self.binary.as_deref().unwrap_or("opencode")
     }
 
-    pub fn auto_approve(&self) -> bool {
-        self.auto_approve.unwrap_or(true)
+    /// Whether `--auto` is passed. Never at `<= RECOMMEND`: low autonomy must not
+    /// auto-approve anything, whatever the harness settings say.
+    pub fn auto_approve(&self, autonomy: AutonomyLevel) -> bool {
+        autonomy > AutonomyLevel::RECOMMEND && self.auto_approve.unwrap_or(true)
     }
 
     pub fn standalone(&self) -> bool {
@@ -149,6 +151,7 @@ impl OpenCodeSettings {
         prompt: &str,
         session_ref: Option<&str>,
         model: Option<&str>,
+        autonomy: AutonomyLevel,
     ) -> Vec<String> {
         let mut args = vec!["run".to_string()];
         if self.standalone() {
@@ -156,7 +159,7 @@ impl OpenCodeSettings {
         }
         args.push("--format".to_string());
         args.push("json".to_string());
-        if self.auto_approve() {
+        if self.auto_approve(autonomy) {
             args.push("--auto".to_string());
         }
         if let Some(agent) = &self.agent {
@@ -275,6 +278,52 @@ fn build_prompt(request: &ExecutionRequest) -> String {
     prompt
 }
 
+/// OpenCode native tools that mutate files or run commands. `edit` is the umbrella
+/// permission for file mutation; the others are listed explicitly so a version that
+/// resolves them individually is still covered.
+const WRITE_CAPABLE_NATIVE_TOOLS: &[&str] =
+    &["bash", "edit", "write", "patch", "multiedit", "apply_patch"];
+
+/// Baseline native-tool permissions enforced by the platform for an autonomy level.
+/// At `<= RECOMMEND` every write/exec tool is denied; read-only tools stay available.
+fn autonomy_native_baseline(autonomy: AutonomyLevel) -> std::collections::BTreeMap<String, String> {
+    if autonomy > AutonomyLevel::RECOMMEND {
+        return Default::default();
+    }
+    WRITE_CAPABLE_NATIVE_TOOLS
+        .iter()
+        .map(|tool| ((*tool).to_string(), "deny".to_string()))
+        .collect()
+}
+
+fn decision_strictness(decision: &str) -> Option<u8> {
+    match decision {
+        "allow" => Some(0),
+        "ask" => Some(1),
+        "deny" => Some(2),
+        _ => None,
+    }
+}
+
+/// Merge profile permissions onto the autonomy baseline. Profile entries can only make a
+/// tool more restrictive (deny > ask > allow); they never loosen the baseline.
+fn merge_native_permissions(
+    baseline: std::collections::BTreeMap<String, String>,
+    profile: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut merged = baseline;
+    for (tool, decision) in profile {
+        let Some(rank) = decision_strictness(decision) else {
+            continue;
+        };
+        let current = merged.get(tool).and_then(|d| decision_strictness(d));
+        if current.is_none_or(|c| rank > c) {
+            merged.insert(tool.clone(), decision.clone());
+        }
+    }
+    merged
+}
+
 /// Write OpenCode tool permissions. Web Search/WebFetch default to deny because
 /// `opencode run` is non-interactive and aborts when they ask for input.
 fn write_open_code_tool_permissions(
@@ -282,7 +331,9 @@ fn write_open_code_tool_permissions(
     web_search: bool,
     web_fetch: bool,
     native: &std::collections::BTreeMap<String, String>,
+    autonomy: AutonomyLevel,
 ) -> std::io::Result<()> {
+    let native = merge_native_permissions(autonomy_native_baseline(autonomy), native);
     let path = workspace.join("opencode.json");
     let mut config: serde_json::Value = if path.exists() {
         std::fs::read_to_string(&path)
@@ -307,10 +358,8 @@ fn write_open_code_tool_permissions(
         .entry("permission")
         .or_insert_with(|| serde_json::json!({}));
     if let Some(map) = permission.as_object_mut() {
-        for (tool, decision) in native {
-            if matches!(decision.as_str(), "allow" | "ask" | "deny") {
-                map.insert(tool.clone(), serde_json::json!(decision));
-            }
+        for (tool, decision) in &native {
+            map.insert(tool.clone(), serde_json::json!(decision));
         }
         map.insert(
             "websearch".into(),
@@ -327,6 +376,12 @@ fn write_open_code_tool_permissions(
     if let Some(map) = tools.as_object_mut() {
         map.insert("websearch".into(), serde_json::json!(web_search));
         map.insert("webfetch".into(), serde_json::json!(web_fetch));
+        // Hide autonomy-denied write/exec tools too, so the model is not offered them.
+        for tool in WRITE_CAPABLE_NATIVE_TOOLS {
+            if native.get(*tool).map(String::as_str) == Some("deny") {
+                map.insert((*tool).into(), serde_json::json!(false));
+            }
+        }
     }
     std::fs::write(
         &path,
@@ -783,6 +838,7 @@ impl OpenCodeHarnessAdapter {
             settings.web_search(),
             settings.web_fetch(),
             &settings.native_tool_permissions,
+            request.autonomy,
         )
         .map_err(|error| {
             HarnessError::new(
@@ -832,7 +888,12 @@ impl OpenCodeHarnessAdapter {
         }
         let model = settings.model_selector(request.model.as_ref());
         let prompt = build_prompt(&request);
-        let args = settings.cli_args(&prompt, session_ref.as_deref(), model.as_deref());
+        let args = settings.cli_args(
+            &prompt,
+            session_ref.as_deref(),
+            model.as_deref(),
+            request.autonomy,
+        );
 
         let mut command = Command::new(settings.binary());
         command.args(&args);
@@ -1225,6 +1286,7 @@ mod tests {
             "do the thing",
             Some("ses_123"),
             Some("any-provider/any-model"),
+            AutonomyLevel::PREPARE,
         );
         assert!(args.contains(&"any-provider/any-model".to_string()));
         assert!(args.contains(&"--auto".to_string()));
@@ -1390,7 +1452,14 @@ mod config_tests {
     fn writes_web_tool_permissions() {
         let dir = std::env::temp_dir().join(format!("orbit-opencode-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
-        write_open_code_tool_permissions(&dir, false, true, &Default::default()).unwrap();
+        write_open_code_tool_permissions(
+            &dir,
+            false,
+            true,
+            &Default::default(),
+            AutonomyLevel::AUTONOMOUS,
+        )
+        .unwrap();
         let config: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("opencode.json")).unwrap())
                 .unwrap();
@@ -1470,5 +1539,83 @@ mod config_tests {
             ]
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn permissions_for(autonomy: AutonomyLevel, profile: &[(&str, &str)]) -> serde_json::Value {
+        let dir = std::env::temp_dir().join(format!("orbit-opencode-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profile = profile
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        write_open_code_tool_permissions(&dir, false, false, &profile, autonomy).unwrap();
+        let config =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("opencode.json")).unwrap())
+                .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        config
+    }
+
+    #[test]
+    fn low_autonomy_denies_write_capable_tools_and_omits_auto() {
+        for level in [AutonomyLevel::OBSERVE, AutonomyLevel::RECOMMEND] {
+            let config = permissions_for(level, &[]);
+            for tool in ["bash", "edit", "write", "patch", "multiedit", "apply_patch"] {
+                assert_eq!(config["permission"][tool], "deny", "{tool} at {level:?}");
+                assert_eq!(config["tools"][tool], false, "{tool} hidden at {level:?}");
+            }
+            for tool in ["read", "grep", "glob", "list"] {
+                assert!(config["permission"].get(tool).is_none(), "{tool} untouched");
+            }
+            // Even an explicit auto_approve=true must not pass --auto.
+            let settings = OpenCodeSettings {
+                auto_approve: Some(true),
+                ..Default::default()
+            };
+            let args = settings.cli_args("task", None, None, level);
+            assert!(
+                !args.contains(&"--auto".to_string()),
+                "no --auto at {level:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn act_level_keeps_auto_and_does_not_add_baseline() {
+        let config = permissions_for(AutonomyLevel::PREPARE, &[]);
+        assert!(config["permission"].get("bash").is_none());
+        assert!(config["tools"].get("bash").is_none());
+        let args = OpenCodeSettings::default().cli_args("task", None, None, AutonomyLevel::PREPARE);
+        assert!(args.contains(&"--auto".to_string()));
+    }
+
+    #[test]
+    fn profile_permissions_cannot_loosen_the_baseline() {
+        let config = permissions_for(
+            AutonomyLevel::RECOMMEND,
+            &[("bash", "allow"), ("edit", "ask"), ("read", "deny")],
+        );
+        assert_eq!(config["permission"]["bash"], "deny");
+        assert_eq!(config["permission"]["edit"], "deny");
+        // Restricting a read-only tool is still honored.
+        assert_eq!(config["permission"]["read"], "deny");
+    }
+
+    #[test]
+    fn profile_permissions_apply_at_higher_autonomy() {
+        let config = permissions_for(
+            AutonomyLevel::AUTONOMOUS,
+            &[
+                ("bash", "deny"),
+                ("edit", "ask"),
+                ("write", "allow"),
+                ("x", "bogus"),
+            ],
+        );
+        assert_eq!(config["permission"]["bash"], "deny");
+        assert_eq!(config["permission"]["edit"], "ask");
+        assert_eq!(config["permission"]["write"], "allow");
+        assert!(config["permission"].get("x").is_none());
+        assert_eq!(config["tools"]["bash"], false);
     }
 }

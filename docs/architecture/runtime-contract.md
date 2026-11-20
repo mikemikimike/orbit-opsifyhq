@@ -205,3 +205,20 @@ harness tool call ──► worker broker /policy or /tools/call
 Adapters that run native tools (Claude Code `PreToolUse`, OpenCode hooks) must call the
 policy endpoint before executing the tool. Until that integration lands, native tools are
 constrained only by harness configuration and sandboxing.
+
+**Autonomy baseline for native tools (enforced by the adapter, independent of the
+broker).** Adapters derive a native-tool baseline from `request.autonomy` and never rely
+on the broker or `/policy` being present:
+
+- Pi: at `<= RECOMMEND` only `read,grep,find,ls,codemode` are enabled.
+- OpenCode: at `<= RECOMMEND` the generated `opencode.json` denies `bash`, `edit`,
+  `write`, `patch`, `multiedit` and `apply_patch` (`permission` = `deny`, and hidden via
+  `tools` = `false`), and `--auto` is never passed, regardless of the `autoApprove`
+  harness setting. Read-only tools (`read`, `grep`, `glob`, `list`) stay allowed; web
+  tools keep their own default (denied unless enabled). Above `RECOMMEND` there is no
+  baseline and `--auto` keeps its default.
+- Worker-profile `nativeToolPermissions` are merged onto the baseline and can only make a
+  tool stricter (`deny` > `ask` > `allow`); they never loosen it.
+
+Starting the broker `/policy` endpoint for native-tool harnesses with no connector tools
+or policies (so approval mode also applies to native tools) is not done yet; see #110.

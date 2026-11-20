@@ -5,7 +5,11 @@ Enforced by `crates/orbit-api/src/access.rs` (`AccessScope`). Invisible resource
 
 | Resource | List filter | Get | Write | Execution/approval |
 |---|---|---|---|---|
-| Agents | yes | yes | yes (author must be able to **use** every referenced connection and provider) | parent visibility; run needs **use** |
+
+| Agents | yes | yes | yes | parent visibility |
+| Agent versions (`/agents/{id}/versions`) | — | parent visibility (404) | — | — |
+| Agent export / agent executions list | — | parent visibility (404) | — | — |
+| Agent runtime / activate / pause | — | manage (404 if invisible) | manage | — |
 | Skills | yes | yes | yes | — |
 | Connections | yes | yes | yes | **use** required on every run path (see preflight) |
 | Providers | yes | yes | yes | **use** required when an agent binds it (platform-managed models) |
@@ -14,8 +18,9 @@ Enforced by `crates/orbit-api/src/access.rs` (`AccessScope`). Invisible resource
 | Triggers | yes | yes | yes | — |
 | Tool policies | yes | yes | yes | — |
 | Executions | via agent | via agent | cancel via agent | events/SSE via agent |
-| Approvals | via execution → agent | — | decide needs `approvals:decide` and use/manage on the agent (team viewers 403, invisible 404); optional four-eyes; expired → 409 | worker wait bound to its own execution |
-| Env mappings | — | — | `settings:write`; each `secretRef`/`secretKey`/`connectionId` must be a connection/provider secret in the caller's org that the caller can use (else 422); resolution is org-scoped | — |
+
+| Approvals | via execution → agent | — | decision inherits execution | — |
+| Dashboard summary | agent/execution/approval/connection/trigger counts, recent executions and usage filtered in SQL (`ResourceAccess`, joined via agent) | — | — | pending approvals via execution → agent |
 | Access teams | member list | member | lead/owner/admin | — |
 | Sharing | — | view | manage + license | — |
 | Export | per-kind read permission + view | — | — | — |
