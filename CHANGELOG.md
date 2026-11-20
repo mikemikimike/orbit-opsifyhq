@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Changed
+
+- Agent teams follow the agent screens. The list is a set of compact rows showing each
+  team's line-up ("Planner → Builder → Reviewer"), with search and a Runs tab. Each team
+  has its own page with Overview, Runs and Queue tabs; the queue is inline instead of a
+  dialog. Creating and editing use Team Studio: one section at a time with a live summary
+  in the section nav, problems marked per section, step pills on phones and Save in view.
+  Agents can be reordered. Runs open on their own page, which follows the steps live and
+  lists the agents still to come. Old `/agent-teams?run=<id>` links redirect there.
+
+### Fixed
+
+- Editing an agent team in the web UI no longer clears its team model, harness or
+  per-agent models: Team Studio loads and sends every field of the definition, and model
+  overrides can be edited (part of #205).
+
 ## [0.23.0] - 2026-11-20
 
 ### Changed
