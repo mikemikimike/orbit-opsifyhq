@@ -98,11 +98,13 @@ auth:
   Keycloak group-membership mapper).
 - The most privileged matching role wins (`owner > admin > operator > viewer`).
 - `syncRoles=false` applies the mapped role only when a user is first auto-provisioned.
-- `syncRoles=true` updates the stored role on every login when the claim is present. A
-  token without the claim never downgrades an existing user. This overrides manual role
-  changes in ORBIT.
-- Only groups listed in `groupRoles` grant anything; unmatched groups fall back to
-  `defaultRole`.
+- `syncRoles=true` updates an existing user's stored role on login only when the token
+  has groups **and** at least one matches `groupRoles`; the role then becomes the highest
+  mapped one. A token without the claim, or whose groups match no mapping, leaves the
+  stored role (including manually assigned and custom roles) unchanged. A matching mapping
+  does override manual role changes in ORBIT.
+- Only groups listed in `groupRoles` grant anything. `defaultRole` is used only when a new
+  user is auto-provisioned without a matching group; it is never applied by sync.
 
 Equivalent environment variables: `ORBIT_OIDC_ROLE_CLAIM`,
 `ORBIT_OIDC_GROUP_ROLES` (`group=role,group=role` or JSON), `ORBIT_OIDC_SYNC_ROLES`.
