@@ -8,13 +8,6 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ## [Unreleased]
 
-### Changed
-
-- Execution detail pages can approve or reject a pending tool call inline, with the exact
-  action details, instead of navigating to Approvals first.
-- Approvals are one click: the card's Approve/Reject buttons decide immediately and show a
-  per-button loading state. The redundant confirmation dialog was removed.
-
 ### Tests
 
 - Restored 41 regression tests that were dropped while integrating PRs #145-#183: team run
@@ -23,6 +16,14 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   runtime continue-after-failure (#150), credential exposure (#142), org-scoped secret
   resolution (#144) and launcher pod naming (#106) (#191).
 
+## [0.23.0] - 2026-11-20
+
+### Changed
+
+- Execution detail pages can approve or reject a pending tool call inline, with the exact
+  action details, instead of navigating to Approvals first.
+- Approvals are one click: the card's Approve/Reject buttons decide immediately and show a
+  per-button loading state. The redundant confirmation dialog was removed.
 
 ### Fixed
 
@@ -30,7 +31,6 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   mode when no tool-policy rule matches. L4/Auto no longer asks for every call; L3/Auto
   still requires approval and L1/L2 still deny writes. Explicit rules can only tighten
   this decision.
-
 
 ### Security
 
@@ -176,12 +176,10 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 - Agent YAML download uses the same-origin API proxy instead of opening/fetching the
   internal `NEXT_PUBLIC_ORBIT_API_URL` host, which browsers cannot reach.
 
-
 ### Added
 
 - OIDC `requireMappedGroup` / `ORBIT_OIDC_REQUIRE_MAPPED_GROUP`: deny users whose IdP
   groups match no role or access-team mapping and show a dedicated no-access page.
-
 
 ### Changed
 
@@ -347,29 +345,24 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   `/home/orbit/.pi/agent` by an init container. Pi no longer fails with
   "Credential store read failed ... read-only file system".
 
-
 ### Added
 
 - Run dialogs for agents and Agent Teams expose an optional harness override, so one
   agent can run on OpenCode or Pi without changing its definition.
 
-
 ### Documentation
 
 - ADR 0012: agents become harness-agnostic; harness is selected per execution/team step.
-
 
 ### Added
 
 - Worker-profile `nativeToolPermissions` JSON map (OpenCode `permission`), e.g. `bash:
   deny`, `shell: allow`, `edit: ask`. Editable in the worker profile UI.
 
-
 ### Changed
 
 - Team roles: `lead`/`member` can use team resources, `viewer` is read-only. Execution
   creation enforces use access for the agent and referenced connections.
-
 
 ### Added
 
@@ -377,18 +370,15 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   regardless of org visibility. Migration adds existing users to the Default team.
 - Settings → Access policy toggle and `GET/PUT /api/v1/settings/access`.
 
-
 ### Added
 
 - Settings → Users & roles UI: organization role assignment and custom-role CRUD with
   permission checkboxes (owner/admin only).
 
-
 ### Added
 
 - OIDC `emailClaim` / `ORBIT_OIDC_EMAIL_CLAIM` selects the unique identity/email claim
   (default `email`); use `name` when multiple IdP accounts share an email.
-
 
 ### Added
 
