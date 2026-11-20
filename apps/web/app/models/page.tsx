@@ -99,6 +99,38 @@ const KIND_LABEL: Record<string, string> = {
 };
 
 const ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
+const PROVIDER_PRESETS = [
+  {
+    id: "custom",
+    label: "Custom endpoint",
+    baseUrl: "",
+    hint: "Any OpenAI-compatible /v1 API.",
+  },
+  {
+    id: "openrouter",
+    label: "OpenRouter",
+    baseUrl: "https://openrouter.ai/api/v1",
+    hint: "Use an OpenRouter API key. Model ids are the ones OpenRouter lists.",
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    baseUrl: "https://api.deepseek.com",
+    hint: "Use a DeepSeek API key; the OpenAI-compatible endpoint is the root URL.",
+  },
+  {
+    id: "gemini",
+    label: "Google Gemini",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+    hint: "Gemini's OpenAI-compatible endpoint with a Gemini API key.",
+  },
+  {
+    id: "azure",
+    label: "Azure OpenAI",
+    baseUrl: "https://YOUR-RESOURCE.openai.azure.com/openai/v1",
+    hint: "Replace YOUR-RESOURCE. Azure's v1 API accepts the key as a bearer token.",
+  },
+] as const;
 
 const HARNESS_LABEL: Record<string, string> = {
   opencode: "OpenCode",
@@ -622,6 +654,42 @@ export default function ModelsPage() {
 
             {isEndpoint ? (
               <>
+                <Field
+                  label="Quick start"
+                  htmlFor="provider-preset"
+                  hint="Presets only fill the base URL. Model names stay free text or come from the provider's /models."
+                >
+                  <Select
+                    id="provider-preset"
+                    value={
+                      PROVIDER_PRESETS.find((preset) => preset.baseUrl === form.baseUrl)?.id ??
+                      "custom"
+                    }
+                    onChange={(event) => {
+                      const preset = PROVIDER_PRESETS.find(
+                        (candidate) => candidate.id === event.target.value,
+                      );
+                      if (!preset) return;
+                      setForm({
+                        ...form,
+                        kind: "openai_compatible",
+                        baseUrl: preset.baseUrl,
+                        model: "",
+                      });
+                    }}
+                  >
+                    {PROVIDER_PRESETS.map((preset) => (
+                      <option key={preset.id} value={preset.id}>
+                        {preset.label}
+                      </option>
+                    ))}
+                  </Select>
+                  <p className="text-[13px] text-muted-foreground">
+                    {PROVIDER_PRESETS.find((preset) => preset.baseUrl === form.baseUrl)?.hint ??
+                      "Choose a preset or enter a custom endpoint."}
+                  </p>
+                </Field>
+
                 <Field
                   label="Base URL"
                   htmlFor="provider-base-url"
