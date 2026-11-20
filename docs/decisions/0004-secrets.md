@@ -15,8 +15,10 @@ exposing them to the frontend or plaintext database dumps.
 - API rules: secrets are write-only; reads return redacted descriptors. Secret values
   are never emitted in logs, execution events, or API payloads.
 - Development mode falls back to a deterministic, documented, non-production master key
-  when `ORBIT_MASTER_KEY` is unset (logged with a warning); the API refuses to start in
-  production mode without an explicit `ORBIT_MASTER_KEY`.
+  when `ORBIT_MASTER_KEY` is unset (logged with a warning). In production the API refuses
+  to start when the key is unset or equals either published development key (the base64
+  dev value or its SHA-256-derived fallback); the Helm chart rejects the published dev key
+  and requires a random key or `secrets.existingSecret`.
 
 ## Consequences
 - Losing the master key makes stored credentials unrecoverable (documented).
