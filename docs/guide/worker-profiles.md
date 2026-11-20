@@ -63,9 +63,15 @@ NATS or master-key credentials.
 
 A worker profile has an owning access team (`ownerTeamId`, default **Default**). Claim is
 restricted to queued executions whose agent is `org`-visible or owned by that team; a
-profile can never claim another team's private agent. Execution context/running/events/
-completion/cancel endpoints re-check the same rule, so knowing an execution ID is not
-enough. Agent and skill references on create/update must be visible to the caller.
+profile can never claim another team's private agent. **Profile visibility is not claim
+scope:** making the profile organization-visible does not let it claim agents from other
+teams. Execution context/running/events/completion/cancel endpoints re-check the same rule,
+so knowing an execution ID is not enough. Agent and skill references on create/update must
+be visible to the caller.
+
+If a run stays queued while its worker is online, check the agent's `visibility` and
+`ownerTeamId` against the profile's owning team. Move the agent, change its visibility, add
+it to a `selected` profile, or remove the profile's owning team (if that is safe).
 
 ## Native OpenCode tool permissions
 
