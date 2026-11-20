@@ -81,10 +81,11 @@ jobs:
       #   RUSTSEC-2024-0449  unsafe-libyaml is unmaintained (no patched version; transitive
       #                      via serde_yaml). Informational, not an exploitable vulnerability.
       - name: cargo audit
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2024-0449
+        # Run cargo-audit directly. rustsec/audit-check@v2 tries to update a check run and
+        # fails on some token/permission combinations even when no advisory is found.
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --ignore RUSTSEC-2024-0449
 
       - name: cargo test (unit + DB integration)
         env:

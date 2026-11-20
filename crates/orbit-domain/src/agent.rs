@@ -207,8 +207,9 @@ impl From<ConnectorBinding> for ConnectorBindingRepr {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TriggerSpec {
     Schedule {
-        /// Standard 5-field cron expression, evaluated in UTC.
+        /// Standard 5-field cron expression, evaluated in `timezone` (UTC when omitted).
         cron: String,
+        /// IANA timezone name such as `Europe/Amsterdam`; defaults to UTC.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timezone: Option<String>,
         /// What the agent is asked to do each time the schedule fires. Without it the
@@ -526,16 +527,14 @@ impl AgentSpec {
                             "task is too long (max 20000 characters)",
                         );
                     }
+                    if let Err(error) = crate::schedule::parse_timezone(timezone.as_deref()) {
+                        report.push(format!("spec.triggers[{idx}].timezone"), error.to_string());
+                    }
                     if cron.parse::<croner::Cron>().is_err() {
                         report.push(
                             format!("spec.triggers[{idx}].cron"),
-                            "invalid cron expression (5-field cron in UTC)",
+                            "invalid cron expression (standard 5-field cron)",
                         );
-                    }
-                    if let Some(tz) = timezone {
-                        if tz.trim().is_empty() {
-                            report.push(format!("spec.triggers[{idx}].timezone"), "empty timezone");
-                        }
                     }
                 }
                 TriggerSpec::Event { subject } => {

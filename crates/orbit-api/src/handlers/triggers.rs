@@ -57,10 +57,17 @@ pub async fn create_trigger(
                 .get("cron")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
+            let timezone = body.config.get("timezone").and_then(|v| v.as_str());
             if cron.parse::<croner::Cron>().is_err() {
                 issues.push(orbit_domain::ValidationIssue::new(
                     "config.cron",
-                    "invalid cron expression (5-field cron in UTC)",
+                    "invalid cron expression (standard 5-field cron)",
+                ));
+            }
+            if let Err(error) = orbit_domain::parse_timezone(timezone) {
+                issues.push(orbit_domain::ValidationIssue::new(
+                    "config.timezone",
+                    error.to_string(),
                 ));
             }
         }

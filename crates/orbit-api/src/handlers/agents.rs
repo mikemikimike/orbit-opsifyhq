@@ -14,7 +14,7 @@ use crate::dto::{
     UpdateAgentRequest,
 };
 use crate::error::ApiError;
-use crate::handlers::{limit, load_agent_detail, load_visible_agent, parse_spec};
+use crate::handlers::{limit, load_agent_detail, load_visible_agent};
 use crate::state::AppState;
 
 async fn require_agent_manage(
