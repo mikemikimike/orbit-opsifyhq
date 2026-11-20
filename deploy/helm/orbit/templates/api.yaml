@@ -214,6 +214,8 @@ spec:
               value: {{ .Values.auth.oidc.requireMappedGroup | quote }}
             - name: ORBIT_OIDC_SYNC_ROLES
               value: {{ .Values.auth.oidc.syncRoles | quote }}
+            - name: ORBIT_OIDC_REQUIRE_VERIFIED_EMAIL
+              value: {{ .Values.auth.oidc.requireVerifiedEmail | quote }}
             {{- end }}
             {{- if .Values.vault.enabled }}
             - name: VAULT_ADDR

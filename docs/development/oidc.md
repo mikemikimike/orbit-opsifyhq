@@ -115,6 +115,27 @@ assigned manually for now; group-to-custom-role mapping is a follow-up.
 OIDC groups can also add users to access teams; see
 [oidc-team-sync.md](oidc-team-sync.md).
 
+## Linking identities to existing users
+
+A user is bound to one OIDC identity `(issuer, subject)`. On the first login of an unknown
+identity, ORBIT matches the token's email (see `ORBIT_OIDC_EMAIL_CLAIM`) against existing
+users:
+
+- No user has that email: a new user is auto-provisioned (when `autoProvision` is on).
+- The user has no OIDC identity yet (an admin invited them): the identity is linked to
+  that user.
+- The user is already bound to a different identity: the login is refused with `403`
+  ("this email is already linked to another sign-in identity") and nothing changes. An
+  admin must resolve it, e.g. by removing the old user.
+- `email_verified: false` in the token: the identity is never linked by email (`403`).
+- `email_verified` absent: linking proceeds, because many IdPs omit the claim. Set
+  `requireVerifiedEmail: true` (`ORBIT_OIDC_REQUIRE_VERIFIED_EMAIL=true`, also under
+  Settings → OIDC / SSO) to require `email_verified: true` for linking; a missing claim then
+  also blocks it.
+
+If your IdP can issue the same email to several accounts, or the email claim is user
+editable, enable `requireVerifiedEmail` and keep the claim on a verified attribute.
+
 ## Configure from the UI
 
 Once the platform is reachable, OIDC can also be configured under **Settings → OIDC / SSO**

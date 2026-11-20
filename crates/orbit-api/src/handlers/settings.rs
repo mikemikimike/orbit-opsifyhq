@@ -54,6 +54,10 @@ pub struct OidcSettings {
     /// Re-evaluate the stored role on every login when a mapping matches.
     #[serde(default)]
     pub sync_roles: bool,
+    /// Link an incoming identity to an existing user by email only when the token says
+    /// `email_verified: true` (a missing claim also blocks linking). Default false.
+    #[serde(default)]
+    pub require_verified_email: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
@@ -89,6 +93,7 @@ pub async fn get_oidc(
         auto_create_teams: false,
         require_mapped_group: false,
         sync_roles: false,
+        require_verified_email: false,
     });
     Ok(Json(settings))
 }
@@ -176,6 +181,7 @@ fn oidc_audit_summary(settings: &OidcSettings) -> serde_json::Value {
         "autoCreateTeams": settings.auto_create_teams,
         "requireMappedGroup": settings.require_mapped_group,
         "syncRoles": settings.sync_roles,
+        "requireVerifiedEmail": settings.require_verified_email,
     })
 }
 
@@ -251,6 +257,7 @@ pub async fn apply_stored_oidc(
         auto_create_teams: false,
         require_mapped_group: false,
         sync_roles: false,
+        require_verified_email: false,
         clock_skew_seconds: 60,
     });
     oidc.issuer = stored.issuer.trim().to_string();
@@ -333,6 +340,9 @@ pub async fn apply_stored_oidc(
     oidc.require_mapped_group = stored.require_mapped_group;
     if stored.sync_roles {
         oidc.sync_roles = true;
+    }
+    if stored.require_verified_email {
+        oidc.require_verified_email = true;
     }
     tracing::info!(issuer = %oidc.issuer, "applied OIDC settings from the database");
     auth.oidc = Some(oidc);
