@@ -6,7 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
-## [Unreleased]
+## [0.23.0] - 2026-11-20
 
 ### Changed
 
@@ -14,7 +14,6 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   action details, instead of navigating to Approvals first.
 - Approvals are one click: the card's Approve/Reject buttons decide immediately and show a
   per-button loading state. The redundant confirmation dialog was removed.
-
 
 ### Fixed
 
