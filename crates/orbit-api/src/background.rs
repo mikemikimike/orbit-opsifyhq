@@ -75,6 +75,9 @@ pub fn spawn(state: AppState) {
                 }
                 Err(error) => tracing::warn!(%error, "team run polling failed"),
             }
+            if let Err(error) = crate::handlers::teams::reconcile_team_outcomes(&team_state).await {
+                tracing::warn!(%error, "team outcome reconciliation failed");
+            }
         }
     });
 

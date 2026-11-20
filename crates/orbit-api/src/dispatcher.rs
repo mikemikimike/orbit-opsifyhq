@@ -81,7 +81,7 @@ async fn dispatch_team_locked(
 ) -> anyhow::Result<()> {
     let existing = state
         .store
-        .list_team_queue_external_keys(team.id)
+        .list_team_queue_external_keys(team.id, 5000)
         .await?
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
@@ -110,16 +110,6 @@ async fn dispatch_team_locked(
         if dispatched >= source.max_items.max(1) as usize {
             break;
         }
-        let claim = match source.provider.as_str() {
-            "github" => claim_github(&client, &base_url, token.as_deref(), source, &issue).await,
-            "gitlab" => claim_gitlab(&client, &base_url, token.as_deref(), source, &issue).await,
-            _ => unreachable!(),
-        };
-        if let Err(error) = claim {
-            last_error = Some(format!("{error}"));
-            continue;
-        }
-
         let payload = serde_json::json!({
             "task": issue.title,
             "url": issue.url,
@@ -133,23 +123,32 @@ async fn dispatch_team_locked(
             .or_else(|| issue.project.clone())
             .or_else(|| source.repository.clone())
             .or_else(|| source.project.clone());
-        let enqueued = state
-            .store
-            .try_enqueue_team_item(
-                team.org_id,
-                team.id,
-                &issue.key,
-                repository.as_deref(),
-                &payload,
-                source.max_attempts.clamp(1, 10) as i32,
-            )
-            .await?;
-        match enqueued {
-            Some(_) => dispatched += 1,
-            None => {
-                // Lost a race against a previous insert despite the lock; release the claim.
-                let _ = release_claim(&client, &base_url, token.as_deref(), source, &issue).await;
-            }
+        // Enqueue first, claim second: a database error before the claim leaves the issue
+        // untouched (it still matches the source labels and is picked up on the next poll).
+        let claimed = enqueue_then_claim(
+            &state.store,
+            team,
+            &issue.key,
+            repository.as_deref(),
+            &payload,
+            source.max_attempts.clamp(1, 10) as i32,
+            || async {
+                match source.provider.as_str() {
+                    "github" => {
+                        claim_github(&client, &base_url, token.as_deref(), source, &issue).await
+                    }
+                    "gitlab" => {
+                        claim_gitlab(&client, &base_url, token.as_deref(), source, &issue).await
+                    }
+                    _ => unreachable!(),
+                }
+            },
+        )
+        .await?;
+        match claimed {
+            EnqueueOutcome::Enqueued => dispatched += 1,
+            EnqueueOutcome::AlreadyQueued => {}
+            EnqueueOutcome::ClaimFailed(error) => last_error = Some(error),
         }
     }
 
@@ -177,32 +176,80 @@ async fn auto_run_pending(
     _definition: &TeamDefinition,
     source: &WorkSourceDefinition,
 ) -> anyhow::Result<()> {
-    let pending = state.store.list_team_queue(team.org_id, team.id).await?;
     let max = source.max_items.clamp(1, 100) as usize;
+    let pending = state
+        .store
+        .list_pending_team_queue(team.org_id, team.id, (max * 2) as i64)
+        .await?;
     let auth = crate::bootstrap::system_context(team.org_id);
     let mut started = 0usize;
     for item in pending {
         if started >= max {
             break;
         }
-        if item.status != "pending" {
-            continue;
-        }
+        // `start_queue_item` claims the item atomically and, on failure, records the error
+        // and returns the item to a retryable state itself.
         if let Err(error) = start_queue_item(state, &auth, team, &item).await {
             tracing::warn!(
                 error = %error,
                 queue_item = %item.id,
                 "failed to auto-run queue item"
             );
-            state
-                .store
-                .set_team_queue_status(team.org_id, item.id, "failed", Some(&error.message))
-                .await?;
             continue;
         }
         started += 1;
     }
     Ok(())
+}
+
+/// Result of [`enqueue_then_claim`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    Enqueued,
+    AlreadyQueued,
+    ClaimFailed(String),
+}
+
+/// Persist the queue item, then claim the issue at the source (which removes its source
+/// labels). The order matters: if persisting fails nothing was claimed, so the issue is
+/// not lost. If the claim fails the freshly enqueued item is withdrawn so the next poll
+/// retries the whole thing.
+pub async fn enqueue_then_claim<F, Fut>(
+    store: &orbit_store::Store,
+    team: &AgentTeam,
+    external_key: &str,
+    repository: Option<&str>,
+    payload: &Value,
+    max_attempts: i32,
+    claim: F,
+) -> anyhow::Result<EnqueueOutcome>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let Some(item) = store
+        .try_enqueue_team_item(
+            team.org_id,
+            team.id,
+            external_key,
+            repository,
+            payload,
+            max_attempts,
+        )
+        .await?
+    else {
+        return Ok(EnqueueOutcome::AlreadyQueued);
+    };
+    if let Err(error) = claim().await {
+        if let Err(undo) = store
+            .delete_pending_team_queue_item(team.org_id, item.id)
+            .await
+        {
+            tracing::warn!(error = %undo, queue_item = %item.id, "failed to withdraw queue item after claim failure");
+        }
+        return Ok(EnqueueOutcome::ClaimFailed(error.to_string()));
+    }
+    Ok(EnqueueOutcome::Enqueued)
 }
 
 async fn start_queue_item(
@@ -282,32 +329,6 @@ async fn claim_github(
         .cloned()
         .collect();
     labels.push(source.claim_label.clone());
-    labels.sort();
-    labels.dedup();
-    work_sources::update_github_labels(client, base_url, token, &repository, issue.number, &labels)
-        .await?;
-    Ok(())
-}
-
-async fn release_claim(
-    client: &reqwest::Client,
-    base_url: &str,
-    token: Option<&str>,
-    source: &WorkSourceDefinition,
-    issue: &work_sources::ExternalIssue,
-) -> anyhow::Result<()> {
-    let repository = issue
-        .repository
-        .clone()
-        .or_else(|| source.repository.clone())
-        .ok_or_else(|| anyhow::anyhow!("GitHub issue has no repository"))?;
-    let mut labels: Vec<String> = issue
-        .labels
-        .iter()
-        .filter(|label| *label != &source.claim_label)
-        .cloned()
-        .collect();
-    labels.extend(source.labels.clone());
     labels.sort();
     labels.dedup();
     work_sources::update_github_labels(client, base_url, token, &repository, issue.number, &labels)

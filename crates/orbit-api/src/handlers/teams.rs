@@ -1116,24 +1116,39 @@ pub async fn get_run(
     Ok(Json(TeamRunDetail { run, steps }))
 }
 
+/// How long a replica may hold the per-run advance lease before another may take over.
+const ADVANCE_LEASE_SECS: i64 = 120;
+/// How long a run whose next step cannot be started is retried before it is failed.
+const START_STEP_RETRY_WINDOW_SECS: i64 = 300;
+
 /// Advance a running team after its current execution reaches a terminal state.
-pub(crate) async fn advance(state: &AppState, run: TeamRun) -> anyhow::Result<()> {
+///
+/// Safe to call concurrently from every API replica: a per-run lease makes all but one
+/// caller a no-op, step transitions are conditional (`WHERE status = 'running'`) and
+/// `team_steps` is unique on `(run_id, step_index)`.
+///
+/// The state machine is resumable. If a tick dies after finishing a step but before the
+/// next one exists, the next tick sees "last step succeeded, run still running" and
+/// continues from there; a run is never stranded in that state.
+pub async fn advance(state: &AppState, run: TeamRun) -> anyhow::Result<()> {
+    let Some(run) = state
+        .store
+        .claim_team_run_advance(run.id, ADVANCE_LEASE_SECS)
+        .await?
+    else {
+        return Ok(());
+    };
+    let result = advance_claimed(state, run.clone()).await;
+    if let Err(error) = state.store.release_team_run_advance(run.id).await {
+        tracing::warn!(%error, run_id = %run.id, "failed to release team run advance lease");
+    }
+    result
+}
+
+async fn advance_claimed(state: &AppState, run: TeamRun) -> anyhow::Result<()> {
     let Some(current) = state.store.current_team_step(run.id).await? else {
         return Ok(());
     };
-    if current.status != "running" {
-        return Ok(());
-    }
-    let Some(execution_id) = current.execution_id else {
-        return Ok(());
-    };
-    let execution = state.store.get_execution_by_id(execution_id).await?;
-    if !matches!(
-        orbit_domain::ExecutionStatus::parse(&execution.status),
-        Some(status) if status.is_terminal()
-    ) {
-        return Ok(());
-    }
     let definition = match run.input.get("definition").cloned() {
         Some(value) => serde_json::from_value::<TeamDefinition>(value)
             .map_err(|error| anyhow::anyhow!("team run definition is invalid: {error}"))?,
@@ -1142,117 +1157,171 @@ pub(crate) async fn advance(state: &AppState, run: TeamRun) -> anyhow::Result<()
             parse_definition(&team).map_err(|error| anyhow::anyhow!(error.message))?
         }
     };
-    if execution.status == "succeeded" {
-        state
-            .store
-            .finish_team_step(current.id, "succeeded", execution.output.as_ref(), None)
-            .await?;
-        if definition.mode == "native" {
-            state
-                .store
-                .update_team_run(run.id, "succeeded", execution.output.as_ref(), None)
-                .await?;
-            crate::team_outcomes::close_queue_loop(
-                state,
-                &run,
-                "succeeded",
-                execution.output.as_ref(),
-                None,
-            )
-            .await?;
-            return Ok(());
+    match current.status.as_str() {
+        "running" => {
+            let Some(execution_id) = current.execution_id else {
+                return Ok(());
+            };
+            let execution = state.store.get_execution_by_id(execution_id).await?;
+            if !matches!(
+                orbit_domain::ExecutionStatus::parse(&execution.status),
+                Some(status) if status.is_terminal()
+            ) {
+                return Ok(());
+            }
+            if execution.status == "succeeded" {
+                let Some(finished) = state
+                    .store
+                    .finish_team_step(current.id, "succeeded", execution.output.as_ref(), None)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                continue_after_success(state, &run, &definition, &finished).await
+            } else {
+                let Some(finished) = state
+                    .store
+                    .finish_team_step(
+                        current.id,
+                        "failed",
+                        execution.output.as_ref(),
+                        Some(&execution.status),
+                    )
+                    .await?
+                else {
+                    return Ok(());
+                };
+                fail_run_for_step(state, &run, &finished).await
+            }
         }
-        let next = (current.step_index as usize) + 1;
-        if next < definition.steps.len() {
-            let run_for_step = state.store.get_team_run(run.org_id, run.id).await?;
-            let created = match start_step(
+        // Resume: the previous tick finished the step but did not get further.
+        "succeeded" => continue_after_success(state, &run, &definition, &current).await,
+        "failed" => fail_run_for_step(state, &run, &current).await,
+        _ => Ok(()),
+    }
+}
+
+async fn fail_run_for_step(state: &AppState, run: &TeamRun, step: &TeamStep) -> anyhow::Result<()> {
+    let message = format!(
+        "step '{}' finished with {}",
+        step.name,
+        step.error.as_deref().unwrap_or("failure")
+    );
+    finalize_run(state, run, "failed", step.output.as_ref(), Some(&message)).await
+}
+
+/// Move a run to a terminal status (conditionally) and close the queue loop. If closing
+/// the loop fails the queue item stays `running` with a terminal run; the outcome
+/// reconciler (`reconcile_team_outcomes`) retries it on later ticks.
+async fn finalize_run(
+    state: &AppState,
+    run: &TeamRun,
+    status: &str,
+    output: Option<&serde_json::Value>,
+    error: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(updated) = state
+        .store
+        .finish_team_run(run.id, status, output, error)
+        .await?
+    else {
+        return Ok(());
+    };
+    crate::team_outcomes::close_queue_loop(
+        state,
+        &updated,
+        status,
+        updated.output.as_ref(),
+        updated.error.as_deref(),
+    )
+    .await
+}
+
+async fn continue_after_success(
+    state: &AppState,
+    run: &TeamRun,
+    definition: &TeamDefinition,
+    finished: &TeamStep,
+) -> anyhow::Result<()> {
+    let next = (finished.step_index as usize) + 1;
+    if definition.mode == "native" || next >= definition.steps.len() {
+        return finalize_run(state, run, "succeeded", finished.output.as_ref(), None).await;
+    }
+    let created = match start_step(state, run, definition, next, finished.output.as_ref()).await {
+        Ok(created) => created,
+        // Refused by the preflight (access lost, harness/quota): fail the run instead of
+        // retrying the same step every poll.
+        Err(error) if error.status.is_client_error() => {
+            return crate::preflight::fail_team_run(state, run, &error).await;
+        }
+        Err(error) => {
+            // The finished step stays `succeeded` and no next step exists, so the next tick
+            // retries. Give up (fail the run visibly) once the retry window has passed so a
+            // permanent error (e.g. the agent was deleted) does not retry forever.
+            let waited = finished
+                .finished_at
+                .map(|at| (chrono::Utc::now() - at).num_seconds())
+                .unwrap_or(0);
+            if waited >= START_STEP_RETRY_WINDOW_SECS {
+                let message = format!("could not start step {}: {}", next + 1, error.message);
+                return finalize_run(
+                    state,
+                    run,
+                    "failed",
+                    finished.output.as_ref(),
+                    Some(&message),
+                )
+                .await;
+            }
+            return Err(anyhow::anyhow!(error.message));
+        }
+    };
+    if definition.auto_launch {
+        if let (Some(profile_id), Some(execution_id)) =
+            (definition.worker_profile_id, created.execution_id)
+        {
+            let auth = AuthContext {
+                user_id: run.requested_by.unwrap_or(Uuid::nil()),
+                org_id: run.org_id,
+                email: String::new(),
+                display_name: "Agent Team".into(),
+                role: orbit_domain::UserRole::Operator,
+                method: orbit_security::AuthMethod::ApiToken,
+                scopes: vec![],
+                token_id: None,
+            };
+            crate::handlers::worker_launches::launch_profile_internal(
                 state,
-                &run_for_step,
-                &definition,
-                next,
-                execution.output.as_ref(),
+                &auth,
+                profile_id,
+                Some(execution_id),
             )
             .await
-            {
-                Ok(created) => created,
-                // Refused by the preflight (access lost, harness/quota): fail the run
-                // instead of retrying the same step every poll.
-                Err(error) if error.status.is_client_error() => {
-                    return crate::preflight::fail_team_run(state, &run, &error).await;
-                }
-                Err(error) => return Err(anyhow::anyhow!(error.message)),
-            };
-            if definition.auto_launch {
-                if let (Some(profile_id), Some(execution_id)) =
-                    (definition.worker_profile_id, created.execution_id)
-                {
-                    let auth = AuthContext {
-                        user_id: run.requested_by.unwrap_or(Uuid::nil()),
-                        org_id: run.org_id,
-                        email: String::new(),
-                        display_name: "Agent Team".into(),
-                        role: orbit_domain::UserRole::Operator,
-                        method: orbit_security::AuthMethod::ApiToken,
-                        scopes: vec![],
-                        token_id: None,
-                    };
-                    crate::handlers::worker_launches::launch_profile_internal(
-                        state,
-                        &auth,
-                        profile_id,
-                        Some(execution_id),
-                    )
-                    .await
-                    .map_err(|error| anyhow::anyhow!(error.message))?;
-                }
-            }
-        } else {
-            state
-                .store
-                .update_team_run(run.id, "succeeded", execution.output.as_ref(), None)
-                .await?;
-            crate::team_outcomes::close_queue_loop(
-                state,
-                &run,
-                "succeeded",
-                execution.output.as_ref(),
-                None,
-            )
-            .await?;
+            .map_err(|error| anyhow::anyhow!(error.message))?;
         }
-    } else {
-        state
-            .store
-            .finish_team_step(
-                current.id,
-                "failed",
-                execution.output.as_ref(),
-                Some(&execution.status),
-            )
-            .await?;
-        state
-            .store
-            .update_team_run(
-                run.id,
-                "failed",
-                execution.output.as_ref(),
-                Some(&format!(
-                    "step '{}' finished with {}",
-                    current.name, execution.status
-                )),
-            )
-            .await?;
-        crate::team_outcomes::close_queue_loop(
+    }
+    Ok(())
+}
+
+/// Retry queue outcomes that were never applied (terminal run, item still `running`) and
+/// release queue claims that never got a run attached. Called from the team-run loop.
+pub async fn reconcile_team_outcomes(state: &AppState) -> anyhow::Result<()> {
+    for run in state.store.list_team_runs_pending_outcome(50).await? {
+        if let Err(error) = crate::team_outcomes::close_queue_loop(
             state,
             &run,
-            "failed",
-            execution.output.as_ref(),
-            Some(&format!(
-                "step '{}' finished with {}",
-                current.name, execution.status
-            )),
+            &run.status,
+            run.output.as_ref(),
+            run.error.as_deref(),
         )
-        .await?;
+        .await
+        {
+            tracing::warn!(%error, run_id = %run.id, "retrying queue outcome failed");
+        }
+    }
+    let released = state.store.release_stale_team_queue_claims(600).await?;
+    if released > 0 {
+        tracing::warn!(released, "released stale team queue claims");
     }
     Ok(())
 }
