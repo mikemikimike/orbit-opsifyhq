@@ -108,6 +108,10 @@ pub async fn run(
         ("ORBIT_SCHEDULER_ENABLED", "false".into()),
         ("ORBIT_EXECUTION_DRIVER", "process".into()),
         ("ORBIT_WORKER_POLL_MS", "1000".into()),
+        (
+            orbit_contracts::MAX_APPROVAL_WAIT_ENV,
+            orbit_contracts::max_approval_wait_seconds().to_string(),
+        ),
         ("ORBIT_WORKSPACE_ROOT", "/tmp/orbit-workspaces".into()),
         ("ORBIT_MCP_BROKER_BIN", "/usr/local/bin/orbit-worker".into()),
         (
@@ -157,8 +161,11 @@ pub async fn run(
 
     let wait = child.wait();
     // The container enforces the real timeout (pausing for approvals); this is only a
-    // backstop, so it allows for one full approval window on top.
-    let timeout = Duration::from_secs(execution.timeout_seconds.max(1) as u64 + 180 + 900);
+    // backstop, so it allows for the whole approval budget on top.
+    let timeout = dispatch_backstop(
+        execution.timeout_seconds.max(1) as u64,
+        orbit_contracts::max_approval_wait_seconds(),
+    );
     // Only worker shutdown cancels this token (user cancellation is delivered to the
     // container's own watcher). The container is stopped, then the run is reported as
     // failed by `supervise`'s caller path below.
@@ -224,6 +231,21 @@ pub async fn run(
 }
 
 /// Variables whose values must not appear in the docker CLI's argv (visible in `ps`).
+/// Grace on top of timeout and approval budget for container start-up and teardown.
+const BACKSTOP_GRACE_SECONDS: u64 = 180;
+
+/// Outer wall-clock kill deadline for a per-execution container:
+/// `timeout + approval budget + grace`. The in-container pause-aware clock is the real
+/// timeout authority; this only catches a container that never finishes.
+fn dispatch_backstop(timeout_seconds: u64, approval_budget_seconds: u64) -> Duration {
+    let timeout = timeout_seconds.max(1);
+    Duration::from_secs(
+        timeout
+            .saturating_add(approval_budget_seconds)
+            .saturating_add(BACKSTOP_GRACE_SECONDS),
+    )
+}
+
 const SECRET_ENV: &[&str] = &["ORBIT_WORKER_TOKEN"];
 
 /// Split container env into `docker run` arguments and the secret values that must be
@@ -269,6 +291,21 @@ mod docker_env_tests {
                 "ORBIT_WORKER_TOKEN".to_string(),
                 "orbit_wk_supersecret".to_string()
             )]
+        );
+    }
+
+    #[test]
+    fn backstop_covers_timeout_approval_budget_and_grace() {
+        assert_eq!(
+            dispatch_backstop(120, 3600),
+            Duration::from_secs(120 + 3600 + 180)
+        );
+        // Two ~14 minute approvals fit inside the default budget.
+        assert!(dispatch_backstop(120, 3600) > Duration::from_secs(120 + 2 * 14 * 60));
+        assert_eq!(dispatch_backstop(0, 60), Duration::from_secs(1 + 60 + 180));
+        assert_eq!(
+            dispatch_backstop(u64::MAX, u64::MAX),
+            Duration::from_secs(u64::MAX)
         );
     }
 }

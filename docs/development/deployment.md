@@ -221,6 +221,7 @@ ENTRYPOINT ["/usr/local/bin/orbit-worker"]
 | `ORBIT_WORKSPACE_ROOT` | no | Writable scratch dir (default `/tmp/orbit-workspaces`) |
 | `ORBIT_WORKER_POLL_MS` | no | Poll interval in ms (default `1000`) |
 | `ORBIT_WORKER_CONCURRENCY` | no | Max concurrent executions (default `4`) |
+| `ORBIT_MAX_APPROVAL_WAIT_SECONDS` | no | Most time (seconds), in total, a run may spend paused waiting for approvals (default `3600`). Past it, further approvals are denied and the run ends as `timed_out`. Set the same value on the launcher: Job `activeDeadlineSeconds` and the Docker dispatch backstop are `timeout + this budget + grace`. |
 | `ORBIT_WORKER_PROFILE_ID` | no | Load a worker profile (agents, skills, auth) |
 
 ### Obtaining the binary

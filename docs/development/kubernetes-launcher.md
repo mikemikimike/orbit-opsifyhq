@@ -143,8 +143,12 @@ launch read, and the TTL leaves a five-minute window.
 
 Lifecycle:
 
-- Single-execution Jobs set `activeDeadlineSeconds` to the execution timeout plus 300s
-  (the API sends `timeoutSeconds`); without it the launcher uses
+- Single-execution Jobs set `activeDeadlineSeconds` to the execution timeout plus the
+  approval budget plus 300s (the API sends `timeoutSeconds`). The approval budget is
+  `ORBIT_MAX_APPROVAL_WAIT_SECONDS` (default 3600): the most time a run may spend paused
+  for human approvals, whose wait does not count against the run timeout. The launcher
+  forwards the value to the single-execution pod or container so the in-run broker
+  enforces the same budget; set it identically on the worker. Without a timeout the launcher uses
   `ORBIT_LAUNCHER_JOB_DEADLINE_SECONDS` (default 7200).
 - Single-execution Docker containers are not started with `--rm`, because status
   (exit code, `OOMKilled`) and logs are read after exit. They are labelled

@@ -389,6 +389,12 @@ fn docker_env_args(
     if let Some(execution_id) = request.single_execution_id {
         args.push("--env".into());
         args.push(format!("ORBIT_SINGLE_EXECUTION_ID={execution_id}"));
+        args.push("--env".into());
+        args.push(format!(
+            "{}={}",
+            orbit_contracts::MAX_APPROVAL_WAIT_ENV,
+            orbit_contracts::max_approval_wait_seconds()
+        ));
     }
     args.push("--env-file".into());
     args.push(env_file.display().to_string());
@@ -666,6 +672,11 @@ fn kubernetes_env(
             "name": "ORBIT_SINGLE_EXECUTION_ID",
             "value": execution_id.to_string()
         }));
+        // The in-pod broker enforces the same approval budget the Job deadline allows for.
+        env.push(json!({
+            "name": orbit_contracts::MAX_APPROVAL_WAIT_ENV,
+            "value": orbit_contracts::max_approval_wait_seconds().to_string()
+        }));
     }
     let mut data = BTreeMap::new();
     for (key, value) in docker_secret_env(request)? {
@@ -849,6 +860,7 @@ async fn launch_kubernetes(
                 "backoffLimit": 0,
                 "activeDeadlineSeconds": mapping::job_deadline_seconds(
                     request.timeout_seconds,
+                    orbit_contracts::max_approval_wait_seconds(),
                     default_job_deadline_seconds(),
                 ),
                 "template": {

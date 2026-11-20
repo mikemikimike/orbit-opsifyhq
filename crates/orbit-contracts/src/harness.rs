@@ -304,13 +304,39 @@ fn default_cancellation() -> tokio_util::sync::CancellationToken {
     tokio_util::sync::CancellationToken::new()
 }
 
+/// Environment variable (worker and launcher) that sets the approval budget.
+pub const MAX_APPROVAL_WAIT_ENV: &str = "ORBIT_MAX_APPROVAL_WAIT_SECONDS";
+
+/// Default approval budget: the most time, in total, a run may spend paused waiting for
+/// human approvals. Outer deadlines (Kubernetes Job, Docker dispatch backstop) are
+/// `timeout + approval budget + grace`.
+pub const DEFAULT_MAX_APPROVAL_WAIT_SECONDS: u64 = 3600;
+
+/// Parse an approval budget value; anything unset, unparsable or zero yields the default.
+pub fn parse_max_approval_wait_seconds(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_APPROVAL_WAIT_SECONDS)
+}
+
+/// The approval budget from `ORBIT_MAX_APPROVAL_WAIT_SECONDS` (default 3600 s).
+pub fn max_approval_wait_seconds() -> u64 {
+    parse_max_approval_wait_seconds(std::env::var(MAX_APPROVAL_WAIT_ENV).ok().as_deref())
+}
+
 /// Tracks how long an execution has been paused waiting for a human decision.
 ///
 /// Cheap to clone; all clones share one clock. Pauses may overlap (two tool calls
 /// waiting at once): the clock runs again only when every pause has ended.
+///
+/// An optional budget caps the cumulative paused time: once it is used up,
+/// [`PauseClock::deadline`] resolves (the run ends as timed out) and callers should stop
+/// granting new pauses (see [`PauseClock::remaining_budget`]).
 #[derive(Debug, Clone, Default)]
 pub struct PauseClock {
     inner: std::sync::Arc<std::sync::Mutex<PauseState>>,
+    budget: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Default)]
@@ -341,6 +367,26 @@ impl Drop for PauseGuard {
 }
 
 impl PauseClock {
+    /// A clock whose cumulative paused time is capped at `budget`.
+    pub fn with_budget(budget: std::time::Duration) -> Self {
+        Self {
+            inner: Default::default(),
+            budget: Some(budget),
+        }
+    }
+
+    /// Paused time still available, or `None` when the clock has no budget.
+    pub fn remaining_budget(&self) -> Option<std::time::Duration> {
+        self.budget
+            .map(|budget| budget.saturating_sub(self.total_paused()))
+    }
+
+    /// True once a budgeted clock has been paused for its whole budget.
+    pub fn budget_exhausted(&self) -> bool {
+        self.remaining_budget()
+            .is_some_and(|remaining| remaining.is_zero())
+    }
+
     /// Stop the run's clock until the returned guard is dropped.
     pub fn pause(&self) -> PauseGuard {
         let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -363,14 +409,15 @@ impl PauseClock {
         state.paused + state.since.map(|since| since.elapsed()).unwrap_or_default()
     }
 
-    /// Resolves once the run has been *active* (not paused) for `timeout`.
+    /// Resolves once the run has been *active* (not paused) for `timeout`, or once the
+    /// approval budget is used up.
     ///
     /// Use in place of `tokio::time::sleep(timeout)` when enforcing an execution timeout.
     pub async fn deadline(&self, timeout: std::time::Duration) {
         let started = std::time::Instant::now();
         loop {
             let active = started.elapsed().saturating_sub(self.total_paused());
-            if !self.is_paused() && active >= timeout {
+            if !self.is_paused() && (active >= timeout || self.budget_exhausted()) {
                 return;
             }
             // While paused there is nothing to count down; poll for the pause to end.
@@ -644,6 +691,43 @@ mod pause_clock_tests {
         waiter.await.unwrap();
         assert!(started.elapsed() >= std::time::Duration::from_millis(590));
         assert!(clock.total_paused() >= std::time::Duration::from_millis(390));
+    }
+
+    #[test]
+    fn approval_budget_parsing_defaults_and_overrides() {
+        use super::{parse_max_approval_wait_seconds as parse, DEFAULT_MAX_APPROVAL_WAIT_SECONDS};
+        assert_eq!(parse(None), DEFAULT_MAX_APPROVAL_WAIT_SECONDS);
+        assert_eq!(parse(Some("")), DEFAULT_MAX_APPROVAL_WAIT_SECONDS);
+        assert_eq!(parse(Some("abc")), DEFAULT_MAX_APPROVAL_WAIT_SECONDS);
+        assert_eq!(parse(Some("0")), DEFAULT_MAX_APPROVAL_WAIT_SECONDS);
+        assert_eq!(parse(Some(" 120 ")), 120);
+    }
+
+    #[test]
+    fn unbudgeted_clock_has_no_limit() {
+        let clock = super::PauseClock::default();
+        assert_eq!(clock.remaining_budget(), None);
+        assert!(!clock.budget_exhausted());
+    }
+
+    #[tokio::test]
+    async fn budget_counts_down_and_deadline_fires_when_exhausted() {
+        let clock = super::PauseClock::with_budget(std::time::Duration::from_millis(200));
+        assert!(!clock.budget_exhausted());
+        {
+            let _guard = clock.pause();
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            // Still paused: the budget is gone but the deadline waits for the pause to end.
+            assert!(clock.budget_exhausted());
+            assert_eq!(clock.remaining_budget(), Some(std::time::Duration::ZERO));
+        }
+        // A far-away timeout still resolves, because the budget is used up.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            clock.deadline(std::time::Duration::from_secs(3600)),
+        )
+        .await
+        .expect("deadline must fire once the approval budget is exhausted");
     }
 
     #[tokio::test]
