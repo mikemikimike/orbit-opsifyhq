@@ -187,8 +187,12 @@ harness tool call ──► worker broker /policy or /tools/call
 - The worker receives the effective rules in `WorkerExecutionContext.tool_policies` and
   starts the broker when rules exist even if the agent has no connector binding.
 - `POST /policy` on the loopback broker (bearer: execution-scoped broker token) is the
-  adapter hook for native tools: request `{ tool, capability?, effect?, connection?,
-  arguments }`, response is the decision with `ruleId`, `ruleName`, `reason`, `impact`.
+  adapter hook for native tools: request `{ tool, arguments, argumentsHash? }` (legacy
+  `capability`/`effect`/`connection` are ignored; the effect is derived from the tool name,
+  unknown tools count as `write`, and autonomy plus approval mode are applied through
+  `evaluate_capability`). The response is the decision with `ruleId`, `ruleName`, `reason`,
+  `impact` and `argumentsHash`, which the approval is bound to; a presented hash that does
+  not match the arguments is denied. See `docs/guide/tool-policies.md`.
   `require_approval` creates a durable approval and blocks until it is decided or its own
   15-minute window expires (the execution timeout is paused meanwhile); expiry and
   rejection deny the call. An action a person rejected is denied without a new approval
