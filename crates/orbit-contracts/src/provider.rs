@@ -13,6 +13,8 @@ use orbit_domain::{HarnessKind, ValidationReport};
 pub enum ProviderKind {
     /// Any endpoint implementing the OpenAI chat-completions shape.
     OpenAiCompatible,
+    /// Anthropic's native Messages API.
+    Anthropic,
     /// Provider inventory and credentials owned by the harness (OpenCode Go, Claude Code).
     HarnessManaged,
 }
@@ -21,6 +23,7 @@ impl ProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::OpenAiCompatible => "openai_compatible",
+            Self::Anthropic => "anthropic",
             Self::HarnessManaged => "harness_managed",
         }
     }
@@ -28,6 +31,7 @@ impl ProviderKind {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "openai_compatible" => Some(Self::OpenAiCompatible),
+            "anthropic" => Some(Self::Anthropic),
             "harness_managed" => Some(Self::HarnessManaged),
             _ => None,
         }
@@ -97,6 +101,33 @@ pub struct OpenAiCompatibleConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnthropicConfig {
+    #[serde(default = "default_anthropic_base_url")]
+    pub base_url: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+}
+
+fn default_anthropic_base_url() -> String {
+    "https://api.anthropic.com/v1".into()
+}
+
+/// Wire protocol a platform-resolved endpoint speaks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProtocol {
+    #[default]
+    OpenAiCompatible,
+    AnthropicMessages,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HarnessManagedConfig {
     pub harness: HarnessKind,
     /// Provider name as understood by the harness (e.g. `opencode-go`). Not validated
@@ -151,6 +182,27 @@ pub fn validate_provider_config(
                 Err(err) => {
                     report.push("config", format!("invalid OpenAI-compatible config: {err}"))
                 }
+            }
+        }
+        ProviderKind::Anthropic => {
+            match serde_json::from_value::<AnthropicConfig>(config.clone()) {
+                Ok(parsed) => {
+                    if !(parsed.base_url.starts_with("http://")
+                        || parsed.base_url.starts_with("https://"))
+                    {
+                        report.push("baseUrl", "must be an http(s) URL");
+                    }
+                    if parsed.base_url.ends_with('/') {
+                        report.push("baseUrl", "must not end with a slash");
+                    }
+                    if parsed.model.trim().is_empty() {
+                        report.push("model", "model id is required");
+                    }
+                    if parsed.context_window.is_some_and(|window| window < 128) {
+                        report.push("contextWindow", "must be >= 128");
+                    }
+                }
+                Err(err) => report.push("config", format!("invalid Anthropic config: {err}")),
             }
         }
         ProviderKind::HarnessManaged => {
@@ -231,6 +283,8 @@ pub struct ModelEndpoint {
     pub base_url: String,
     pub model: String,
     #[serde(default)]
+    pub protocol: ModelProtocol,
+    #[serde(default)]
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub request_params: serde_json::Value,
@@ -288,6 +342,27 @@ mod tests {
         });
         let report = validate_provider_config(ProviderKind::OpenAiCompatible, &config);
         assert!(report.is_valid(), "{report:?}");
+    }
+
+    #[test]
+    fn accepts_anthropic_native_provider() {
+        let config = serde_json::json!({
+            "baseUrl": "https://api.anthropic.com/v1",
+            "model": "claude-sonnet-4-5"
+        });
+        let report = validate_provider_config(ProviderKind::Anthropic, &config);
+        assert!(report.is_valid(), "{report:?}");
+        assert_eq!(
+            ProviderKind::parse("anthropic"),
+            Some(ProviderKind::Anthropic)
+        );
+    }
+
+    #[test]
+    fn anthropic_defaults_base_url_and_requires_model() {
+        let report =
+            validate_provider_config(ProviderKind::Anthropic, &serde_json::json!({ "model": "" }));
+        assert!(!report.is_valid());
     }
 
     #[test]

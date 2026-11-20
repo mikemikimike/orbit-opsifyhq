@@ -15,6 +15,18 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   instead of "saved" (#197). `PUT /api/v1/settings/oidc` now merges: absent fields keep
   their stored value. The form loads via a query (no fetch during render), sends the full
   loaded object with its edits, and reports load errors with a retry.
+
+## [0.23.0] - 2026-11-20
+
+### Changed
+
+- Execution detail pages can approve or reject a pending tool call inline, with the exact
+  action details, instead of navigating to Approvals first.
+- Approvals are one click: the card's Approve/Reject buttons decide immediately and show a
+  per-button loading state. The redundant confirmation dialog was removed.
+
+### Fixed
+
 - Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval
   mode when no tool-policy rule matches. L4/Auto no longer asks for every call; L3/Auto
   still requires approval and L1/L2 still deny writes. Explicit rules can only tighten

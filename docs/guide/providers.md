@@ -1,11 +1,34 @@
 # Providers and models
 
-ORBIT supports two provider kinds:
+ORBIT supports three provider kinds:
 
 | Kind | Auth | Use |
 |---|---|---|
 | `openai_compatible` | ORBIT stores an encrypted credential and injects it into the harness | vLLM, LiteLLM, gateways, OpenRouter-style endpoints |
+| `anthropic` | ORBIT stores an encrypted Anthropic API key | Native Anthropic Messages API (`/v1/messages`) |
 | `harness_managed` | The harness owns credentials (e.g. `opencode auth export`) | Provider inventories managed by OpenCode/Pi |
+
+`anthropic` is resolved to the native Anthropic protocol: OpenCode uses
+`@ai-sdk/anthropic` and Pi uses `anthropic-messages`. The base URL defaults to
+`https://api.anthropic.com/v1`; model discovery probes `/models` with `x-api-key` and
+`anthropic-version`. The key is still encrypted, write-only and sent only to that base URL.
+
+## Known OpenAI-compatible endpoints
+
+These providers expose an OpenAI-compatible API and need no extra ORBIT adapter. Use the
+Models page presets or enter the base URL directly:
+
+| Provider | Base URL | Credential |
+|---|---|---|
+| OpenRouter | `https://openrouter.ai/api/v1` | OpenRouter API key |
+| DeepSeek | `https://api.deepseek.com` | DeepSeek API key |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | Gemini API key |
+| Azure OpenAI (v1) | `https://<resource>.openai.azure.com/openai/v1` | Azure OpenAI key |
+| Anthropic (native Messages API) | `https://api.anthropic.com/v1` | Anthropic API key, kind `anthropic` |
+
+Model ids are not bundled: use the provider's `/models` discovery or type the id. Azure
+v1 accepts the key as a bearer token; do not use the legacy deployment-specific URL unless
+you know your provider endpoint expects it.
 
 ## Models
 
