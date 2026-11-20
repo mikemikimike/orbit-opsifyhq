@@ -8,6 +8,13 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ## [Unreleased]
 
+### Changed
+
+- Execution detail pages can approve or reject a pending tool call inline, with the exact
+  action details, instead of navigating to Approvals first.
+- Approvals are one click: the card's Approve/Reject buttons decide immediately and show a
+  per-button loading state. The redundant confirmation dialog was removed.
+
 ### Tests
 
 - Restored 41 regression tests that were dropped while integrating PRs #145-#183: team run
@@ -15,6 +22,7 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   (#44), execution preflight (#140), error envelope (#123), SQL list visibility (#122),
   runtime continue-after-failure (#150), credential exposure (#142), org-scoped secret
   resolution (#144) and launcher pod naming (#106) (#191).
+
 
 ### Fixed
 
