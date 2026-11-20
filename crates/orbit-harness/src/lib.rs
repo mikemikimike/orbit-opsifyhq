@@ -9,6 +9,7 @@ pub mod opencode;
 pub mod paths;
 pub mod pi;
 pub mod planned;
+mod process_env;
 pub mod registry;
 pub mod testing;
 
