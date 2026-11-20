@@ -33,6 +33,13 @@ Codes: `bad_request`, `validation_error`, `unauthorized`, `forbidden`, `not_foun
 endpoints additionally return `launcher_unavailable`, `launcher_error` and
 `launch_failed`.
 
+The envelope is enforced centrally: a middleware in `orbit-api` rewrites any 4xx/5xx
+response that is not already JSON (malformed path/query parameters, unknown routes,
+`method_not_allowed`, `payload_too_large`, `unsupported_media_type`, ...) into the envelope,
+keeping headers such as `Allow`. Successful responses, SSE streams, `HEAD` responses and the
+Swagger UI (`/docs`) are never rewritten. Settings updates (`PUT /api/v1/settings/*`) are
+validated with field-level `details` and recorded in the audit log.
+
 ## Resources
 
 | Method & path | Purpose |

@@ -420,6 +420,9 @@ pub fn build_router(state: AppState) -> Router {
         .merge(public)
         .merge(worker)
         .merge(protected)
+        .fallback(crate::error::not_found_fallback)
+        // Inside `instrument` so the request id is available to the envelope.
+        .layer(middleware::from_fn(crate::error::envelope_rejections))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::request_id::instrument,

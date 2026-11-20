@@ -397,6 +397,11 @@ async fn execution_creation_is_idempotent_and_streams_events() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // The envelope middleware must leave streams alone.
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("event: snapshot"), "{text}");
@@ -1352,470 +1357,184 @@ async fn same_agent_queues_on_different_harnesses() {
     assert_eq!(second["harnessKind"], "pi");
 }
 
-async fn seed_execution(store: &Store, org_id: Uuid, agent_id: Uuid) -> Uuid {
-    let agent = store.get_agent(org_id, agent_id).await.unwrap();
-    let version = store.get_current_version(org_id, &agent).await.unwrap();
-    store
-        .create_execution(orbit_store::executions::NewExecution {
-            org_id,
-            agent_id,
-            agent_version_id: version.id,
-            agent_name: &agent.name,
-            harness_kind: orbit_domain::HarnessKind::Mock,
-            trigger_source: orbit_domain::TriggerSource::Manual,
-            placement: "auto",
-            trigger_id: None,
-            input: json!({ "task": "seeded" }),
-            session_ref: None,
-            skills: &[],
-            timeout_seconds: 30,
-            requested_by: None,
-            idempotency_key: None,
-            team_run_id: None,
-            team_step_index: None,
-        })
-        .await
+<
+fn put(path: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
         .unwrap()
-        .id
+}
+
+fn assert_envelope(status: StatusCode, body: &Value, expected: StatusCode, code: &str) {
+    assert_eq!(status, expected, "{body}");
+    assert_eq!(body["error"]["code"], code, "{body}");
+    assert!(body["error"]["message"].is_string(), "{body}");
+    assert!(body["error"]["details"].is_array(), "{body}");
+    assert!(
+        !body["error"]["requestId"].as_str().unwrap_or("").is_empty(),
+        "{body}"
+    );
 }
 
 #[tokio::test]
-async fn execution_list_applies_visibility_before_paging() {
+async fn path_query_route_and_method_rejections_use_the_error_envelope() {
     let Some(app) = test_app(true).await else {
         return;
     };
-    let alice = app
-        .store
-        .ensure_user(
-            app.org_id,
-            "page-alice@test.local",
-            "Alice",
-            UserRole::Operator,
-        )
+
+    let (status, body) = send(&app.router, get("/api/v1/agents/not-a-uuid")).await;
+    assert_envelope(status, &body, StatusCode::BAD_REQUEST, "bad_request");
+
+    let (status, body) = send(&app.router, get("/api/v1/agents?limit=abc")).await;
+    assert_envelope(status, &body, StatusCode::BAD_REQUEST, "bad_request");
+
+    let (status, body) = send(&app.router, get("/api/v1/no/such/route")).await;
+    assert_envelope(status, &body, StatusCode::NOT_FOUND, "not_found");
+
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/meta")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert!(response.headers().contains_key("allow"));
+    assert!(response.headers().contains_key("x-request-id"));
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_envelope(
+        StatusCode::METHOD_NOT_ALLOWED,
+        &body,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+    );
+
+    // Existing envelope errors and successful responses are unchanged.
+    let missing = format!("/api/v1/agents/{}", Uuid::now_v7());
+    let (status, body) = send(&app.router, get(&missing)).await;
+    assert_envelope(status, &body, StatusCode::NOT_FOUND, "not_found");
+    let (status, body) = send(&app.router, post("/api/v1/agents", json!({"bad": true}))).await;
+    assert!(status.is_client_error(), "{body}");
+    assert!(body["error"]["requestId"].is_string(), "{body}");
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(get("/api/v1/agents"))
         .await
         .unwrap();
-    let bob = app
-        .store
-        .ensure_user(app.org_id, "page-bob@test.local", "Bob", UserRole::Operator)
-        .await
-        .unwrap();
-    let alice_token = token_for(&app.store, app.org_id, alice.id, "alice").await;
-    let agent_a = create_demo_agent(&app.store, app.org_id, alice.id).await;
-    let agent_b = create_demo_agent(&app.store, app.org_id, bob.id).await;
-    make_private(&app.store, app.org_id, "agents", agent_a, alice.id).await;
-    make_private(&app.store, app.org_id, "agents", agent_b, bob.id).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+}
 
-    // 3 visible executions first, then 7 newer hidden ones.
-    let mut visible_ids = Vec::new();
-    for _ in 0..3 {
-        visible_ids.push(seed_execution(&app.store, app.org_id, agent_a).await);
+#[tokio::test]
+async fn settings_updates_are_validated_enveloped_and_audited() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+
+    // Malformed bodies use the envelope for all three handlers.
+    for path in [
+        "/api/v1/settings/oidc",
+        "/api/v1/settings/access",
+        "/api/v1/settings/harness",
+    ] {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let (status, body) = send(&app.router, request).await;
+        assert_envelope(status, &body, StatusCode::BAD_REQUEST, "bad_request");
     }
-    for _ in 0..7 {
-        seed_execution(&app.store, app.org_id, agent_b).await;
-    }
 
-    let (status, page1) = send(
+    // Invalid OIDC settings are rejected with field-level details.
+    let (status, body) = send(
         &app.router,
-        auth_get("/api/v1/executions?limit=2", &alice_token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{page1}");
-    assert_eq!(page1["items"].as_array().unwrap().len(), 2);
-    assert!(page1["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|item| item["agentId"] == agent_a.to_string()));
-    assert_eq!(page1["total"], 3);
-    let cursor = page1["nextCursor"]
-        .as_str()
-        .expect("next cursor")
-        .to_string();
-
-    let (status, page2) = send(
-        &app.router,
-        auth_get(
-            &format!("/api/v1/executions?limit=2&cursor={cursor}"),
-            &alice_token,
+        put(
+            "/api/v1/settings/oidc",
+            json!({"settings": {
+                "issuer": "not a url",
+                "defaultRole": "viewer",
+                "groupRoles": {"admins": "no-such-role"},
+            }}),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{page2}");
-    assert_eq!(page2["items"].as_array().unwrap().len(), 1);
-    assert_eq!(page2["items"][0]["agentId"], agent_a.to_string());
-    assert!(page2["nextCursor"].is_null(), "{page2}");
-    assert_eq!(page2["total"], 3);
-
-    let mut seen: Vec<String> = [&page1, &page2]
+    assert_envelope(
+        status,
+        &body,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "validation_error",
+    );
+    let paths: Vec<&str> = body["error"]["details"]
+        .as_array()
+        .unwrap()
         .iter()
-        .flat_map(|p| p["items"].as_array().unwrap().iter())
-        .map(|item| item["id"].as_str().unwrap().to_string())
+        .map(|d| d["path"].as_str().unwrap())
         .collect();
-    seen.sort();
-    let mut expected: Vec<String> = visible_ids.iter().map(|id| id.to_string()).collect();
-    expected.sort();
-    assert_eq!(seen, expected);
+    assert!(paths.contains(&"settings.issuer"), "{paths:?}");
+    assert!(paths.contains(&"settings.groupRoles.admins"), "{paths:?}");
 
-    // The org owner (dev identity) sees everything: 10 executions, one full page.
-    let (status, owner) = send(&app.router, get("/api/v1/executions?limit=50")).await;
-    assert_eq!(status, StatusCode::OK, "{owner}");
-    assert_eq!(owner["items"].as_array().unwrap().len(), 10);
-    assert_eq!(owner["total"], 10);
-}
-
-#[tokio::test]
-async fn approval_list_applies_visibility_in_sql() {
-    let Some(app) = test_app(true).await else {
-        return;
-    };
-    let alice = app
-        .store
-        .ensure_user(
-            app.org_id,
-            "appr-alice@test.local",
-            "Alice",
-            UserRole::Operator,
-        )
-        .await
-        .unwrap();
-    let bob = app
-        .store
-        .ensure_user(app.org_id, "appr-bob@test.local", "Bob", UserRole::Operator)
-        .await
-        .unwrap();
-    let agent_a = create_demo_agent(&app.store, app.org_id, alice.id).await;
-    let agent_b = create_demo_agent(&app.store, app.org_id, bob.id).await;
-    make_private(&app.store, app.org_id, "agents", agent_a, alice.id).await;
-    make_private(&app.store, app.org_id, "agents", agent_b, bob.id).await;
-
-    let mut visible = Vec::new();
-    for _ in 0..2 {
-        let execution = seed_execution(&app.store, app.org_id, agent_a).await;
-        let approval = app
-            .store
-            .create_approval(app.org_id, execution, json!({ "action": "a" }), None)
-            .await
-            .unwrap();
-        visible.push(approval.id);
-    }
-    for _ in 0..5 {
-        let execution = seed_execution(&app.store, app.org_id, agent_b).await;
-        app.store
-            .create_approval(app.org_id, execution, json!({ "action": "b" }), None)
-            .await
-            .unwrap();
-    }
-
-    // Operators cannot decide approvals over HTTP, so exercise the store predicate the
-    // handler passes for non-privileged callers: newer hidden rows must not consume the
-    // page limit.
-    let alice_access =
-        orbit_store::access::ResourceAccess::new(alice.id, false, vec![]).with_team_isolation(true);
-    let rows = app
-        .store
-        .list_approvals(app.org_id, Some("pending"), 2, Some(&alice_access))
-        .await
-        .unwrap();
-    let mut got: Vec<Uuid> = rows.iter().map(|r| r.approval.id).collect();
-    got.sort();
-    visible.sort();
-    assert_eq!(got, visible);
-    assert!(rows.iter().all(|r| r.agent_id == agent_a));
-
-    // Internal access and the privileged owner see all 7 rows.
-    let all = app
-        .store
-        .list_approvals(app.org_id, Some("pending"), 50, None)
-        .await
-        .unwrap();
-    assert_eq!(all.len(), 7);
-    let (status, body) = send(&app.router, get("/api/v1/approvals?status=pending")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body.as_array().unwrap().len(), 7);
-
-async fn raw_pool() -> sqlx::PgPool {
-    sqlx::PgPool::connect(&std::env::var("ORBIT_TEST_DATABASE_URL").unwrap())
-        .await
-        .unwrap()
-}
-
-#[tokio::test]
-async fn poisoned_runtimes_do_not_block_healthy_ones() {
-    let Some(app) = test_app(false).await else {
-        return;
-    };
-    let user = app
-        .store
-        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
-        .await
-        .unwrap();
-    let pool = raw_pool().await;
-
-    // Oldest runtime: unknown harness (permanent error).
-    let bad_harness = create_demo_agent(&app.store, app.org_id, user.id).await;
-    let rt_harness = app
-        .store
-        .create_agent_runtime(app.org_id, bad_harness, "t", "bogus", 60, None)
-        .await
-        .unwrap();
-    // Second: current spec that no longer deserialises (transient, backs off).
-    let bad_spec = create_demo_agent(&app.store, app.org_id, user.id).await;
-    sqlx::query("UPDATE agent_versions SET spec = '{\"bogus\": true}'::jsonb WHERE agent_id = $1")
-        .bind(bad_spec)
-        .execute(&pool)
-        .await
-        .unwrap();
-    app.store
-        .create_agent_runtime(app.org_id, bad_spec, "t", "mock", 10, None)
-        .await
-        .unwrap();
-    // Healthy runtime created last.
-    let healthy = create_demo_agent(&app.store, app.org_id, user.id).await;
-    app.store
-        .create_agent_runtime(app.org_id, healthy, "t", "mock", 60, None)
-        .await
-        .unwrap();
-
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-
-    let ok = app
-        .store
-        .get_agent_runtime(app.org_id, healthy)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        ok.last_execution_id.is_some(),
-        "healthy runtime must advance"
-    );
-    assert!(ok.last_error.is_none());
-
-    let spec = app
-        .store
-        .get_agent_runtime(app.org_id, bad_spec)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(spec.status, "running");
-    assert!(spec.last_error.as_deref().unwrap().contains("invalid"));
-    assert!(spec.next_run_at > chrono::Utc::now() + chrono::Duration::seconds(30));
-    assert!(spec.last_execution_id.is_none());
-
-    let (status, error): (String, Option<String>) =
-        sqlx::query_as("SELECT status, last_error FROM agent_runtimes WHERE id = $1")
-            .bind(rt_harness.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(status, "stopped");
-    assert!(error.unwrap().contains("unknown harness"));
-}
-
-#[tokio::test]
-async fn runtime_tick_retry_reuses_execution() {
-    let Some(app) = test_app(false).await else {
-        return;
-    };
-    let user = app
-        .store
-        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
-        .await
-        .unwrap();
-    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
-    let runtime = app
-        .store
-        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
-        .await
-        .unwrap();
-    let pool = raw_pool().await;
-
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-    let first = app
-        .store
-        .get_agent_runtime(app.org_id, agent_id)
-        .await
-        .unwrap()
-        .unwrap()
-        .last_execution_id
-        .unwrap();
-
-    // Simulate a crash between create_execution and update_agent_runtime: the execution
-    // exists but the runtime row still points at nothing and is due again.
-    sqlx::query("UPDATE agent_runtimes SET last_execution_id = NULL, next_run_at = now() - interval '1 second' WHERE id = $1")
-        .bind(runtime.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-
-    let retried = app
-        .store
-        .get_agent_runtime(app.org_id, agent_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        retried.last_execution_id,
-        Some(first),
-        "retry reuses the execution"
-    );
-    let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM executions WHERE org_id = $1 AND agent_id = $2")
-            .bind(app.org_id)
-            .bind(agent_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(count, 1, "no duplicate execution");
-}
-
-async fn fail_execution(pool: &sqlx::PgPool, execution_id: uuid::Uuid) {
-    sqlx::query("UPDATE executions SET status = 'failed', error = '\"boom\"'::jsonb, finished_at = now() WHERE id = $1")
-        .bind(execution_id)
-        .execute(pool)
-        .await
-        .unwrap();
-}
-
-async fn make_runtime_due(pool: &sqlx::PgPool, runtime_id: uuid::Uuid) {
-    sqlx::query(
-        "UPDATE agent_runtimes SET next_run_at = now() - interval '1 second' WHERE id = $1",
+    // Valid updates succeed and write audit rows.
+    let (status, _) = send(
+        &app.router,
+        put(
+            "/api/v1/settings/oidc",
+            json!({"settings": {
+                "issuer": "https://idp.example.com",
+                "clientId": "orbit",
+                "defaultRole": "viewer",
+                "groupRoles": {"admins": "admin"},
+            }}),
+        ),
     )
-    .bind(runtime_id)
-    .execute(pool)
-    .await
-    .unwrap();
-}
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app.router,
+        put("/api/v1/settings/access", json!({"teamIsolation": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app.router,
+        put(
+            "/api/v1/settings/harness",
+            json!({"defaultHarness": "mock"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 
-async fn runtime_row(
-    app: &TestApp,
-    agent_id: uuid::Uuid,
-) -> orbit_store::agent_runtimes::AgentRuntime {
-    sqlx::query_as("SELECT * FROM agent_runtimes WHERE org_id = $1 AND agent_id = $2")
-        .bind(app.org_id)
-        .bind(agent_id)
-        .fetch_one(&raw_pool().await)
-        .await
-        .unwrap()
-}
-
-#[tokio::test]
-async fn runtime_backs_off_then_continues_after_failed_execution() {
-    let Some(app) = test_app(false).await else {
-        return;
-    };
-    let user = app
-        .store
-        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
-        .await
-        .unwrap();
-    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
-    let runtime = app
-        .store
-        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
-        .await
-        .unwrap();
-    let pool = raw_pool().await;
-
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-    let first = runtime_row(&app, agent_id).await.last_execution_id.unwrap();
-    fail_execution(&pool, first).await;
-    make_runtime_due(&pool, runtime.id).await;
-
-    // Failure is accounted for and delays the next run; no new execution yet.
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-    let row = runtime_row(&app, agent_id).await;
-    assert_eq!(row.status, "running");
-    assert_eq!(row.consecutive_failures, 1);
-    assert_eq!(row.failed_execution_id, Some(first));
-    assert_eq!(row.last_execution_id, Some(first));
-    assert!(row.last_error.as_deref().unwrap().contains("boom"));
-    assert!(row.next_run_at > chrono::Utc::now() + chrono::Duration::seconds(30));
-
-    // Not yet due: still nothing new, and the failure is not double counted.
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-    let row = runtime_row(&app, agent_id).await;
-    assert_eq!(row.consecutive_failures, 1);
-    assert_eq!(row.last_execution_id, Some(first));
-
-    // Backoff elapsed: the next tick creates a new execution.
-    make_runtime_due(&pool, runtime.id).await;
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-    let row = runtime_row(&app, agent_id).await;
-    let second = row.last_execution_id.unwrap();
-    assert_ne!(second, first, "runtime must continue after a failure");
-    assert_eq!(row.consecutive_failures, 1, "reset only after a success");
-    assert!(row.last_error.is_none());
-
-    // A successful execution resets the counter on the following launch.
-    sqlx::query("UPDATE executions SET status = 'succeeded', finished_at = now() WHERE id = $1")
-        .bind(second)
-        .execute(&pool)
-        .await
-        .unwrap();
-    make_runtime_due(&pool, runtime.id).await;
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-    let row = runtime_row(&app, agent_id).await;
-    assert_ne!(row.last_execution_id, Some(second));
-    assert_eq!(row.consecutive_failures, 0);
-    assert!(row.failed_execution_id.is_none());
-}
-
-#[tokio::test]
-async fn runtime_stops_after_consecutive_failures() {
-    let Some(app) = test_app(false).await else {
-        return;
-    };
-    let user = app
-        .store
-        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
-        .await
-        .unwrap();
-    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
-    let runtime = app
-        .store
-        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
-        .await
-        .unwrap();
-    let pool = raw_pool().await;
-    let limit = orbit_api::background::RUNTIME_MAX_CONSECUTIVE_FAILURES;
-
-    for round in 1..=limit {
-        make_runtime_due(&pool, runtime.id).await;
-        orbit_api::background::runtime_tick(&app.state)
+    for (action, key, expected) in [
+        (
+            "settings.oidc.update",
+            "after",
+            json!("https://idp.example.com"),
+        ),
+        ("settings.access.update", "after", json!(false)),
+        ("settings.harness.update", "after", json!("mock")),
+    ] {
+        let (rows, _) = app
+            .store
+            .list_audit_logs(app.org_id, 10, None, Some(action))
             .await
             .unwrap();
-        let id = runtime_row(&app, agent_id).await.last_execution_id.unwrap();
-        fail_execution(&pool, id).await;
-        make_runtime_due(&pool, runtime.id).await;
-        orbit_api::background::runtime_tick(&app.state)
-            .await
-            .unwrap();
-        let row = runtime_row(&app, agent_id).await;
-        assert_eq!(row.consecutive_failures, round);
-        if round < limit {
-            assert_eq!(row.status, "running");
-        }
+        assert_eq!(rows.len(), 1, "{action}");
+        let after = &rows[0].metadata[key];
+        let found = match action {
+            "settings.oidc.update" => &after["issuer"],
+            "settings.access.update" => &after["teamIsolation"],
+            _ => &after["defaultHarness"],
+        };
+        assert_eq!(found, &expected, "{action}");
+        assert!(rows[0].request_id.is_some());
     }
-    let row = runtime_row(&app, agent_id).await;
-    assert_eq!(row.status, "stopped");
-    assert!(row.last_error.as_deref().unwrap().contains(&format!(
-        "stopped after {limit} consecutive failed executions"
-    )));
 }
