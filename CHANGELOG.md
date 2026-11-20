@@ -8,6 +8,14 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval
+  mode when no tool-policy rule matches. L4/Auto no longer asks for every call; L3/Auto
+  still requires approval and L1/L2 still deny writes. Explicit rules can only tighten
+  this decision.
+
+
 ### Security
 
 - Creating a trigger now requires **use** on the target agent and use of every connection

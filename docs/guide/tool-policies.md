@@ -53,9 +53,10 @@ resolved). Use harness sandboxing and the autonomy level for hard guarantees.
 ## Precedence
 
 Platform deny → rule deny → require_approval → allow. An `allow` rule cannot bypass a
-platform approval or denial. Native harness tools (no connector capability) default to
-`require_approval`; an explicit `allow` rule can make a specific safe call unattended,
-but never below the autonomy / approval-mode floor.
+platform approval or denial. With no matching rule, the platform autonomy/approval
+decision is the default. Native harness tools therefore run unattended at L4/Auto,
+require approval at L3/Auto and are denied for writes at L1/L2. Add an explicit
+`require_approval` rule to make a native tool ask again at L4.
 
 ## Enforcement
 
