@@ -416,7 +416,7 @@ pub struct WorkerMemoryEntry {
 impl WorkerClient {
     pub async fn list_memory(
         &self,
-        _execution_id: uuid::Uuid,
+        execution_id: uuid::Uuid,
         agent_id: uuid::Uuid,
         _retention_days: Option<u32>,
     ) -> anyhow::Result<Vec<WorkerMemoryEntry>> {
@@ -424,7 +424,7 @@ impl WorkerClient {
             .http
             .post(format!("{}/api/v1/worker/memory/list", self.base_url))
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({ "agentId": agent_id }))
+            .json(&serde_json::json!({ "executionId": execution_id, "agentId": agent_id }))
             .send()
             .await?;
         if !response.status().is_success() {
@@ -435,6 +435,7 @@ impl WorkerClient {
 
     pub async fn store_memory(
         &self,
+        execution_id: uuid::Uuid,
         agent_id: uuid::Uuid,
         kind: &str,
         content: &str,
@@ -444,6 +445,7 @@ impl WorkerClient {
             .post(format!("{}/api/v1/worker/memory/store", self.base_url))
             .bearer_auth(&self.token)
             .json(&serde_json::json!({
+                "executionId": execution_id,
                 "agentId": agent_id,
                 "kind": kind,
                 "content": content,

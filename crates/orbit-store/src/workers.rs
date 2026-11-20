@@ -16,39 +16,61 @@ pub struct WorkerHeartbeat {
 }
 
 impl Store {
+    /// Record a heartbeat. The row is owned by the first token that reports a worker id;
+    /// another token (or org) cannot overwrite it. Returns `false` when the worker id
+    /// belongs to someone else. Pre-binding rows (NULL owner) are adopted.
     pub async fn upsert_worker_heartbeat(
         &self,
+        org_id: Uuid,
+        token_id: Uuid,
         worker_id: &str,
         harnesses: &[String],
         target: &str,
         hostname: Option<&str>,
-    ) -> StoreResult<()> {
-        sqlx::query(
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
             r#"
-            INSERT INTO worker_heartbeats (worker_id, harnesses, target, hostname, last_heartbeat_at)
-            VALUES ($1, $2, $3, $4, now())
+            INSERT INTO worker_heartbeats
+                (worker_id, harnesses, target, hostname, last_heartbeat_at, org_id, token_id)
+            VALUES ($1, $2, $3, $4, now(), $5, $6)
             ON CONFLICT (worker_id) DO UPDATE SET
                 harnesses = EXCLUDED.harnesses,
                 target = EXCLUDED.target,
                 hostname = COALESCE(EXCLUDED.hostname, worker_heartbeats.hostname),
-                last_heartbeat_at = now()
+                last_heartbeat_at = now(),
+                org_id = EXCLUDED.org_id,
+                token_id = EXCLUDED.token_id
+            WHERE worker_heartbeats.token_id IS NULL
+               OR worker_heartbeats.token_id = EXCLUDED.token_id
             "#,
         )
         .bind(worker_id)
         .bind(harnesses)
         .bind(target)
         .bind(hostname)
+        .bind(org_id)
+        .bind(token_id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
-    pub async fn delete_worker_heartbeat(&self, worker_id: &str) -> StoreResult<()> {
-        sqlx::query("DELETE FROM worker_heartbeats WHERE worker_id = $1")
-            .bind(worker_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    /// Delete a worker record, only if the calling token owns it.
+    pub async fn delete_worker_heartbeat(
+        &self,
+        org_id: Uuid,
+        token_id: Uuid,
+        worker_id: &str,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "DELETE FROM worker_heartbeats WHERE worker_id = $1 AND org_id = $2 AND token_id = $3",
+        )
+        .bind(worker_id)
+        .bind(org_id)
+        .bind(token_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn worker_heartbeat_age_seconds(&self, worker_id: &str) -> StoreResult<Option<i64>> {
@@ -247,10 +269,11 @@ impl Store {
         Ok(rows)
     }
 
-    pub async fn list_worker_heartbeats(&self) -> StoreResult<Vec<WorkerHeartbeat>> {
+    pub async fn list_worker_heartbeats(&self, org_id: Uuid) -> StoreResult<Vec<WorkerHeartbeat>> {
         Ok(sqlx::query_as::<_, WorkerHeartbeat>(
-            "SELECT * FROM worker_heartbeats ORDER BY last_heartbeat_at DESC",
+            "SELECT * FROM worker_heartbeats WHERE org_id = $1 ORDER BY last_heartbeat_at DESC",
         )
+        .bind(org_id)
         .fetch_all(&self.pool)
         .await?)
     }

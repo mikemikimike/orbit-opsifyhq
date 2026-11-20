@@ -39,7 +39,7 @@ pub struct PiSettings {
     /// Additional `--skill` directories/files. Skills are mounted/baked by the worker.
     pub skills: Vec<String>,
     pub extra_args: Vec<String>,
-    /// Optional persistent session directory (enables resume across executions).
+    /// Optional session directory, relative to (and confined to) the execution workspace.
     pub session_dir: Option<String>,
     pub debug_logs: Option<bool>,
     /// Execution-scoped MCP bridge injected by the worker's tool broker.
@@ -247,7 +247,7 @@ impl PiHarnessAdapter {
                     "thinking": { "type": "string", "enum": ["off","minimal","low","medium","high","xhigh","max"] },
                     "skills": { "type": "array", "items": { "type": "string" }, "description": "Skill directories or files passed with --skill" },
                     "extraArgs": { "type": "array", "items": { "type": "string" } },
-                    "sessionDir": { "type": "string", "description": "Persistent directory for session files (resume)" },
+                    "sessionDir": { "type": "string", "description": "Session file directory, relative to the execution workspace (no absolute paths or '..')" },
                     "debugLogs": { "type": "boolean" }
                 }
             }),
@@ -498,16 +498,23 @@ impl PiHarnessAdapter {
                 format!("could not create workspace {}: {e}", workspace.display()),
             )
         })?;
+        // `sessionDir` is agent-author input: it is relative to the execution workspace
+        // and confined to it (no absolute paths, `..` or symlink escapes).
         let session_dir = match &settings.session_dir {
-            Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-            _ => workspace.join(".pi-sessions"),
+            Some(dir) if !dir.trim().is_empty() => {
+                crate::paths::resolve_confined_dir(&workspace, dir).await?
+            }
+            _ => {
+                let default = workspace.join(".pi-sessions");
+                tokio::fs::create_dir_all(&default).await.map_err(|e| {
+                    HarnessError::new(
+                        HarnessErrorKind::Internal,
+                        format!("could not create Pi session dir: {e}"),
+                    )
+                })?;
+                default
+            }
         };
-        tokio::fs::create_dir_all(&session_dir).await.map_err(|e| {
-            HarnessError::new(
-                HarnessErrorKind::Internal,
-                format!("could not create Pi session dir: {e}"),
-            )
-        })?;
 
         if let Some(bridge) = &settings.orbit_mcp {
             write_pi_mcp_config(&workspace, bridge).map_err(|e| {
@@ -791,6 +798,11 @@ impl HarnessAdapter for PiHarnessAdapter {
                 if settings.extra_args.len() > 32 {
                     report.push("extraArgs", "at most 32 arguments");
                 }
+                if let Some(dir) = &settings.session_dir {
+                    if let Err(message) = crate::paths::validate_relative_subpath(dir) {
+                        report.push("sessionDir", message);
+                    }
+                }
                 if let Some(thinking) = &settings.thinking {
                     if !["off", "minimal", "low", "medium", "high", "xhigh", "max"]
                         .contains(&thinking.as_str())
@@ -893,6 +905,30 @@ impl HarnessAdapter for PiHarnessAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn validate_config_rejects_escaping_session_dir() {
+        let adapter = PiHarnessAdapter;
+        for bad in ["/var/lib/other", "../other-execution/.pi", "x/../../y"] {
+            let report = adapter
+                .validate_config(&HarnessConfig {
+                    kind: HarnessKind::Pi,
+                    settings: serde_json::json!({ "sessionDir": bad }),
+                })
+                .await;
+            assert!(
+                report.issues.iter().any(|i| i.path == "sessionDir"),
+                "{bad} accepted"
+            );
+        }
+        let ok = adapter
+            .validate_config(&HarnessConfig {
+                kind: HarnessKind::Pi,
+                settings: serde_json::json!({ "sessionDir": ".sessions/a" }),
+            })
+            .await;
+        assert!(ok.issues.iter().all(|i| i.path != "sessionDir"));
+    }
 
     #[test]
     fn cli_restricts_low_autonomy_to_read_only_tools() {

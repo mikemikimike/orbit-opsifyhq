@@ -308,7 +308,15 @@ pub async fn offline(
     Path(worker_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let _ = active_profile(&state, &auth).await?;
-    state.store.delete_worker_heartbeat(&worker_id).await?;
+    // Only the token that owns the worker record may remove it; anything else looks
+    // like a missing worker.
+    let removed = state
+        .store
+        .delete_worker_heartbeat(auth.org_id, auth.token_id, &worker_id)
+        .await?;
+    if !removed {
+        return Err(ApiError::not_found("worker"));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -319,15 +327,22 @@ pub async fn heartbeat(
 ) -> Result<StatusCode, ApiError> {
     let _ = active_profile(&state, &auth).await?;
     let harnesses = intersect_harnesses(&auth, &body.harnesses);
-    state
+    let accepted = state
         .store
         .upsert_worker_heartbeat(
+            auth.org_id,
+            auth.token_id,
             &body.worker_id,
             &harnesses,
             &body.target,
             body.hostname.as_deref(),
         )
         .await?;
+    if !accepted {
+        return Err(ApiError::conflict(
+            "worker id is already registered by another worker token",
+        ));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -357,6 +372,7 @@ pub async fn claim(
             &body.target,
             &agent_ids,
             profile.as_ref().and_then(|profile| profile.owner_team_id),
+            Some(auth.token_id),
         )
         .await?
     {
@@ -927,6 +943,16 @@ async fn ensure_execution(
     if execution.org_id != auth.org_id {
         return Err(ApiError::not_found("execution"));
     }
+    // Bind to the claiming worker. The claim records the token that took the execution;
+    // any other token (even of the same org/profile team) sees it as nonexistent.
+    // Rows claimed before token binding existed (NULL token, worker id set) stay
+    // reachable by org/profile scope so in-flight runs survive an upgrade.
+    match state.store.execution_worker_token(execution_id).await? {
+        Some(bound) if bound != auth.token_id => return Err(ApiError::not_found("execution")),
+        Some(_) => {}
+        None if execution.worker_id.is_none() => return Err(ApiError::not_found("execution")),
+        None => {}
+    }
     if let Some(profile) = active_profile(state, auth).await? {
         if profile.agent_scope == "selected"
             && !profile.agent_ids.is_empty()
@@ -1163,9 +1189,14 @@ pub struct MemoryEntry {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Largest memory entry a worker may store.
+pub const MAX_MEMORY_CONTENT_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListMemoryRequest {
+    pub execution_id: uuid::Uuid,
+    /// Accepted for backward compatibility; must match the execution's agent if sent.
     #[serde(default)]
     pub agent_id: Option<uuid::Uuid>,
     #[serde(default)]
@@ -1175,11 +1206,30 @@ pub struct ListMemoryRequest {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreMemoryRequest {
-    pub agent_id: uuid::Uuid,
+    pub execution_id: uuid::Uuid,
+    /// Accepted for backward compatibility; must match the execution's agent if sent.
+    #[serde(default)]
+    pub agent_id: Option<uuid::Uuid>,
     pub kind: String,
     pub content: String,
     #[serde(default)]
     pub metadata: serde_json::Value,
+}
+
+/// Memory is always the claimed execution's own agent memory, never a caller-chosen one.
+async fn memory_agent(
+    state: &AppState,
+    auth: &WorkerAuth,
+    execution_id: Uuid,
+    claimed_agent: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    let execution = ensure_execution(state, auth, execution_id).await?;
+    if claimed_agent.is_some_and(|agent_id| agent_id != execution.agent_id) {
+        return Err(ApiError::forbidden(
+            "agentId does not match the execution's agent",
+        ));
+    }
+    Ok(execution.agent_id)
 }
 
 pub async fn list_memory(
@@ -1187,15 +1237,11 @@ pub async fn list_memory(
     auth: WorkerAuth,
     crate::extract::ApiJson(body): crate::extract::ApiJson<ListMemoryRequest>,
 ) -> Result<Json<Vec<MemoryEntry>>, ApiError> {
-    let org_id = auth.org_id;
-    let agent_id = match body.agent_id {
-        Some(id) => id,
-        None => return Ok(Json(vec![])),
-    };
-    if agent_id.is_nil() {
-        return Ok(Json(vec![]));
-    }
-    let entries = state.store.list_memory(org_id, agent_id, None, 20).await?;
+    let agent_id = memory_agent(&state, &auth, body.execution_id, body.agent_id).await?;
+    let entries = state
+        .store
+        .list_memory(auth.org_id, agent_id, None, 20)
+        .await?;
     Ok(Json(
         entries
             .into_iter()
@@ -1214,17 +1260,23 @@ pub async fn store_memory(
     auth: WorkerAuth,
     crate::extract::ApiJson(body): crate::extract::ApiJson<StoreMemoryRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let org_id = auth.org_id;
-    let expires_at = None;
+    if body.content.len() > MAX_MEMORY_CONTENT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            format!("memory content exceeds {MAX_MEMORY_CONTENT_BYTES} bytes"),
+        ));
+    }
+    let agent_id = memory_agent(&state, &auth, body.execution_id, body.agent_id).await?;
     state
         .store
         .store_memory(
-            org_id,
-            body.agent_id,
+            auth.org_id,
+            agent_id,
             &body.kind,
             &body.content,
             &body.metadata,
-            expires_at,
+            None,
         )
         .await?;
     Ok(Json(serde_json::json!({ "stored": true })))

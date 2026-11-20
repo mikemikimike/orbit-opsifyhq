@@ -224,6 +224,46 @@ async fn fail_worker_executions(state: &AppState, launch: &WorkerLaunch) {
     }
 }
 
+/// A launch is exactly as visible as the worker profile it was launched from. Launches
+/// whose profile no longer exists are visible to owners/admins only.
+fn launch_visible(
+    access: &crate::access::AccessScope,
+    profiles: &std::collections::HashMap<Uuid, orbit_store::WorkerProfile>,
+    launch: &WorkerLaunch,
+) -> bool {
+    match profiles.get(&launch.profile_id) {
+        Some(profile) => access.can_view(
+            profile.owner_user_id,
+            profile.owner_team_id,
+            &profile.visibility,
+        ),
+        None => access.is_privileged(),
+    }
+}
+
+async fn load_visible_launch(
+    state: &AppState,
+    auth: &AuthContext,
+    launch_id: Uuid,
+) -> Result<WorkerLaunch, ApiError> {
+    let launch = state
+        .store
+        .get_worker_launch(auth.org_id, launch_id)
+        .await?;
+    let access = crate::access::AccessScope::load(state, auth).await?;
+    let profiles = state
+        .store
+        .list_worker_profiles(auth.org_id, None)
+        .await?
+        .into_iter()
+        .map(|profile| (profile.id, profile))
+        .collect();
+    if !launch_visible(&access, &profiles, &launch) {
+        return Err(ApiError::not_found("worker launch"));
+    }
+    Ok(launch)
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkerLaunchesQuery {
@@ -243,6 +283,18 @@ pub async fn list_launches(
     } else {
         state.store.list_active_worker_launches(auth.org_id).await?
     };
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    let profiles = state
+        .store
+        .list_worker_profiles(auth.org_id, None)
+        .await?
+        .into_iter()
+        .map(|profile| (profile.id, profile))
+        .collect();
+    let launches: Vec<WorkerLaunch> = launches
+        .into_iter()
+        .filter(|launch| launch_visible(&access, &profiles, launch))
+        .collect();
     let mut refreshed = Vec::with_capacity(launches.len());
     for launch in launches {
         refreshed.push(refresh(&state, launch).await);
@@ -257,10 +309,7 @@ pub async fn get_launch(
     Path(launch_id): Path<Uuid>,
 ) -> Result<Json<WorkerLaunch>, ApiError> {
     auth.require(Permission::HarnessesRead)?;
-    let launch = state
-        .store
-        .get_worker_launch(auth.org_id, launch_id)
-        .await?;
+    let launch = load_visible_launch(&state, &auth, launch_id).await?;
     Ok(Json(refresh(&state, launch).await))
 }
 
@@ -334,6 +383,11 @@ pub(crate) async fn launch_profile_internal(
             .await?
             .ok_or_else(|| ApiError::conflict("execution is no longer queued for this launch"))?;
         timeout_seconds = Some(claimed.timeout_seconds.max(1) as u64);
+        // The launched worker authenticates with this launch's token; bind the claim to it.
+        state
+            .store
+            .bind_execution_worker_token(execution_id, issued.token_id)
+            .await?;
     }
     let request = LauncherRequest {
         launch_id: launch.id,
@@ -481,10 +535,7 @@ pub async fn launch_logs(
     Path(launch_id): Path<Uuid>,
 ) -> Result<Json<LaunchLogs>, ApiError> {
     auth.require(Permission::HarnessesRead)?;
-    let launch = state
-        .store
-        .get_worker_launch(auth.org_id, launch_id)
-        .await?;
+    let launch = load_visible_launch(&state, &auth, launch_id).await?;
     let logs: LaunchLogs = call_launcher(
         &state,
         reqwest::Method::GET,

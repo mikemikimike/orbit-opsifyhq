@@ -849,7 +849,7 @@ pub async fn list_workers(
 ) -> Result<Json<Vec<WorkerView>>, ApiError> {
     auth.require(Permission::HarnessesRead)?;
     let now = chrono::Utc::now();
-    let mut workers = state.store.list_worker_heartbeats().await?;
+    let mut workers = state.store.list_worker_heartbeats(auth.org_id).await?;
     workers.sort_by_key(|worker| std::cmp::Reverse(worker.last_heartbeat_at));
     Ok(Json(
         workers

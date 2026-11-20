@@ -28,7 +28,8 @@ impl Store {
         let query = format!(
             "SELECT id FROM {table} WHERE org_id = $1 AND {column} = $2 ORDER BY created_at LIMIT 1"
         );
-        Ok(sqlx::query_scalar::<_, Uuid>(&query)
+        // The dynamic parts come only from the fixed allowlist above; keys are bound.
+        Ok(sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(query))
             .bind(org_id)
             .bind(key)
             .fetch_optional(&self.pool)

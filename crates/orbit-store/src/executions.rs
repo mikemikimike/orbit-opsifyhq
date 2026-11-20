@@ -263,8 +263,9 @@ impl Store {
         .await?)
     }
 
-    /// Move an execution to a terminal state. Terminal states are never overwritten and
-    /// cancellation always wins over a late harness result.
+    /// Move an execution to a terminal state. Terminal states are never overwritten,
+    /// cancellation always wins over a late harness result, and only transitions allowed by
+    /// `ExecutionStatus::can_transition_to` are accepted (`None` otherwise).
     pub async fn finish_execution(
         &self,
         execution_id: Uuid,
@@ -279,6 +280,12 @@ impl Store {
                 "finish_execution requires a terminal status".into(),
             ));
         }
+        // The source states come from the domain transition table, so e.g.
+        // queued -> succeeded is rejected (returns None) instead of fabricating a result.
+        let from: Vec<String> = ExecutionStatus::sources_for(status)
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
         Ok(sqlx::query_as::<_, ExecutionRecord>(
             r#"
             UPDATE executions
@@ -290,7 +297,7 @@ impl Store {
                 finished_at = now(),
                 updated_at = now()
             WHERE id = $1
-              AND status NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'rejected')
+              AND status = ANY($7)
             RETURNING *
             "#,
         )
@@ -300,6 +307,7 @@ impl Store {
         .bind(error)
         .bind(usage)
         .bind(session_ref)
+        .bind(&from)
         .fetch_optional(&self.pool)
         .await?)
     }
@@ -530,6 +538,7 @@ impl Store {
 
 impl Store {
     /// Claim the oldest queued execution atomically.
+    #[allow(clippy::too_many_arguments)]
     pub async fn claim_next_queued(
         &self,
         org_id: Uuid,
@@ -538,13 +547,14 @@ impl Store {
         worker_target: &str,
         agent_ids: &[Uuid],
         profile_team_id: Option<Uuid>,
+        worker_token_id: Option<Uuid>,
     ) -> StoreResult<Option<ExecutionRecord>> {
         let team_filter = if profile_team_id.is_some() {
             r#"
                   AND EXISTS (
                       SELECT 1 FROM agents a
                       WHERE a.id = executions.agent_id
-                        AND (a.visibility = 'org' OR a.owner_team_id = $6)
+                        AND (a.visibility = 'org' OR a.owner_team_id = $7)
                   )
             "#
         } else {
@@ -553,7 +563,7 @@ impl Store {
         let sql = format!(
             r#"
             UPDATE executions
-            SET status = 'dispatched', worker_id = $2,
+            SET status = 'dispatched', worker_id = $2, worker_token_id = $6,
                 started_at = COALESCE(started_at, now()), updated_at = now()
             WHERE id = (
                 SELECT id FROM executions
@@ -576,7 +586,8 @@ impl Store {
             .bind(worker_id)
             .bind(harnesses)
             .bind(worker_target)
-            .bind(agent_ids);
+            .bind(agent_ids)
+            .bind(worker_token_id);
         if let Some(team_id) = profile_team_id {
             query = query.bind(team_id);
         }
@@ -591,6 +602,32 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| StoreError::NotFound("execution".into()))
+    }
+
+    /// Record which worker token owns a claimed execution (single-execution launches,
+    /// where the API claims on behalf of the launched worker).
+    pub async fn bind_execution_worker_token(
+        &self,
+        execution_id: Uuid,
+        worker_token_id: Uuid,
+    ) -> StoreResult<()> {
+        sqlx::query("UPDATE executions SET worker_token_id = $2 WHERE id = $1")
+            .bind(execution_id)
+            .bind(worker_token_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Token that claimed the execution (`None` for unclaimed or pre-binding legacy rows).
+    pub async fn execution_worker_token(&self, execution_id: Uuid) -> StoreResult<Option<Uuid>> {
+        Ok(
+            sqlx::query_scalar("SELECT worker_token_id FROM executions WHERE id = $1")
+                .bind(execution_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
     }
 
     /// Bind an already-dispatched execution to a specific worker (used by the
