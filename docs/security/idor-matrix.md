@@ -10,14 +10,12 @@ Enforced by `crates/orbit-api/src/access.rs` (`AccessScope`). Invisible resource
 | Connections | yes | yes | yes | **use** required on every run path (see preflight) |
 | Providers | yes | yes | yes | **use** required when an agent binds it (platform-managed models) |
 | Worker profiles | yes | yes | yes | claims scoped by owning team |
-| Triggers | yes | yes | yes | re-checked at fire time for the owner |
-| Tool policies | yes | yes | yes (agent-scoped rules need **manage** on the agent; org-wide rules need `settings:write`) | — |
-| Executions | via agent | via agent | cancel needs **use** on the agent | events/SSE via agent |
-| Approvals | via execution → agent | — | decision inherits execution | — |
-| Worker launches | via worker profile | via worker profile | owner/admin or profile manager | logs via worker profile |
-| Worker API executions | — | claiming token only (`404` otherwise) | claiming token only | events/complete/approvals/audit/connection/memory bound to claiming token |
-| Worker heartbeats | org-scoped | — | owning token only | — |
-| Agent memory (worker API) | — | via claimed execution's agent | via claimed execution's agent (64 KiB cap) | — |
+
+| Triggers | yes | yes | yes | — |
+| Tool policies | yes | yes | yes | — |
+| Executions | via agent | via agent | cancel via agent | events/SSE via agent |
+| Approvals | via execution → agent | — | decide needs `approvals:decide` and use/manage on the agent (team viewers 403, invisible 404); optional four-eyes; expired → 409 | worker wait bound to its own execution |
+| Env mappings | — | — | `settings:write`; each `secretRef`/`secretKey`/`connectionId` must be a connection/provider secret in the caller's org that the caller can use (else 422); resolution is org-scoped | — |
 | Access teams | member list | member | lead/owner/admin | — |
 | Sharing | — | view | manage + license | — |
 | Export | per-kind read permission + view | — | — | — |
@@ -29,26 +27,21 @@ one profile token for a pool, or Docker-driver child containers) are one princip
 
 Owner/admin bypass is intentional and documented in ADR 0011.
 
-## Execution preflight
 
-Every path that starts an execution goes through `crates/orbit-api/src/preflight.rs`
-(`Preflight::authorize_access`, `check_harness`, `check_quota`, `run`; team runs also use
-`authorize_team_run`). It checks, in order: agent not archived and **use** on the agent,
-**use** on every connection bound in the spec (and a team's shared/work-source
-connections) and on the platform model provider, harness enabled and `available`, and the
-agent's `autonomy.maxExecutionsPerHour` quota (`429`).
+## Approvals and secret references (#144)
 
-| Path | Identity | Notes |
-|---|---|---|
-| `POST /agents/{id}/executions` | request caller | quota evaluated after the idempotent replay |
-| `POST /executions/{id}/rerun` | request caller | preflight on the original version's spec |
-| `POST /agents/{id}/runtime` | request caller (manage) | runtime start |
-| runtime tick (`background.rs`) | runtime creator, else agent owner | lost access stops the runtime with an error; harness/quota delays the tick |
-| scheduled trigger (`background.rs`) | trigger owner, else agent owner | lost access fails the run (audit `trigger.fire_denied`, counts towards auto-disable); harness/quota skip the tick |
-| `POST /agent-teams/{id}/runs` | request caller | team **use** + step agents + team connections before the run is created; repository override must be a configured team repository |
-| team step start (`start_step`, also advance and queue start) | run requester, else team owner | re-checked for every step; a refused next step fails the run |
-| queue start | request caller | same team preflight before the run row exists |
-
-Background identities are loaded with `AccessScope::load_for_user`; disabled users are
-refused. Resources with no user owner at all (legacy rows) keep running under platform
-authority and only get the harness and quota checks.
+- `POST /approvals/{id}/approve|reject` requires `approvals:decide` **and** use access to
+  the agent (`AccessScope::require_use`). Owners/admins, the agent owner and team
+  leads/members pass; team viewers receive `403`, users who cannot see the agent `404`.
+- Four-eyes: `PUT /api/v1/settings/approvals {"approvalsRequireDifferentApprover": true}`
+  (default `false`, API only) makes the user in `executions.requested_by` ineligible to
+  approve or reject that execution's approvals (`403`).
+- An approval past `expires_at` cannot be decided: the call returns `409 approval expired`
+  and the row is marked `expired`.
+- Worker `GET /worker/approvals/{id}/wait` returns `404` unless the approval belongs to the
+  `executionId` in the query. `POST /worker/approvals` clamps `waitSeconds` to 1 s..24 h and
+  allows at most 50 pending approvals per execution (`429`).
+- Env-mapping secret refs are validated on create/update (`422`, same message for unknown
+  and foreign refs, never including values) and resolved with
+  `Store::get_secret_value_for_org`. The unscoped `get_secret_value` remains only for
+  references read from org-checked rows and the org-less `SecretStore` trait.

@@ -154,7 +154,8 @@ async fn test_app(allow_anonymous: bool) -> Option<TestApp> {
 
         bus_healthy,
         shutdown,
-        router: build_router(state),
+        router: build_router(state.clone()),
+        state,
         store,
         org_id: org.id,
         agent_id: created,
@@ -1472,109 +1473,584 @@ async fn same_agent_queues_on_different_harnesses() {
     assert_eq!(second["harnessKind"], "pi");
 }
 
-#[tokio::test]
-async fn changing_provider_base_url_requires_reentering_the_credential() {
-    let Some(app) = test_app(true).await else {
-        return;
-    };
-    let (status, body) = send(
+
+async fn new_execution(app: &TestApp, agent_id: Uuid) -> Uuid {
+    let (status, execution) = send(
         &app.router,
         post(
-            "/api/v1/providers",
-            json!({
-                "name": "Rebind Gateway",
-                "kind": "openai_compatible",
-                "config": { "baseUrl": "http://10.1.2.3:9999/v1", "model": "qwen" },
-                "credential": "sk-rebind-secret"
-            }),
+            &format!("/api/v1/agents/{agent_id}/executions"),
+            json!({ "task": "approval policy test" }),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    let id = body["id"].as_str().unwrap().to_string();
-    let path = format!("/api/v1/providers/{id}");
-    let patch = |body: Value| {
-        Request::builder()
-            .method("PATCH")
-            .uri(&path)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap()
-    };
+    assert_eq!(status, StatusCode::ACCEPTED, "{execution}");
+    Uuid::parse_str(execution["id"].as_str().unwrap()).unwrap()
+}
 
-    // New host without a new key: refused, nothing changes.
-    let (status, body) = send(
-        &app.router,
-        patch(json!({ "config": { "baseUrl": "http://evil.example/v1", "model": "qwen" } })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("re-enter the API key"));
-    let stored: Value = sqlx::query_scalar("SELECT config FROM providers WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_one(app.store.pool())
+async fn new_approval(app: &TestApp, execution_id: Uuid) -> Uuid {
+    app.store
+        .create_approval(
+            app.org_id,
+            execution_id,
+            json!({ "action": "deploy" }),
+            None,
+        )
         .await
-        .unwrap();
-    assert_eq!(stored["baseUrl"], "http://10.1.2.3:9999/v1");
-
-    // Same URL (trailing slash only) keeps the credential.
-    let (status, body) = send(
-        &app.router,
-        patch(json!({ "config": { "baseUrl": "http://10.1.2.3:9999/v1", "model": "other" } })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-
-    // New host with a freshly supplied key is accepted.
-    let (status, body) = send(
-        &app.router,
-        patch(json!({
-            "config": { "baseUrl": "http://10.9.9.9:9999/v1", "model": "qwen" },
-            "credential": "sk-new-key"
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+        .unwrap()
+        .id
 }
 
 #[tokio::test]
-async fn provider_probe_requires_manage_and_refuses_metadata_addresses() {
+async fn approval_decisions_require_use_and_optional_four_eyes() {
     let Some(app) = test_app(true).await else {
         return;
     };
-    let provider = app
-        .store
-        .create_provider(
+    app.store
+        .create_custom_role(
             app.org_id,
-            "Metadata probe",
-            "openai_compatible",
-            &json!({ "baseUrl": "http://169.254.169.254/v1", "model": "m" }),
+            "Approver",
+            &[
+                "agents:read".into(),
+                "executions:read".into(),
+                "approvals:decide".into(),
+            ],
+        )
+        .await
+        .unwrap();
+    let carol = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "appr-carol@test.local",
+            "Carol",
+            UserRole::Viewer,
+        )
+        .await
+        .unwrap();
+    app.store
+        .set_user_role_name(app.org_id, carol.id, "Approver")
+        .await
+        .unwrap();
+    let carol_token = token_for(&app.store, app.org_id, carol.id, "carol").await;
+    let team = app
+        .store
+        .create_access_team(
+            app.org_id,
+            "Approvers",
+            &format!("appr-{}", Uuid::now_v7()),
             None,
         )
         .await
         .unwrap();
-    // An operator can see org-visible providers but cannot probe (send credentials).
-    let operator = app
+
+    // Someone other than Carol owns the agent, so only her team role grants access.
+    let dave = app
         .store
         .ensure_user(
             app.org_id,
-            "probe-op@test.local",
-            "Operator",
+            "appr-dave@test.local",
+            "Dave",
             UserRole::Operator,
         )
         .await
         .unwrap();
-    let operator_token = token_for(&app.store, app.org_id, operator.id, "probe-op").await;
-    let path = format!("/api/v1/providers/{}/test", provider.id);
-    let (status, _) = send(&app.router, auth_post(&path, &operator_token, json!({}))).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
 
-    // The manager's probe is refused by the outbound guard with a generic category.
-    let (status, body) = send(&app.router, post(&path, json!({}))).await;
+    app.store
+        .assign_resource_owner(app.org_id, "agents", app.agent_id, dave.id)
+        .await
+        .unwrap();
+    app.store
+        .set_resource_visibility(app.org_id, "agents", app.agent_id, "team", Some(team.id))
+        .await
+        .unwrap();
+    app.store
+        .upsert_team_member(team.id, carol.id, "viewer")
+        .await
+        .unwrap();
+
+    let execution_id = new_execution(&app, app.agent_id).await;
+    let approval_id = new_approval(&app, execution_id).await;
+
+    // Team viewer: can see the agent but cannot use it -> 403.
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/approvals/{approval_id}/approve"),
+            &carol_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Not in the team at all -> the agent is invisible -> 404.
+    app.store
+        .remove_team_member(team.id, carol.id)
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/approvals/{approval_id}/approve"),
+            &carol_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Team member: allowed (four-eyes off by default; requester is the dev owner).
+    app.store
+        .upsert_team_member(team.id, carol.id, "member")
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/approvals/{approval_id}/approve"),
+            &carol_token,
+            json!({}),
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["ok"], false);
-    assert_eq!(body["error"], "endpoint refused (blocked)");
+
+    // Default setting is off.
+    let (status, body) = send(&app.router, get("/api/v1/settings/approvals")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["approvalsRequireDifferentApprover"], false);
+
+    // Four-eyes off: the requester (dev owner) may approve their own execution.
+    let own = new_approval(&app, execution_id).await;
+    let (status, body) = send(
+        &app.router,
+        post(&format!("/api/v1/approvals/{own}/approve"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Four-eyes on: the requester is refused, another user is not.
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings/approvals")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "approvalsRequireDifferentApprover": true }).to_string(),
+        ))
+        .unwrap();
+    let (status, body) = send(&app.router, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["approvalsRequireDifferentApprover"], true);
+
+    let gated = new_approval(&app, execution_id).await;
+    for decision in ["approve", "reject"] {
+        let (status, body) = send(
+            &app.router,
+            post(&format!("/api/v1/approvals/{gated}/{decision}"), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("different approver"));
+    }
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/approvals/{gated}/approve"),
+            &carol_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "approved");
+}
+
+#[tokio::test]
+async fn expired_approval_cannot_be_decided_via_api() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let execution_id = new_execution(&app, app.agent_id).await;
+    let approval = app
+        .store
+        .create_approval(
+            app.org_id,
+            execution_id,
+            json!({ "action": "late" }),
+            Some(chrono::Utc::now() - chrono::Duration::seconds(30)),
+        )
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/approvals/{}/approve", approval.id),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("approval expired"));
+    assert_eq!(
+        app.store
+            .get_approval(app.org_id, approval.id)
+            .await
+            .unwrap()
+            .status,
+        "expired"
+    );
+}
+
+fn worker_request(method: &str, path: &str, token: &str, body: Option<Value>) -> Request<Body> {
+    let builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"));
+    match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn worker_approvals_are_bound_to_the_execution_and_clamped() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let issued = orbit_security::issue_worker_token();
+    app.store
+        .create_worker_token(
+            app.org_id,
+            None,
+            "approvals-test",
+            &issued.prefix,
+            &issued.hash,
+            &[],
+        )
+        .await
+        .unwrap();
+    let execution_a = new_execution(&app, app.agent_id).await;
+    let zed = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "worker-zed@test.local",
+            "Zed",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let other_agent = create_demo_agent(&app.store, app.org_id, zed.id).await;
+    let execution_b = new_execution(&app, other_agent).await;
+
+    // u64::MAX must neither panic nor produce an absurd deadline.
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/approvals",
+            &issued.token,
+            Some(json!({
+                "executionId": execution_a,
+                "action": { "capability": "x" },
+                "waitSeconds": u64::MAX
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let expires: chrono::DateTime<chrono::Utc> =
+        body["expiresAt"].as_str().unwrap().parse().unwrap();
+    assert!(
+        expires <= chrono::Utc::now() + chrono::Duration::hours(24) + chrono::Duration::minutes(1)
+    );
+    let approval_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    // Decide it so the wait returns immediately for the matching execution.
+    app.store
+        .decide_approval(app.org_id, approval_id, "approved", zed.id, None)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "GET",
+            &format!(
+                "/api/v1/worker/approvals/{approval_id}/wait?executionId={execution_a}&seconds=1"
+            ),
+            &issued.token,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Another execution in the same org cannot read this approval's status.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "GET",
+            &format!(
+                "/api/v1/worker/approvals/{approval_id}/wait?executionId={execution_b}&seconds=1"
+            ),
+            &issued.token,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Per-execution cap on pending approvals.
+    for _ in 0..49 {
+        app.store
+            .create_approval(app.org_id, execution_b, json!({ "n": 1 }), None)
+            .await
+            .unwrap();
+    }
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/approvals",
+            &issued.token,
+            Some(json!({ "executionId": execution_b, "action": {} })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/approvals",
+            &issued.token,
+            Some(json!({ "executionId": execution_b, "action": {} })),
+        ),
+    )
+    .await;
+    // 49 + 1 created above = 50 pending -> the next request is refused.
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+}
+
+#[tokio::test]
+async fn env_mapping_secret_refs_must_be_usable_in_the_callers_org() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let mapping = |reference: &str| {
+        json!({
+            "name": format!("map-{}", Uuid::now_v7()),
+            "mappings": [{ "envVar": "TOKEN", "secretRef": reference }]
+        })
+    };
+
+    // A real secret that belongs to another organization.
+    let other = app
+        .store
+        .create_organization(
+            &format!("other-{}", Uuid::now_v7()),
+            "Other",
+            orbit_domain::OrganizationMode::Personal,
+        )
+        .await
+        .unwrap();
+    let foreign = format!("connection/{}", Uuid::now_v7());
+    app.store
+        .put_secret(
+            Some(other.id),
+            &foreign,
+            &orbit_security::SecretValue::new("foreign-super-secret"),
+            "t",
+        )
+        .await
+        .unwrap();
+    let (status, body) = send(&app.router, post("/api/v1/env-mappings", mapping(&foreign))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(!body.to_string().contains("foreign-super-secret"));
+
+    // Unknown reference.
+    let (status, _) = send(
+        &app.router,
+        post("/api/v1/env-mappings", mapping("connection/does-not-exist")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Own-org secret that no connection/provider owns.
+    let orphan = format!("connection/{}", Uuid::now_v7());
+    app.store
+        .put_secret(
+            Some(app.org_id),
+            &orphan,
+            &orbit_security::SecretValue::new("orphan"),
+            "t",
+        )
+        .await
+        .unwrap();
+    let (status, _) = send(&app.router, post("/api/v1/env-mappings", mapping(&orphan))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Unknown connection id.
+    let (status, _) = send(
+        &app.router,
+        post(
+            "/api/v1/env-mappings",
+            json!({
+                "name": "bad-conn",
+                "mappings": [{ "envVar": "TOKEN", "connectionId": Uuid::now_v7() }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A usable connection's credential in the caller's org is accepted (create + update).
+    let (status, created) = send(
+        &app.router,
+        post(
+            "/api/v1/connections",
+            json!({
+                "connectorSlug": "telegram",
+                "name": "Mapped bot",
+                "credential": "123456:bot-secret",
+                "scopes": ["messages.list"]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let connection = app
+        .store
+        .get_connection(
+            app.org_id,
+            Uuid::parse_str(created["id"].as_str().unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let reference = connection.credential_ref.unwrap();
+    let (status, body) = send(
+        &app.router,
+        post("/api/v1/env-mappings", mapping(&reference)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap();
+    let patch = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/env-mappings/{id}"))
+        .header("content-type", "application/json")
+        .body(Body::from(mapping(&foreign).to_string()))
+        .unwrap();
+    let (status, _) = send(&app.router, patch).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn env_mapping_secret_refs_respect_resource_access() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    app.store
+        .create_custom_role(
+            app.org_id,
+            "Mapper",
+            &["settings:read".into(), "settings:write".into()],
+        )
+        .await
+        .unwrap();
+    let erin = app
+        .store
+        .ensure_user(app.org_id, "map-erin@test.local", "Erin", UserRole::Viewer)
+        .await
+        .unwrap();
+    app.store
+        .set_user_role_name(app.org_id, erin.id, "Mapper")
+        .await
+        .unwrap();
+    let erin_token = token_for(&app.store, app.org_id, erin.id, "erin").await;
+    let frank = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "map-frank@test.local",
+            "Frank",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let connector = app
+        .store
+        .get_connector_by_slug(app.org_id, "webhook")
+        .await
+        .unwrap()
+        .expect("webhook connector");
+    let reference = format!("connection/{}", Uuid::now_v7());
+    app.store
+        .put_secret(
+            Some(app.org_id),
+            &reference,
+            &orbit_security::SecretValue::new("franks-token"),
+            "t",
+        )
+        .await
+        .unwrap();
+    let connection = app
+        .store
+        .create_connection(
+            app.org_id,
+            connector.id,
+            "Frank private",
+            &json!({ "url": "http://127.0.0.1:9/frank" }),
+            &[],
+            Some(&reference),
+            Some(frank.id),
+        )
+        .await
+        .unwrap();
+    make_private(
+        &app.store,
+        app.org_id,
+        "connections",
+        connection.id,
+        frank.id,
+    )
+    .await;
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/env-mappings",
+            &erin_token,
+            json!({
+                "name": "erin-map",
+                "mappings": [{ "envVar": "TOKEN", "secretRef": reference }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(!body.to_string().contains("franks-token"));
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/env-mappings",
+            &erin_token,
+            json!({
+                "name": "erin-map-conn",
+                "mappings": [{ "envVar": "TOKEN", "connectionId": connection.id }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }

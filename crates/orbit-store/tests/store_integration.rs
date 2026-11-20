@@ -1969,3 +1969,77 @@ async fn terminal_launch_cannot_regress_and_error_is_kept() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn expired_approvals_cannot_be_decided() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, version) = store
+        .create_agent(org, Some(user), &definition("Expiry Agent"))
+        .await
+        .unwrap();
+    let execution = store
+        .create_execution(NewExecution {
+            org_id: org,
+            agent_id: agent.id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: HarnessKind::Mock,
+            trigger_source: TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: serde_json::json!({ "task": "x", "payload": {}, "provenance": { "source": "test", "trusted": true, "receivedAt": chrono::Utc::now() } }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: Some(user),
+            idempotency_key: Some("expiry-1"),
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+
+    let expired = store
+        .create_approval(
+            org,
+            execution.id,
+            serde_json::json!({ "action": "x" }),
+            Some(chrono::Utc::now() - chrono::Duration::seconds(5)),
+        )
+        .await
+        .unwrap();
+    let error = store
+        .decide_approval(org, expired.id, "approved", user, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("approval expired"), "{error}");
+    let stored = store.get_approval(org, expired.id).await.unwrap();
+    assert_eq!(stored.status, "expired");
+    assert!(stored.decided_by.is_none());
+
+    // A live approval is still decidable, and pending ones are counted.
+    let live = store
+        .create_approval(
+            org,
+            execution.id,
+            serde_json::json!({ "action": "y" }),
+            Some(chrono::Utc::now() + chrono::Duration::seconds(300)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .count_pending_approvals(org, execution.id)
+            .await
+            .unwrap(),
+        1
+    );
+    let decided = store
+        .decide_approval(org, live.id, "approved", user, None)
+        .await
+        .unwrap();
+    assert_eq!(decided.status, "approved");
+}

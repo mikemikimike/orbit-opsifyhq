@@ -472,3 +472,63 @@ pub async fn update_harness(
     .await;
     Ok(Json(body))
 }
+
+/// Platform-setting key holding the approvals policy.
+pub const APPROVALS_SETTING_KEY: &str = "approvals";
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalsSettings {
+    /// Four-eyes: the user who requested an execution cannot approve or reject the
+    /// approvals that execution raises. Default `false`.
+    #[serde(default)]
+    pub approvals_require_different_approver: bool,
+}
+
+/// Read the approvals policy; missing or malformed values fall back to the default (off).
+pub async fn load_approvals_settings(
+    store: &orbit_store::Store,
+) -> Result<ApprovalsSettings, ApiError> {
+    let value = store.get_platform_setting(APPROVALS_SETTING_KEY).await?;
+    Ok(value
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or(ApprovalsSettings {
+            approvals_require_different_approver: false,
+        }))
+}
+
+#[utoipa::path(get, path = "/api/v1/settings/approvals", tag = "settings", responses((status = 200, body = ApprovalsSettings)))]
+pub async fn get_approvals(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<ApprovalsSettings>, ApiError> {
+    auth.require(Permission::SettingsRead)?;
+    Ok(Json(load_approvals_settings(&state.store).await?))
+}
+
+#[utoipa::path(put, path = "/api/v1/settings/approvals", tag = "settings", request_body = ApprovalsSettings, responses((status = 200, body = ApprovalsSettings)))]
+pub async fn update_approvals(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(body): Json<ApprovalsSettings>,
+) -> Result<Json<ApprovalsSettings>, ApiError> {
+    auth.require(Permission::SettingsWrite)?;
+    let value =
+        serde_json::to_value(&body).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    state
+        .store
+        .set_platform_setting(APPROVALS_SETTING_KEY, &value, Some(auth.user_id))
+        .await?;
+    crate::audit::record(
+        &state,
+        &auth,
+        "settings.approvals.updated",
+        Some("settings"),
+        None,
+        serde_json::json!({
+            "approvalsRequireDifferentApprover": body.approvals_require_different_approver,
+        }),
+    )
+    .await;
+    Ok(Json(body))
+}
