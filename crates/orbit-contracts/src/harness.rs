@@ -330,9 +330,10 @@ pub fn max_approval_wait_seconds() -> u64 {
 /// Cheap to clone; all clones share one clock. Pauses may overlap (two tool calls
 /// waiting at once): the clock runs again only when every pause has ended.
 ///
-/// An optional budget caps the cumulative paused time: once it is used up,
-/// [`PauseClock::deadline`] resolves (the run ends as timed out) and callers should stop
-/// granting new pauses (see [`PauseClock::remaining_budget`]).
+/// An optional budget caps the cumulative paused time that is excluded from the timeout:
+/// once it is used up, further waiting counts as active time and callers should stop
+/// granting new pauses (see [`PauseClock::remaining_budget`]). A run therefore always ends
+/// within `timeout + budget`, which is what the outer (Job / container) deadlines assume.
 #[derive(Debug, Clone, Default)]
 pub struct PauseClock {
     inner: std::sync::Arc<std::sync::Mutex<PauseState>>,
@@ -409,15 +410,19 @@ impl PauseClock {
         state.paused + state.since.map(|since| since.elapsed()).unwrap_or_default()
     }
 
-    /// Resolves once the run has been *active* (not paused) for `timeout`, or once the
-    /// approval budget is used up.
+    /// Resolves once the run has been *active* (not paused) for `timeout`. Paused time
+    /// beyond the approval budget counts as active.
     ///
     /// Use in place of `tokio::time::sleep(timeout)` when enforcing an execution timeout.
     pub async fn deadline(&self, timeout: std::time::Duration) {
         let started = std::time::Instant::now();
         loop {
-            let active = started.elapsed().saturating_sub(self.total_paused());
-            if !self.is_paused() && (active >= timeout || self.budget_exhausted()) {
+            let excluded = match self.budget {
+                Some(budget) => self.total_paused().min(budget),
+                None => self.total_paused(),
+            };
+            let active = started.elapsed().saturating_sub(excluded);
+            if (!self.is_paused() || self.budget_exhausted()) && active >= timeout {
                 return;
             }
             // While paused there is nothing to count down; poll for the pause to end.
@@ -711,7 +716,7 @@ mod pause_clock_tests {
     }
 
     #[tokio::test]
-    async fn budget_counts_down_and_deadline_fires_when_exhausted() {
+    async fn budget_caps_excluded_pause_time() {
         let clock = super::PauseClock::with_budget(std::time::Duration::from_millis(200));
         assert!(!clock.budget_exhausted());
         {
@@ -721,13 +726,23 @@ mod pause_clock_tests {
             assert!(clock.budget_exhausted());
             assert_eq!(clock.remaining_budget(), Some(std::time::Duration::ZERO));
         }
-        // A far-away timeout still resolves, because the budget is used up.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+        // Exhausting the budget does not end the run by itself: a long timeout keeps running…
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
             clock.deadline(std::time::Duration::from_secs(3600)),
         )
         .await
-        .expect("deadline must fire once the approval budget is exhausted");
+        .is_err());
+        // …while paused time beyond the budget counts as active, so a pause that outlives
+        // the budget lets a short timeout fire even while still paused.
+        let clock = super::PauseClock::with_budget(std::time::Duration::from_millis(50));
+        let _guard = clock.pause();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            clock.deadline(std::time::Duration::from_millis(100)),
+        )
+        .await
+        .expect("time paused beyond the budget must count toward the timeout");
     }
 
     #[tokio::test]

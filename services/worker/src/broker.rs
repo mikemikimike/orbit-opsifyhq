@@ -1170,7 +1170,7 @@ async fn request_approval_action(
     }
 
     // Cumulative approval time is capped: once the budget is used up no further pause is
-    // granted, the call is denied and the run ends as timed out via its pause-aware clock.
+    // granted and the call is denied; further waiting then counts toward the run timeout.
     let Some(wait_seconds) = approval_wait_seconds(state.pause.remaining_budget()) else {
         record_event(
             state,

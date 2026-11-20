@@ -14,8 +14,9 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   and the Docker dispatch backstop are `timeout + approval budget + grace` instead of a fixed
   window, so a run waiting on a person is no longer killed. The budget is the cumulative time a
   run may spend paused for approvals (`ORBIT_MAX_APPROVAL_WAIT_SECONDS`, default 3600, Helm
-  `maxApprovalWaitSeconds`). When it is used up, further approvals are denied and the run ends
-  as `timed_out`; expired approvals are remembered like rejected ones.
+  `maxApprovalWaitSeconds`). Once it is used up, new approval requests are denied and further
+  waiting counts toward the run timeout, so every run still ends within `timeout + budget`;
+  expired approvals are remembered like rejected ones.
 - Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval
   mode when no tool-policy rule matches. L4/Auto no longer asks for every call; L3/Auto
   still requires approval and L1/L2 still deny writes. Explicit rules can only tighten
