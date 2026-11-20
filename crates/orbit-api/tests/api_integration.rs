@@ -2921,3 +2921,57 @@ fn usage_total(body: &Value) -> i64 {
         .map(|d| d["executions"].as_i64().unwrap())
         .sum()
 }
+
+#[tokio::test]
+async fn trigger_creation_requires_use_on_the_target_agent() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let alice = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "trigger-alice@test.local",
+            "Alice",
+            UserRole::Owner,
+        )
+        .await
+        .unwrap();
+    let bob = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "trigger-bob@test.local",
+            "Bob",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let agent = create_demo_agent(&app.store, app.org_id, alice.id).await;
+    make_private(&app.store, app.org_id, "agents", agent, alice.id).await;
+    let bob_token = token_for(&app.store, app.org_id, bob.id, "trigger-bob").await;
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "trigger-alice").await;
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/triggers",
+            &bob_token,
+            json!({ "agentId": agent, "kind": "manual" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/triggers",
+            &alice_token,
+            json!({ "agentId": agent, "kind": "manual" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["agentId"], agent.to_string());
+}

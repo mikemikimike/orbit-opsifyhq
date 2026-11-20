@@ -15,7 +15,7 @@ Enforced by `crates/orbit-api/src/access.rs` (`AccessScope`). Invisible resource
 | Providers | yes | yes | yes | **use** required when an agent binds it (platform-managed models) |
 | Worker profiles | yes | yes | yes | claims scoped by owning team |
 
-| Triggers | yes | yes | yes | — |
+| Triggers | yes | yes | yes | create needs **use** on the target agent and its spec references; fire re-checks the owner |
 | Tool policies | yes | yes | yes | — |
 | Executions | via agent | via agent | cancel via agent | events/SSE via agent |
 
