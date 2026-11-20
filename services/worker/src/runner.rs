@@ -924,6 +924,18 @@ fn map_harness_event(
     (kind, event.level, event.message, event.data)
 }
 
+/// Longest prefix of `value` that fits in `max_bytes` without splitting a character.
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1133,17 +1145,4 @@ mod tests {
         assert_eq!(completes[0]["error"]["code"], "worker_shutdown");
         drop(guard);
     }
-
-}
-
-/// Longest prefix of `value` that fits in `max_bytes` without splitting a character.
-fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
 }

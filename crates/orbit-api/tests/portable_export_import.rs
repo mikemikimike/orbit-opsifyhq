@@ -121,6 +121,7 @@ async fn env() -> Option<Env> {
             token: None,
             file: None,
         }),
+        shutdown: tokio_util::sync::CancellationToken::new(),
     };
     Some(Env {
         router: build_router(state),

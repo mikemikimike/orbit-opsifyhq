@@ -1127,6 +1127,7 @@ mod credential_tests {
             ca_secret_name: None,
             ca_secret_key: default_ca_key(),
             single_execution_id: single,
+            timeout_seconds: None,
         }
     }
 

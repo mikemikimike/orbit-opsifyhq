@@ -1706,6 +1706,15 @@ async fn single_execution_launch_tokens_are_revoked_when_execution_is_terminal()
         .is_some());
 
     store
+        .claim_execution(execution.id, "single-worker")
+        .await
+        .unwrap()
+        .expect("execution is queued");
+    store
+        .mark_execution_running(execution.id, None)
+        .await
+        .unwrap();
+    store
         .finish_execution(
             execution.id,
             ExecutionStatus::Succeeded,
@@ -1849,13 +1858,14 @@ async fn aborted_unclaimed_launch_is_not_live_and_token_is_revoked() {
     };
     let (org, _) = seed_org(&store).await;
     let profile = launch_profile_fixture(&store, org, "Abort").await;
+    let token_hash = format!("hash-abort-{}", uuid::Uuid::now_v7());
     let token = store
         .create_worker_token(
             org,
             Some(profile.id),
             "t",
             "pfx",
-            "hash-abort",
+            &token_hash,
             &["pi".into()],
         )
         .await

@@ -928,13 +928,18 @@ async fn advance_runtime(
             .await;
         return Ok(());
     }
-    let delayed =
-        match crate::preflight::require_harness_available(state, runtime.org_id, harness_kind).await {
-            Ok(()) => {
-                crate::preflight::require_hourly_quota(state, runtime.org_id, agent.id, &spec).await
-            }
-            Err(error) => Err(error),
-        };
+    let delayed = match crate::preflight::require_harness_available(
+        state,
+        runtime.org_id,
+        harness_kind,
+    )
+    .await
+    {
+        Ok(()) => {
+            crate::preflight::require_hourly_quota(state, runtime.org_id, agent.id, &spec).await
+        }
+        Err(error) => Err(error),
+    };
     if let Err(error) = delayed {
         let _ = state
             .store

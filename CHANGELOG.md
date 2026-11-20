@@ -8,6 +8,51 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ## [Unreleased]
 
+### Added
+
+- Embedded in-app documentation with working links (#44).
+- Portable YAML/Markdown export and import for agents, skills, triggers, connections,
+  providers, worker profiles, agent teams and tool policies (#80).
+- Execution preflight shared by every run path: agent use, referenced connections and
+  providers, harness availability and hourly quota (#140).
+- Opt-in audit retention and output delivery claims (#130, #112).
+- Approvals require use access, optional four-eyes, expiry handling and org-scoped secret
+  references (#144).
+- Worker-profile component split and calmer editor (#79).
+- Worker launches: exact live lookup, no phantom launches and guarded updates (#121).
+
+### Changed
+
+- Worker tokens are bound to their claimed executions; memory, launches and harness paths
+  are scoped to that claim (#139).
+- Tool policy fails closed and derives native tool effects server-side (#141).
+- Execution and approval lists apply visibility in SQL (#122).
+- Deployment defaults bind infrastructure ports to loopback; Helm gains production
+  guardrails (#128).
+- Harness status, paths, descriptors and image URLs are documented accurately (#129).
+- Continuous runtimes continue after a failed execution and Stop cannot be overwritten by
+  an in-flight tick (#150, #115).
+- Team runs and queue transitions are atomic and retryable (#113).
+- API lifecycle uses DB-only readiness, confirmed publishes and prompt shutdown (#125).
+- Worker always finishes claimed executions and reaps timed-out runs (#116).
+- Launcher reports accurate launch status and workload lifecycle (#120).
+- Web keeps sessions on transient errors and stops stream retry loops (#126).
+- OIDC only syncs roles when a group mapping matches (#124).
+- Rejections use the error envelope; settings are validated and audited (#123).
+- Auth rejects wrong dev tokens and unsafe login redirects (#143).
+- Credentials stay out of edited endpoints, argv and plain Kubernetes env (#142).
+- Agent commits cannot expose runtime credentials; harness subprocess environments are
+  isolated (#138, #137).
+- Observe/Recommend deny writes; egress is labelled as not enforced (#131).
+- Removed dead store code and unused dependencies (#130).
+
+### Fixed
+
+- Execution event sequence allocation is serialized (#114).
+- Output deliveries are claimed, have no enqueue window and stop on permanent failures
+  (#112).
+- CI now runs real security and deploy gates and fixes the root build (#127).
+
 ### Security
 
 - Cleared the RustSec advisories that the `cargo audit` gate (#127) reports:

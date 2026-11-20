@@ -44,7 +44,6 @@ impl orbit_events::EventBus for SwitchableBus {
 }
 
 struct TestApp {
-
     bus_healthy: Arc<std::sync::atomic::AtomicBool>,
     shutdown: tokio_util::sync::CancellationToken,
     router: axum::Router,
@@ -151,7 +150,6 @@ async fn test_app(allow_anonymous: bool) -> Option<TestApp> {
 
     let created = create_demo_agent(&store, org.id, user.id).await;
     Some(TestApp {
-
         bus_healthy,
         shutdown,
         router: build_router(state.clone()),
@@ -530,6 +528,8 @@ async fn approvals_can_be_listed_and_decided() {
     let Some(app) = test_app(true).await else {
         return;
     };
+    let _serial = APPROVAL_SETTINGS_LOCK.lock().await;
+    reset_approval_policy(&app).await;
     let (status, execution) = send(
         &app.router,
         post(
@@ -1473,10 +1473,23 @@ async fn same_agent_queues_on_different_harnesses() {
     assert_eq!(second["harnessKind"], "pi");
 }
 
-
 /// `runtime_tick` advances every runtime in the shared test database, so tests that tick
 /// (or interleave with a tick) run one at a time.
 static RUNTIME_TICK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Approval policy is a platform-wide setting; tests that change it must not overlap.
+static APPROVAL_SETTINGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn reset_approval_policy(app: &TestApp) {
+    app.store
+        .set_platform_setting(
+            "approvals",
+            &json!({ "approvalsRequireDifferentApprover": false }),
+            None,
+        )
+        .await
+        .unwrap();
+}
 
 async fn raw_pool() -> sqlx::PgPool {
     sqlx::PgPool::connect(&std::env::var("ORBIT_TEST_DATABASE_URL").unwrap())
@@ -1622,6 +1635,18 @@ async fn runtime_tick_retry_reuses_execution() {
     assert_eq!(count, 1, "no duplicate execution");
 }
 
+async fn runtime_row(
+    app: &TestApp,
+    agent_id: uuid::Uuid,
+) -> orbit_store::agent_runtimes::AgentRuntime {
+    sqlx::query_as("SELECT * FROM agent_runtimes WHERE org_id = $1 AND agent_id = $2")
+        .bind(app.org_id)
+        .bind(agent_id)
+        .fetch_one(&raw_pool().await)
+        .await
+        .unwrap()
+}
+
 async fn fail_execution(pool: &sqlx::PgPool, execution_id: uuid::Uuid) {
     sqlx::query("UPDATE executions SET status = 'failed', error = '\"boom\"'::jsonb, finished_at = now() WHERE id = $1")
         .bind(execution_id)
@@ -1633,6 +1658,64 @@ async fn fail_execution(pool: &sqlx::PgPool, execution_id: uuid::Uuid) {
 async fn make_runtime_due(pool: &sqlx::PgPool, runtime_id: uuid::Uuid) {
     sqlx::query(
         "UPDATE agent_runtimes SET next_run_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(runtime_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn runtime_stops_after_consecutive_failures() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let runtime = app
+        .store
+        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
+        .await
+        .unwrap();
+    let pool = raw_pool().await;
+    let limit = orbit_api::background::RUNTIME_MAX_CONSECUTIVE_FAILURES;
+
+    for round in 1..=limit {
+        make_runtime_due(&pool, runtime.id).await;
+        orbit_api::background::runtime_tick(&app.state)
+            .await
+            .unwrap();
+        let id = runtime_row(&app, agent_id).await.last_execution_id.unwrap();
+        fail_execution(&pool, id).await;
+        make_runtime_due(&pool, runtime.id).await;
+        orbit_api::background::runtime_tick(&app.state)
+            .await
+            .unwrap();
+        let row = runtime_row(&app, agent_id).await;
+        assert_eq!(row.consecutive_failures, round);
+        if round < limit {
+            assert_eq!(row.status, "running");
+        }
+    }
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.status, "stopped");
+    assert!(row.last_error.as_deref().unwrap().contains(&format!(
+        "stopped after {limit} consecutive failed executions"
+    )));
+}
+
+async fn new_execution(app: &TestApp, agent_id: Uuid) -> Uuid {
+    let (status, execution) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/agents/{agent_id}/executions"),
+            json!({ "task": "approval policy test" }),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{execution}");
@@ -1657,9 +1740,21 @@ async fn approval_decisions_require_use_and_optional_four_eyes() {
     let Some(app) = test_app(true).await else {
         return;
     };
-
-    let _serial = RUNTIME_TICK_LOCK.lock().await;
-    let user = app
+    let _serial = APPROVAL_SETTINGS_LOCK.lock().await;
+    reset_approval_policy(&app).await;
+    app.store
+        .create_custom_role(
+            app.org_id,
+            "Approver",
+            &[
+                "agents:read".into(),
+                "executions:read".into(),
+                "approvals:decide".into(),
+            ],
+        )
+        .await
+        .unwrap();
+    let carol = app
         .store
         .ensure_user(
             app.org_id,
@@ -1684,69 +1779,8 @@ async fn approval_decisions_require_use_and_optional_four_eyes() {
         )
         .await
         .unwrap();
-
-
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-    let first = runtime_row(&app, agent_id).await.last_execution_id.unwrap();
-    fail_execution(&pool, first).await;
-    make_runtime_due(&pool, runtime.id).await;
-
-    // Failure is accounted for and delays the next run; no new execution yet.
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-    let row = runtime_row(&app, agent_id).await;
-    assert_eq!(row.status, "running");
-    assert_eq!(row.consecutive_failures, 1);
-    assert_eq!(row.failed_execution_id, Some(first));
-    assert_eq!(row.last_execution_id, Some(first));
-    assert!(row.last_error.as_deref().unwrap().contains("boom"));
-    assert!(row.next_run_at > chrono::Utc::now() + chrono::Duration::seconds(30));
-
-    // Not yet due: still nothing new, and the failure is not double counted.
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-    let row = runtime_row(&app, agent_id).await;
-    assert_eq!(row.consecutive_failures, 1);
-    assert_eq!(row.last_execution_id, Some(first));
-
-    // Backoff elapsed: the next tick creates a new execution.
-    make_runtime_due(&pool, runtime.id).await;
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-    let row = runtime_row(&app, agent_id).await;
-    let second = row.last_execution_id.unwrap();
-    assert_ne!(second, first, "runtime must continue after a failure");
-    assert_eq!(row.consecutive_failures, 1, "reset only after a success");
-    assert!(row.last_error.is_none());
-
-    // A successful execution resets the counter on the following launch.
-    sqlx::query("UPDATE executions SET status = 'succeeded', finished_at = now() WHERE id = $1")
-        .bind(second)
-        .execute(&pool)
-        .await
-        .unwrap();
-    make_runtime_due(&pool, runtime.id).await;
-    orbit_api::background::runtime_tick(&app.state)
-        .await
-        .unwrap();
-    let row = runtime_row(&app, agent_id).await;
-    assert_ne!(row.last_execution_id, Some(second));
-    assert_eq!(row.consecutive_failures, 0);
-    assert!(row.failed_execution_id.is_none());
-}
-
-#[tokio::test]
-async fn runtime_stops_after_consecutive_failures() {
-    let Some(app) = test_app(false).await else {
-        return;
-    };
-    let _serial = RUNTIME_TICK_LOCK.lock().await;
-    let user = app
+    // Someone other than Carol owns the agent, so only her team role grants access.
+    let dave = app
         .store
         .ensure_user(
             app.org_id,
@@ -1756,7 +1790,6 @@ async fn runtime_stops_after_consecutive_failures() {
         )
         .await
         .unwrap();
-
     app.store
         .assign_resource_owner(app.org_id, "agents", app.agent_id, dave.id)
         .await
@@ -1875,6 +1908,8 @@ async fn expired_approval_cannot_be_decided_via_api() {
     let Some(app) = test_app(true).await else {
         return;
     };
+    let _serial = APPROVAL_SETTINGS_LOCK.lock().await;
+    reset_approval_policy(&app).await;
     let execution_id = new_execution(&app, app.agent_id).await;
     let approval = app
         .store
@@ -1929,7 +1964,8 @@ async fn worker_approvals_are_bound_to_the_execution_and_clamped() {
         return;
     };
     let issued = orbit_security::issue_worker_token();
-    app.store
+    let token_record = app
+        .store
         .create_worker_token(
             app.org_id,
             None,
@@ -1953,6 +1989,17 @@ async fn worker_approvals_are_bound_to_the_execution_and_clamped() {
         .unwrap();
     let other_agent = create_demo_agent(&app.store, app.org_id, zed.id).await;
     let execution_b = new_execution(&app, other_agent).await;
+    for execution_id in [execution_a, execution_b] {
+        app.store
+            .claim_execution(execution_id, "approvals-test-worker")
+            .await
+            .unwrap()
+            .expect("execution is queued");
+        app.store
+            .bind_execution_worker_token(execution_id, token_record.id)
+            .await
+            .unwrap();
+    }
 
     // u64::MAX must neither panic nor produce an absurd deadline.
     let (status, body) = send(

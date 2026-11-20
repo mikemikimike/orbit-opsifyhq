@@ -99,6 +99,24 @@ async fn decide(
         agent.owner_team_id,
         &agent.visibility,
     )?;
+    // An expired approval is reported as expired even when four-eyes would also refuse
+    // it; the row is marked expired by the same conditional update.
+    if existing
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= chrono::Utc::now())
+    {
+        let _ = state
+            .store
+            .decide_approval(
+                auth.org_id,
+                approval_id,
+                decision,
+                auth.user_id,
+                comment.as_deref(),
+            )
+            .await;
+        return Err(ApiError::conflict("approval expired"));
+    }
     // Optional four-eyes policy: whoever requested the execution cannot decide it.
     if execution.requested_by == Some(auth.user_id)
         && crate::handlers::settings::load_approvals_settings(&state.store)
