@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ArrowUpRight, Check, ShieldCheck, X } from "lucide-react";
 import { toast } from "sonner";
@@ -10,38 +10,24 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
 import { Card } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
-import { Field } from "@/components/ui/field";
 import { PageHeader } from "@/components/ui/page-header";
 import { Section } from "@/components/ui/section";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import { queryKeys, unwrap, useApprovals } from "@/lib/queries";
 import { errorMessage } from "@orbit/api-client";
 import { formatDateTime, relativeTime, titleCase } from "@/lib/utils";
-import { brandName, capabilityLabel, effectLabel, effectTone } from "@/lib/presentation";
+import { capabilityLabel } from "@/lib/presentation";
 import type { ApprovalWithExecution } from "@/lib/types";
+import { ApprovalDetails } from "@/components/approvals/approval-details";
 
-interface ReviewState {
-  approval: ApprovalWithExecution;
-  decision: "approved" | "rejected";
-}
+type ApprovalDecision = "approved" | "rejected";
 
 export default function ApprovalsPage() {
   const pending = useApprovals("pending");
   const decided = useApprovals(undefined);
   const queryClient = useQueryClient();
-  const [review, setReview] = useState<ReviewState | null>(null);
-  const [comment, setComment] = useState("");
 
   const history = useMemo(
     () => (decided.data ?? []).filter((item) => item.status !== "pending").slice(0, 30),
@@ -49,7 +35,13 @@ export default function ApprovalsPage() {
   );
 
   const decide = useMutation({
-    mutationFn: async ({ approval, decision }: ReviewState) =>
+    mutationFn: async ({
+      approval,
+      decision,
+    }: {
+      approval: ApprovalWithExecution;
+      decision: ApprovalDecision;
+    }) =>
       unwrap(
         await api.POST(
           decision === "approved"
@@ -57,14 +49,12 @@ export default function ApprovalsPage() {
             : "/api/v1/approvals/{approval_id}/reject",
           {
             params: { path: { approval_id: approval.id } },
-            body: { comment: comment.trim() || undefined },
+            body: {},
           },
         ),
       ),
     onSuccess: (_, variables) => {
       toast.success(variables.decision === "approved" ? "Approved" : "Rejected");
-      setReview(null);
-      setComment("");
       void queryClient.invalidateQueries({ queryKey: queryKeys.approvals("pending") });
       void queryClient.invalidateQueries({ queryKey: queryKeys.approvals(undefined) });
       void queryClient.invalidateQueries({ queryKey: queryKeys.dashboard });
@@ -74,13 +64,6 @@ export default function ApprovalsPage() {
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
-
-  function open(approval: ApprovalWithExecution, decision: ReviewState["decision"]) {
-    setComment("");
-    setReview({ approval, decision });
-  }
-
-  const approving = review?.decision === "approved";
 
   return (
     <div className="space-y-7">
@@ -102,8 +85,14 @@ export default function ApprovalsPage() {
               <li key={approval.id}>
                 <ApprovalCard
                   approval={approval}
-                  onApprove={() => open(approval, "approved")}
-                  onReject={() => open(approval, "rejected")}
+                  pending={decide.isPending && decide.variables?.approval.id === approval.id}
+                  pendingDecision={
+                    decide.isPending && decide.variables?.approval.id === approval.id
+                      ? decide.variables?.decision
+                      : undefined
+                  }
+                  onApprove={() => decide.mutate({ approval, decision: "approved" })}
+                  onReject={() => decide.mutate({ approval, decision: "rejected" })}
                 />
               </li>
             ))}
@@ -163,62 +152,20 @@ export default function ApprovalsPage() {
         )}
       </Section>
 
-      <Dialog open={Boolean(review)} onOpenChange={(next) => !next && setReview(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{approving ? "Approve this action?" : "Reject this action?"}</DialogTitle>
-            <DialogDescription>
-              {approving
-                ? "The agent may make this exact call once. Anything else it tries is asked again."
-                : "The call is not made. The agent is told it was refused and carries on without it."}
-            </DialogDescription>
-          </DialogHeader>
-          {review ? <ApprovalDetails approval={review.approval} /> : null}
-          <Field
-            label="Comment"
-            optional
-            htmlFor="approval-comment"
-            hint="Recorded in the audit trail with your decision."
-          >
-            <Textarea
-              id="approval-comment"
-              value={comment}
-              onChange={(event) => setComment(event.target.value)}
-              placeholder={approving ? "Why is this safe to run?" : "Why is this refused?"}
-            />
-          </Field>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setReview(null)}>
-              Cancel
-            </Button>
-            <Button
-              variant={approving ? "default" : "destructive"}
-              loading={decide.isPending}
-              onClick={() => review && decide.mutate(review)}
-            >
-              {approving ? (
-                <>
-                  <Check /> Approve
-                </>
-              ) : (
-                <>
-                  <X /> Reject
-                </>
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }
 
 function ApprovalCard({
   approval,
+  pending,
+  pendingDecision,
   onApprove,
   onReject,
 }: {
   approval: ApprovalWithExecution;
+  pending: boolean;
+  pendingDecision?: ApprovalDecision;
   onApprove: () => void;
   onReject: () => void;
 }) {
@@ -253,10 +200,17 @@ function ApprovalCard({
               variant="outline"
               className="flex-1 text-destructive hover:border-destructive/50 hover:bg-destructive/10 sm:flex-none"
               onClick={onReject}
+              loading={pending && pendingDecision === "rejected"}
+              disabled={pending}
             >
               <X /> Reject
             </Button>
-            <Button className="flex-1 sm:flex-none" onClick={onApprove}>
+            <Button
+              className="flex-1 sm:flex-none"
+              onClick={onApprove}
+              loading={pending && pendingDecision === "approved"}
+              disabled={pending}
+            >
               <Check /> Approve
             </Button>
           </div>
@@ -264,61 +218,6 @@ function ApprovalCard({
         <ApprovalDetails approval={approval} />
       </div>
     </Card>
-  );
-}
-
-function ApprovalDetails({ approval }: { approval: ApprovalWithExecution }) {
-  const action = (approval.requestedAction ?? {}) as {
-    capability?: string;
-    connector?: string;
-    connectionName?: string;
-    effect?: string;
-    arguments?: Record<string, unknown>;
-  };
-  const args = action.arguments ?? {};
-  const rows = actionRows(action.capability, args);
-  const tone = effectTone(action.effect);
-  return (
-    <div className="space-y-3 rounded-lg border bg-subtle p-3 text-[13px]">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
-        <Badge variant={tone === "safe" ? "secondary" : "warning"}>
-          {effectLabel(action.effect)}
-        </Badge>
-        <span>
-          <span className="text-muted-foreground">Agent</span> {approval.agentName}
-        </span>
-        {action.connectionName ? (
-          <span>
-            <span className="text-muted-foreground">Connection</span> {action.connectionName}
-          </span>
-        ) : null}
-        {action.connector ? (
-          <span>
-            <span className="text-muted-foreground">Connector</span> {brandName(action.connector)}
-          </span>
-        ) : null}
-      </div>
-      {rows.length ? (
-        <dl className="grid gap-x-4 gap-y-1.5 sm:grid-cols-[6rem_minmax(0,1fr)]">
-          {rows.map(([label, value]) => (
-            <div key={label} className="contents">
-              <dt className="text-muted-foreground">{titleCase(label)}</dt>
-              <dd className="break-words font-mono text-xs leading-relaxed">{value}</dd>
-            </div>
-          ))}
-        </dl>
-      ) : null}
-      {Object.keys(args).length ? (
-        <details>
-          <summary className="w-fit cursor-pointer select-none text-muted-foreground hover:text-foreground">
-            Full arguments
-          </summary>
-          <pre className="code-block mt-1.5 max-h-48 whitespace-pre-wrap break-words bg-card">
-            {JSON.stringify(args, null, 2)}
-          </pre>
-        </details>
-      ) : null}
-    </div>
   );
 }
 
@@ -346,35 +245,6 @@ function approvalTitle(approval: ApprovalWithExecution): string {
   }
 }
 
-function actionRows(
-  capability: string | undefined,
-  args: Record<string, unknown>,
-): Array<[string, string]> {
-  const rows: Array<[string, string]> = [];
-  const push = (label: string, value: unknown) => {
-    if (value !== undefined && value !== null && String(value).trim() !== "") {
-      rows.push([label, String(value).slice(0, 1000)]);
-    }
-  };
-  // Where it happens comes first: the same action on another repository is another decision.
-  push("repository", [args.owner, args.repo ?? args.project].filter(Boolean).join("/"));
-  if (capability === "repo.commit") push("message", args.message);
-  if (capability === "repo.push") push("branch", args.branch);
-  if (capability === "pulls.create") {
-    push("title", args.title);
-    push("head", args.head);
-    push("base", args.base);
-    push("draft", args.draft);
-  }
-  if (capability?.startsWith("issues.")) push("number", args.number);
-  if (capability === "issues.update" || capability === "issues.create") {
-    push("state", args.state);
-    push("labels", Array.isArray(args.labels) ? args.labels.join(", ") : args.labels);
-    push("assignees", Array.isArray(args.assignees) ? args.assignees.join(", ") : args.assignees);
-  }
-  if (capability === "issues.comment") push("body", args.body);
-  return rows;
-}
 
 function capabilityOf(approval: ApprovalWithExecution): string {
   const action = (approval.requestedAction ?? {}) as { capability?: string };
