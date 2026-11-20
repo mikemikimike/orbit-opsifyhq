@@ -3119,3 +3119,85 @@ async fn team_queue_requires_team_view_and_use() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+fn anon_put(path: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn oidc_settings_update_preserves_absent_fields() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let path = "/api/v1/settings/oidc";
+    let (status, body) = send(
+        &app.router,
+        anon_put(
+            path,
+            json!({ "settings": {
+                "issuer": "https://idp.example.com",
+                "clientId": "orbit",
+                "groupRoles": { "admins": "admin" },
+                "teamGroups": { "eng": "platform:lead" },
+                "syncRoles": true,
+                "roleClaim": "roles",
+                "autoCreateTeams": true,
+                "requireMappedGroup": true,
+            } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A partial body (what the form used to send) must not reset the mappings.
+    let (status, body) = send(
+        &app.router,
+        anon_put(
+            path,
+            json!({ "settings": { "issuer": "https://idp2.example.com", "clientId": "orbit2" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(&app.router, get(path)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["issuer"], "https://idp2.example.com");
+    assert_eq!(body["clientId"], "orbit2");
+    assert_eq!(body["groupRoles"], json!({ "admins": "admin" }));
+    assert_eq!(body["teamGroups"], json!({ "eng": "platform:lead" }));
+    assert_eq!(body["syncRoles"], true);
+    assert_eq!(body["roleClaim"], "roles");
+    assert_eq!(body["autoCreateTeams"], true);
+    assert_eq!(body["requireMappedGroup"], true);
+
+    // Explicit values still clear a mapping.
+    let (status, _) = send(
+        &app.router,
+        anon_put(path, json!({ "settings": { "groupRoles": {} } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = send(&app.router, get(path)).await;
+    assert_eq!(body["groupRoles"], json!({}));
+    assert_eq!(body["syncRoles"], true);
+
+    // A validation error returns 422 and changes nothing.
+    for bad in [
+        json!({ "settings": { "issuer": "ftp://nope" } }),
+        json!({ "settings": { "groupRoles": { "x": "superuser" } } }),
+        json!({ "settings": { "syncRoles": "yes" } }),
+        json!({ "settings": "not an object" }),
+    ] {
+        let (_, before) = send(&app.router, get(path)).await;
+        let (status, body) = send(&app.router, anon_put(path, bad.clone())).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {body}");
+        assert_eq!(body["error"]["code"], "validation_error");
+        let (_, after) = send(&app.router, get(path)).await;
+        assert_eq!(before, after, "{bad} changed stored settings");
+    }
+}

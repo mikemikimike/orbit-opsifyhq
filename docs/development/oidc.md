@@ -123,6 +123,12 @@ the environment configuration in OIDC mode, and applied when the API starts — 
 API after saving. `ORBIT_OIDC_CLIENT_SECRET` is never stored by the UI; keep
 confidential-client secrets in the deployment Secret.
 
+`PUT /api/v1/settings/oidc` is a merge: only the fields present in `settings` change, and
+absent fields (role claim, `groupRoles`, `teamGroups`, `autoCreateTeams`,
+`requireMappedGroup`, `syncRoles`) keep their stored value. The merged result is validated
+before it is stored (422 and no change on error). To clear a mapping, send it explicitly,
+for example `"groupRoles": {}`.
+
 ## Web flow
 
 ```text

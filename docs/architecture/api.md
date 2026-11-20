@@ -96,7 +96,7 @@ validated with field-level `details` and recorded in the audit log.
 | `GET/POST /api/v1/api-tokens` | list / create user API tokens |
 | `DELETE /api/v1/api-tokens/{id}` | revoke API token |
 | `GET /api/v1/agent-instances` | long-running agent instances |
-| `GET/PUT /api/v1/settings/oidc` | read / update OIDC configuration |
+| `GET/PUT /api/v1/settings/oidc` | read / update OIDC configuration (PUT merges; absent fields are kept) |
 | `GET /api/v1/organizations/current` | current organization |
 | `GET /api/v1/users` | organization members |
 | `PATCH /api/v1/users/{id}` | update a member role |

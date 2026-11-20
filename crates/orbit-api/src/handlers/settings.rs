@@ -59,7 +59,32 @@ pub struct OidcSettings {
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateOidcRequest {
-    pub settings: OidcSettings,
+    /// Partial or full OIDC settings. Fields that are absent keep their stored value.
+    /// Kept as raw JSON so "absent" can be told apart from "empty"; the schema is
+    /// still `OidcSettings`.
+    #[schema(value_type = OidcSettings)]
+    pub settings: serde_json::Value,
+}
+
+/// Overlay the keys present in `patch` onto the stored settings object and parse the
+/// result. Absent keys keep their stored value (or the serde default when nothing is
+/// stored yet). Errors describe the first malformed field.
+fn merge_oidc_settings(
+    stored: Option<serde_json::Value>,
+    patch: serde_json::Value,
+) -> Result<OidcSettings, ValidationIssue> {
+    let serde_json::Value::Object(patch) = patch else {
+        return Err(ValidationIssue::new("settings", "must be an object"));
+    };
+    let mut merged = match stored {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    for (key, value) in patch {
+        merged.insert(key, value);
+    }
+    serde_json::from_value(serde_json::Value::Object(merged))
+        .map_err(|e| ValidationIssue::new("settings", e.to_string()))
 }
 
 #[utoipa::path(get, path = "/api/v1/settings/oidc", tag = "settings", responses((status = 200, body = OidcSettings)))]
@@ -179,6 +204,13 @@ fn oidc_audit_summary(settings: &OidcSettings) -> serde_json::Value {
     })
 }
 
+/// Update the OIDC sign-in settings.
+///
+/// This is a merge: only the fields present in `settings` change, and absent fields
+/// (including `roleClaim`, `groupRoles`, `teamGroups`, `autoCreateTeams`,
+/// `requireMappedGroup` and `syncRoles`) are preserved. To clear a mapping, send it
+/// explicitly (for example `"groupRoles": {}`). The merged result is validated before
+/// it is stored.
 #[utoipa::path(put, path = "/api/v1/settings/oidc", tag = "settings", request_body = UpdateOidcRequest, responses((status = 200, body = OidcSettings), (status = 422, body = crate::error::ErrorEnvelope)))]
 pub async fn update_oidc(
     State(state): State<AppState>,
@@ -186,23 +218,23 @@ pub async fn update_oidc(
     ApiJson(body): ApiJson<UpdateOidcRequest>,
 ) -> Result<Json<OidcSettings>, ApiError> {
     auth.require(Permission::SettingsWrite)?;
-    let issues = validate_oidc(&state, &body.settings);
+    let stored_before = state.store.get_platform_setting("oidc").await?;
+    let before = stored_before
+        .clone()
+        .and_then(|value| serde_json::from_value::<OidcSettings>(value).ok())
+        .map(|settings| oidc_audit_summary(&settings));
+    let merged = merge_oidc_settings(stored_before, body.settings)
+        .map_err(|issue| ApiError::validation(vec![issue]))?;
+    let issues = validate_oidc(&state, &merged);
     if !issues.is_empty() {
         return Err(ApiError::validation(issues));
     }
-    let before = state
-        .store
-        .get_platform_setting("oidc")
-        .await?
-        .and_then(|value| serde_json::from_value::<OidcSettings>(value).ok())
-        .map(|settings| oidc_audit_summary(&settings));
-    let value =
-        serde_json::to_value(&body.settings).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let value = serde_json::to_value(&merged).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let stored = state
         .store
         .set_platform_setting("oidc", &value, Some(auth.user_id))
         .await?;
-    let settings: OidcSettings = serde_json::from_value(stored).unwrap_or(body.settings);
+    let settings: OidcSettings = serde_json::from_value(stored).unwrap_or(merged);
     audit::record(
         &state,
         &auth,

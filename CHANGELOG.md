@@ -10,6 +10,11 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ### Fixed
 
+- Saving Settings -> Sign-in (OIDC) no longer erases the role claim, group/team mappings,
+  auto-create-teams and sync-roles settings, and a failed save now shows the server error
+  instead of "saved" (#197). `PUT /api/v1/settings/oidc` now merges: absent fields keep
+  their stored value. The form loads via a query (no fetch during render), sends the full
+  loaded object with its edits, and reports load errors with a retry.
 - Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval
   mode when no tool-policy rule matches. L4/Auto no longer asks for every call; L3/Auto
   still requires approval and L1/L2 still deny writes. Explicit rules can only tighten
