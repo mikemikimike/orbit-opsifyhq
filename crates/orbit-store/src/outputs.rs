@@ -187,7 +187,7 @@ impl Store {
              AND t.updated_at >= GREATEST(o.enqueue_from, o.enqueue_cursor - interval '5 minutes')
              AND COALESCE(t.finished_at, t.updated_at) >= o.enqueue_from
             WHERE o.enabled AND o.team_id IS NOT NULL
-            ON CONFLICT (output_id, team_run_id) DO NOTHING
+            ON CONFLICT (output_id, team_run_id) WHERE team_run_id IS NOT NULL DO NOTHING
             "#,
         )
         .execute(&mut *tx)

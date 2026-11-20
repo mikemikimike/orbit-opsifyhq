@@ -1163,6 +1163,66 @@ async fn custom_roles_round_trip() {
 }
 
 #[tokio::test]
+async fn team_output_enqueue_uses_the_partial_unique_index() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let team = store
+        .create_agent_team(
+            org,
+            &format!("Team {}", uuid::Uuid::now_v7()),
+            "team output",
+            &serde_json::json!({ "steps": [] }),
+            Some(user),
+        )
+        .await
+        .unwrap();
+    let output = store
+        .create_output(
+            org,
+            &format!("team-output-{}", uuid::Uuid::now_v7()),
+            "webhook",
+            None,
+            Some(team.id),
+            &["succeeded".to_string()],
+            "secret://output/team",
+            None,
+        )
+        .await
+        .unwrap();
+    let run = store
+        .create_team_run(
+            org,
+            team.id,
+            &serde_json::json!({ "task": "t" }),
+            Some(user),
+        )
+        .await
+        .unwrap();
+    store
+        .finish_team_run(
+            run.id,
+            "succeeded",
+            Some(&serde_json::json!({ "ok": true })),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.enqueue_team_output_deliveries().await.unwrap(), 1);
+    // The second pass overlaps the cursor but must dedupe via the partial unique index.
+    assert_eq!(store.enqueue_team_output_deliveries().await.unwrap(), 0);
+    let deliveries: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM output_deliveries WHERE org_id = $1 AND output_id = $2",
+    )
+    .bind(org)
+    .bind(output.id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(deliveries, 1);
+}
+
 async fn env_mappings_and_outputs_round_trip() {
     let Some(store) = test_store().await else {
         return;
@@ -1693,12 +1753,13 @@ async fn single_execution_launch_tokens_are_revoked_when_execution_is_terminal()
         .await
         .unwrap();
 
-    // Execution still queued: nothing is revoked.
-    assert!(store
+    // Execution still queued: neither token is revoked. (The revoke helper is global, so
+    // old terminal launches from earlier test runs may also be returned.)
+    assert!(!store
         .revoke_finished_single_execution_tokens()
         .await
         .unwrap()
-        .is_empty());
+        .contains(&single_record.id));
     assert!(store
         .find_worker_token_by_hash(&single.hash)
         .await
