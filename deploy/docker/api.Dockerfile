@@ -31,6 +31,8 @@ RUN mkdir -p crates/orbit-domain/src crates/orbit-contracts/src crates/orbit-sto
     && cargo fetch --locked
 
 COPY crates ./crates
+# Documentation is embedded into orbit-api at compile time (crates/orbit-api/src/docs.rs).
+COPY docs ./docs
 COPY services ./services
 RUN cargo build --release --locked -p orbit-api-server --bin orbit-api
 

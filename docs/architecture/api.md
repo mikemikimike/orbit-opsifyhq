@@ -47,6 +47,9 @@ validated with field-level `details` and recorded in the audit log.
 | `GET /healthz`, `GET /readyz` | liveness / dependency readiness |
 | `GET /metrics` | Prometheus metrics |
 | `GET /api/v1/meta` | platform version, auth mode, capabilities |
+| `GET /api/v1/docs` | embedded documentation index (categories and pages); authenticated |
+| `GET /api/v1/docs/{slug}` | one page: JSON with Markdown, `?format=markdown`, or HTML (`?format=html` / `Accept: text/html`); relative links are rewritten to `/api/v1/docs/...` |
+| `GET /api/v1/docs/assets/{path}` | embedded images used by the docs |
 | `GET /api/v1/me` | current user, organization, role, permissions |
 | `GET/POST /api/v1/agents` | list (filter/search) / create agent + version 1 |
 | `GET/PATCH/DELETE /api/v1/agents/{id}` | read / new version or metadata / archive |

@@ -141,8 +141,15 @@ use crate::handlers;
         handlers::tool_policies::create,
         handlers::tool_policies::update,
         handlers::tool_policies::delete,
+        handlers::docs::index,
+        handlers::docs::get_page,
+        handlers::docs::get_asset,
     ),
     components(schemas(
+        crate::docs::DocIndex,
+        crate::docs::DocCategory,
+        crate::docs::DocSummary,
+        crate::docs::DocPageView,
         ErrorEnvelope,
         ErrorBody,
         AgentSummary,
@@ -274,6 +281,7 @@ use crate::handlers;
         (name = "connectors", description = "Connector registry and connections"),
         (name = "triggers", description = "Schedules, webhooks and event triggers"),
         (name = "dashboard", description = "Aggregated platform status"),
+        (name = "docs", description = "Embedded documentation (authenticated)"),
     )
 )]
 pub struct ApiDoc;

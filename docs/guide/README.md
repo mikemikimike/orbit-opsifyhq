@@ -1,7 +1,7 @@
 # ORBIT guide
 
 Practical, task-oriented documentation. For design rationale see
-[`docs/architecture`](../architecture) and [`docs/decisions`](../decisions).
+[architecture](../architecture/overview.md) and [decisions](../decisions/README.md).
 
 | Topic | Page |
 |---|---|

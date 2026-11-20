@@ -109,7 +109,7 @@ helm template orbit deploy/helm/orbit -f deploy/helm/orbit/values.yaml
 4. Register it in `HarnessRegistry::builtin()`.
 5. Pass `orbit_harness::testing::assert_adapter_contract` in `crates/orbit-harness/tests`.
 6. Add a compliance test against the real harness binary/container and document the
-   tested version in `docs/architecture/harness-contract.md`.
+   tested version in `docs/architecture/runtime-contract.md`.
 7. Never hardcode provider names or model inventories.
 
 ## Adding a provider kind

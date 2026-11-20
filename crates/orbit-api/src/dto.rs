@@ -483,6 +483,8 @@ pub struct MetaResponse {
     pub events_driver: String,
     pub features: MetaFeatures,
     pub license: orbit_security::LicenseStatus,
+    /// Route of the embedded documentation index (authenticated).
+    pub docs_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]

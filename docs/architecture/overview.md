@@ -60,7 +60,7 @@ ORBIT is a Rust workspace with a Next.js frontend:
 | `services/worker` | Execution-plane binary |
 | `apps/web` | Next.js web app |
 
-See [AGENTS.md](../../AGENTS.md) for the full repository map.
+See `AGENTS.md` in the repository root for the full repository map.
 
 ## 4. Request & execution flow
 

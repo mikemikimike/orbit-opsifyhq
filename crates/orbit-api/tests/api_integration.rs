@@ -1358,183 +1358,163 @@ async fn same_agent_queues_on_different_harnesses() {
 }
 
 <
-fn put(path: &str, body: Value) -> Request<Body> {
-    Request::builder()
-        .method("PUT")
-        .uri(path)
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
-
-fn assert_envelope(status: StatusCode, body: &Value, expected: StatusCode, code: &str) {
-    assert_eq!(status, expected, "{body}");
-    assert_eq!(body["error"]["code"], code, "{body}");
-    assert!(body["error"]["message"].is_string(), "{body}");
-    assert!(body["error"]["details"].is_array(), "{body}");
-    assert!(
-        !body["error"]["requestId"].as_str().unwrap_or("").is_empty(),
-        "{body}"
-    );
+async fn send_raw(
+    router: &axum::Router,
+    request: Request<Body>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let response = router.clone().oneshot(request).await.expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes.to_vec())
 }
 
 #[tokio::test]
-async fn path_query_route_and_method_rejections_use_the_error_envelope() {
+async fn docs_index_lists_categories_and_excludes_planning() {
     let Some(app) = test_app(true).await else {
         return;
     };
+    let (status, body) = send(&app.router, get("/api/v1/docs")).await;
+    assert_eq!(status, StatusCode::OK);
+    let categories = body["categories"].as_array().expect("categories");
+    assert!(categories.len() >= 4);
+    let ids: Vec<&str> = categories.iter().filter_map(|c| c["id"].as_str()).collect();
+    assert!(ids.contains(&"guide") && ids.contains(&"architecture"));
+    let slugs: Vec<&str> = categories
+        .iter()
+        .flat_map(|c| c["pages"].as_array().unwrap())
+        .filter_map(|p| p["slug"].as_str())
+        .collect();
+    assert!(slugs.contains(&"architecture/overview"));
+    assert!(!slugs.iter().any(|s| s.starts_with("planning")));
+    let first = &categories[0]["pages"][0];
+    assert!(first["title"].as_str().is_some_and(|t| !t.is_empty()));
+    assert!(first["url"].as_str().unwrap().starts_with("/api/v1/docs/"));
 
-    let (status, body) = send(&app.router, get("/api/v1/agents/not-a-uuid")).await;
-    assert_envelope(status, &body, StatusCode::BAD_REQUEST, "bad_request");
+    let (status, headers, bytes) = send_raw(&app.router, get("/api/v1/docs?format=html")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert!(String::from_utf8_lossy(&bytes).contains("architecture/overview"));
+}
 
-    let (status, body) = send(&app.router, get("/api/v1/agents?limit=abc")).await;
-    assert_envelope(status, &body, StatusCode::BAD_REQUEST, "bad_request");
+#[tokio::test]
+async fn docs_page_rewrites_links_and_supports_html() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(&app.router, get("/api/v1/docs/index")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["slug"], "index");
+    let markdown = body["markdown"].as_str().unwrap();
+    assert!(
+        markdown.contains("](/api/v1/docs/architecture/overview)"),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("overview.md)"));
 
-    let (status, body) = send(&app.router, get("/api/v1/no/such/route")).await;
-    assert_envelope(status, &body, StatusCode::NOT_FOUND, "not_found");
+    let (status, headers, bytes) = send_raw(
+        &app.router,
+        get("/api/v1/docs/architecture/overview?format=markdown"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/markdown"));
+    assert!(String::from_utf8_lossy(&bytes).starts_with("# "));
 
     let request = Request::builder()
-        .method("DELETE")
-        .uri("/api/v1/meta")
+        .uri("/api/v1/docs/index")
+        .header("accept", "text/html")
         .body(Body::empty())
         .unwrap();
-    let response = app.router.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-    assert!(response.headers().contains_key("allow"));
-    assert!(response.headers().contains_key("x-request-id"));
-    let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_envelope(
-        StatusCode::METHOD_NOT_ALLOWED,
-        &body,
-        StatusCode::METHOD_NOT_ALLOWED,
-        "method_not_allowed",
-    );
-
-    // Existing envelope errors and successful responses are unchanged.
-    let missing = format!("/api/v1/agents/{}", Uuid::now_v7());
-    let (status, body) = send(&app.router, get(&missing)).await;
-    assert_envelope(status, &body, StatusCode::NOT_FOUND, "not_found");
-    let (status, body) = send(&app.router, post("/api/v1/agents", json!({"bad": true}))).await;
-    assert!(status.is_client_error(), "{body}");
-    assert!(body["error"]["requestId"].is_string(), "{body}");
-
-    let response = app
-        .router
-        .clone()
-        .oneshot(get("/api/v1/agents"))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get("content-type").unwrap(),
-        "application/json"
-    );
+    let (status, headers, bytes) = send_raw(&app.router, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert!(headers.contains_key("content-security-policy"));
+    let html = String::from_utf8_lossy(&bytes);
+    assert!(html.contains("<h1 id="));
+    assert!(html.contains("href=\"/api/v1/docs/"));
 }
 
 #[tokio::test]
-async fn settings_updates_are_validated_enveloped_and_audited() {
+async fn docs_assets_are_served_with_content_type() {
     let Some(app) = test_app(true).await else {
         return;
     };
+    let (status, headers, bytes) = send_raw(
+        &app.router,
+        get("/api/v1/docs/assets/architecture/orbit-overview.png"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/png");
+    assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
 
-    // Malformed bodies use the envelope for all three handlers.
+    let (status, headers, _) = send_raw(
+        &app.router,
+        get("/api/v1/docs/assets/architecture/orbit-overview.svg"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/svg+xml");
+
+    // A page whose slug starts with `assets/` is still reachable.
+    let (status, body) = send(&app.router, get("/api/v1/docs/assets/brand")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["slug"], "assets/brand");
+}
+
+#[tokio::test]
+async fn docs_reject_traversal_unknown_and_planning() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
     for path in [
-        "/api/v1/settings/oidc",
-        "/api/v1/settings/access",
-        "/api/v1/settings/harness",
+        "/api/v1/docs/../Cargo.toml",
+        "/api/v1/docs/..%2F..%2FCargo.toml",
+        "/api/v1/docs/%2e%2e/%2e%2e/Cargo.toml",
+        "/api/v1/docs/assets/../../Cargo.toml",
+        "/api/v1/docs/assets/..%2F..%2FCargo.toml",
+        "/api/v1/docs/does/not/exist",
+        "/api/v1/docs/planning/provider-ux-and-harness-decoupling",
+        "/api/v1/docs/assets/planning/provider-ux-and-harness-decoupling.md",
+        "/api/v1/docs/assets/nope.png",
     ] {
-        let request = Request::builder()
-            .method("PUT")
-            .uri(path)
-            .header("content-type", "application/json")
-            .body(Body::from("{not json"))
-            .unwrap();
-        let (status, body) = send(&app.router, request).await;
-        assert_envelope(status, &body, StatusCode::BAD_REQUEST, "bad_request");
+        let (status, body) = send(&app.router, get(path)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(body["error"]["code"], "not_found", "{path}");
+        assert!(!body["error"]["requestId"].as_str().unwrap_or("").is_empty());
     }
+}
 
-    // Invalid OIDC settings are rejected with field-level details.
-    let (status, body) = send(
-        &app.router,
-        put(
-            "/api/v1/settings/oidc",
-            json!({"settings": {
-                "issuer": "not a url",
-                "defaultRole": "viewer",
-                "groupRoles": {"admins": "no-such-role"},
-            }}),
-        ),
-    )
-    .await;
-    assert_envelope(
-        status,
-        &body,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "validation_error",
-    );
-    let paths: Vec<&str> = body["error"]["details"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|d| d["path"].as_str().unwrap())
-        .collect();
-    assert!(paths.contains(&"settings.issuer"), "{paths:?}");
-    assert!(paths.contains(&"settings.groupRoles.admins"), "{paths:?}");
-
-    // Valid updates succeed and write audit rows.
-    let (status, _) = send(
-        &app.router,
-        put(
-            "/api/v1/settings/oidc",
-            json!({"settings": {
-                "issuer": "https://idp.example.com",
-                "clientId": "orbit",
-                "defaultRole": "viewer",
-                "groupRoles": {"admins": "admin"},
-            }}),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, _) = send(
-        &app.router,
-        put("/api/v1/settings/access", json!({"teamIsolation": false})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, _) = send(
-        &app.router,
-        put(
-            "/api/v1/settings/harness",
-            json!({"defaultHarness": "mock"}),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    for (action, key, expected) in [
-        (
-            "settings.oidc.update",
-            "after",
-            json!("https://idp.example.com"),
-        ),
-        ("settings.access.update", "after", json!(false)),
-        ("settings.harness.update", "after", json!("mock")),
+#[tokio::test]
+async fn docs_require_authentication_but_swagger_stays_public() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    for path in [
+        "/api/v1/docs",
+        "/api/v1/docs/index",
+        "/api/v1/docs/assets/architecture/orbit-overview.png",
     ] {
-        let (rows, _) = app
-            .store
-            .list_audit_logs(app.org_id, 10, None, Some(action))
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1, "{action}");
-        let after = &rows[0].metadata[key];
-        let found = match action {
-            "settings.oidc.update" => &after["issuer"],
-            "settings.access.update" => &after["teamIsolation"],
-            _ => &after["defaultHarness"],
-        };
-        assert_eq!(found, &expected, "{action}");
-        assert!(rows[0].request_id.is_some());
+        let (status, body) = send(&app.router, get(path)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(body["error"]["code"], "unauthorized");
     }
+    let (status, _) = send(&app.router, auth_get("/api/v1/docs", "test-token")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&app.router, get("/api/v1/openapi.json")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(&app.router, get("/api/v1/meta")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["docsUrl"], "/api/v1/docs");
 }

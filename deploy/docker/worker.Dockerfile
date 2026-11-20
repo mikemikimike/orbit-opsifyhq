@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # ORBIT execution-plane worker. Harness binaries are NOT bundled here: harness
-# containers/Jobs are separate images by design (see docs/architecture/harness-contract.md).
+# containers/Jobs are separate images by design (see docs/architecture/runtime-contract.md).
 FROM rust:1-bookworm AS builder
 WORKDIR /app
 
@@ -31,6 +31,8 @@ RUN mkdir -p crates/orbit-domain/src crates/orbit-contracts/src crates/orbit-sto
     && cargo fetch --locked
 
 COPY crates ./crates
+# Documentation is embedded into orbit-api at compile time (crates/orbit-api/src/docs.rs).
+COPY docs ./docs
 COPY services ./services
 RUN cargo build --release --locked -p orbit-worker --bin orbit-worker
 

@@ -63,6 +63,8 @@ tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "limi
 http = "1"
 utoipa = { version = "6", features = ["axum_extras", "chrono", "uuid"] }
 utoipa-swagger-ui = { version = "10", features = ["axum"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+rust-embed = { version = "8", features = ["debug-embed", "include-exclude"] }
 serde_yaml = "0.9"
 jsonschema = "0.26"
 async-nats = "0.52"
