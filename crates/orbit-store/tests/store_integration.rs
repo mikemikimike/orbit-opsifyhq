@@ -1241,7 +1241,7 @@ async fn env_mappings_and_outputs_round_trip() {
         )
         .await
         .expect("env mapping");
-    assert_eq!(store.list_env_mappings(org).await.unwrap().len(), 1);
+    assert_eq!(store.list_env_mappings(org, None).await.unwrap().len(), 1);
     assert_eq!(mapping.name, "Shared tokens");
     store.delete_env_mapping(org, mapping.id).await.unwrap();
 

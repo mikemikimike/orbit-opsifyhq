@@ -374,6 +374,12 @@ pub async fn create_profile(
     auth.require(Permission::SettingsWrite)?;
     validate_native_tool_permissions(&body.native_tool_permissions)?;
     let access = crate::access::AccessScope::load(&state, &auth).await?;
+    crate::handlers::env_mappings::validate_profile_mapping_ids(
+        &state,
+        &auth,
+        &body.env_mapping_ids,
+    )
+    .await?;
     state.enforce_limit(
         "workers",
         state
@@ -506,6 +512,12 @@ pub async fn update_profile(
         existing.owner_team_id,
         &existing.visibility,
     )?;
+    crate::handlers::env_mappings::validate_profile_mapping_ids(
+        &state,
+        &auth,
+        &body.env_mapping_ids,
+    )
+    .await?;
     let mut attached_before: Vec<Uuid> = state
         .store
         .list_worker_profile_env_mappings(profile_id)
