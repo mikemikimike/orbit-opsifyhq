@@ -18,6 +18,16 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ### Security
 
+- Team-run `autoApprove` no longer forces autonomy level 4 on every step agent (#194).
+  It now stamps a server-set `approvalOverride: "auto"` that the worker applies only to
+  agents whose own level is L3 or higher, and only by switching the approval mode; it
+  never raises the level, so Observe and Recommend agents still deny writes. Starting a
+  run with `autoApprove: true` requires `approvals:decide` (403 otherwise). The legacy
+  `autonomyOverride` input is ignored by the worker. Reruns drop the override unless the
+  rerunning user holds `approvals:decide`. Note: at L3 with `Auto` mode, writes still need
+  approval by design (only L4 runs them unattended), so the override matters for L4
+  agents configured with `Always`/`Writes` approval mode.
+
 - Creating a trigger now requires **use** on the target agent and use of every connection
   and provider its current spec references, closing an IDOR that let an Operator attach a
   trigger to a private agent (#135).

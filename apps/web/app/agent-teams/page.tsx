@@ -1306,12 +1306,13 @@ export default function AgentTeamsPage() {
             </div>
             <div className="space-y-2">
               <Callout tone="warning" title="Auto-approve skips human review">
-                Bound GitHub writes run without approval. Capability allowlists still apply. Use it only for
-                trusted repositories and tested agents.
+                Skips approval prompts for step agents already at Prepare (L3) or higher. It never raises
+                an agent&apos;s autonomy: Observe and Recommend agents still cannot write. Capability
+                allowlists still apply. Requires the approvals:decide permission.
               </Callout>
               <CheckboxField
                 title="Auto-approve writes for this run"
-                description="Level 4 autonomy, for this run only."
+                description="Skip approval prompts for L3+ agents, for this run only. Never raises autonomy."
                 checked={autoApprove}
                 onChange={(event) => setAutoApprove(event.target.checked)}
               />

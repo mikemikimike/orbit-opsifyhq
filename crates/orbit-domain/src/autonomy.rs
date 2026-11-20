@@ -162,6 +162,34 @@ pub fn evaluate_capability(
     }
 }
 
+/// Execution-input key carrying a server-set approval override (#194).
+pub const APPROVAL_OVERRIDE_KEY: &str = "approvalOverride";
+/// Legacy numeric override that raised the autonomy level. It is ignored everywhere.
+pub const LEGACY_AUTONOMY_OVERRIDE_KEY: &str = "autonomyOverride";
+/// The only accepted value of [`APPROVAL_OVERRIDE_KEY`].
+pub const APPROVAL_OVERRIDE_AUTO: &str = "auto";
+
+/// Apply an execution's approval override to an agent's autonomy spec.
+///
+/// The override can only switch the approval mode to `Auto`, and only for agents whose own
+/// level is already Prepare (3) or higher. It never raises the level, so Observe and
+/// Recommend agents keep denying writes. Returns `true` when the override was applied.
+pub fn apply_approval_override(spec: &mut crate::AutonomySpec, requested: Option<&str>) -> bool {
+    if requested != Some(APPROVAL_OVERRIDE_AUTO) || spec.level < AutonomyLevel::PREPARE.level() {
+        return false;
+    }
+    spec.approval_mode = crate::ApprovalMode::Auto;
+    true
+}
+
+/// Remove approval/autonomy overrides (including the legacy numeric one) from an execution input.
+pub fn strip_approval_overrides(input: &mut serde_json::Value) {
+    if let Some(object) = input.as_object_mut() {
+        object.remove(APPROVAL_OVERRIDE_KEY);
+        object.remove(LEGACY_AUTONOMY_OVERRIDE_KEY);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +354,58 @@ mod tests {
         }
         assert!(AutonomyLevel::from_level(0).is_none());
         assert!(AutonomyLevel::from_level(5).is_none());
+    }
+
+    fn spec_at(level: u8, mode: ApprovalMode) -> crate::AutonomySpec {
+        crate::AutonomySpec {
+            level,
+            approval_mode: mode,
+            max_executions_per_hour: None,
+        }
+    }
+
+    #[test]
+    fn approval_override_never_raises_level_and_needs_l3() {
+        for level in [1u8, 2] {
+            let mut spec = spec_at(level, ApprovalMode::Always);
+            assert!(!apply_approval_override(&mut spec, Some("auto")));
+            assert_eq!(spec, spec_at(level, ApprovalMode::Always));
+            // Still denies writes.
+            let granted = vec![grant("issues.create", CapabilityEffect::Write)];
+            assert_eq!(
+                evaluate_capability(
+                    AutonomyLevel::from_level(spec.level).unwrap(),
+                    spec.approval_mode,
+                    "issues.create",
+                    CapabilityEffect::Write,
+                    &granted
+                ),
+                PolicyDecision::Deny
+            );
+        }
+        let mut l3 = spec_at(3, ApprovalMode::Always);
+        assert!(apply_approval_override(&mut l3, Some("auto")));
+        assert_eq!(l3, spec_at(3, ApprovalMode::Auto));
+        let mut l4 = spec_at(4, ApprovalMode::Always);
+        assert!(apply_approval_override(&mut l4, Some("auto")));
+        assert_eq!(l4, spec_at(4, ApprovalMode::Auto));
+    }
+
+    #[test]
+    fn unknown_override_values_are_ignored() {
+        for value in [None, Some("4"), Some("AUTO"), Some("")] {
+            let mut spec = spec_at(4, ApprovalMode::Always);
+            assert!(!apply_approval_override(&mut spec, value));
+            assert_eq!(spec, spec_at(4, ApprovalMode::Always));
+        }
+    }
+
+    #[test]
+    fn strip_removes_both_override_keys() {
+        let mut input = serde_json::json!({
+            "task": "x", "approvalOverride": "auto", "autonomyOverride": 4
+        });
+        strip_approval_overrides(&mut input);
+        assert_eq!(input, serde_json::json!({ "task": "x" }));
     }
 }

@@ -3119,3 +3119,159 @@ async fn team_queue_requires_team_view_and_use() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn team_run_auto_approve_requires_approvals_decide() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let operator = app
+        .store
+        .ensure_user(app.org_id, "op194@test.local", "Op", UserRole::Operator)
+        .await
+        .unwrap();
+    let token = token_for(&app.store, app.org_id, operator.id, "op194").await;
+    // The permission check runs before any team lookup, so the team id need not exist.
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agent-teams/{}/runs", Uuid::now_v7()),
+            &token,
+            json!({ "task": "x", "autoApprove": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("approvals:decide"));
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agent-teams/{}/runs", Uuid::now_v7()),
+            &token,
+            json!({ "task": "x" }),
+        ),
+    )
+    .await;
+    assert_ne!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn rerun_strips_approval_override_without_approvals_decide() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let owner = owner_user(&app).await;
+    let operator = app
+        .store
+        .ensure_user(app.org_id, "rr194@test.local", "Op", UserRole::Operator)
+        .await
+        .unwrap();
+    let definition: orbit_domain::AgentDefinition = serde_json::from_value(definition()).unwrap();
+    let (agent, version) = app
+        .store
+        .create_agent(app.org_id, Some(operator.id), &definition)
+        .await
+        .unwrap();
+    app.store
+        .set_agent_status(app.org_id, agent.id, orbit_domain::AgentStatus::Active)
+        .await
+        .unwrap();
+    let agent_id = agent.id;
+    app.store
+        .set_resource_visibility(app.org_id, "agents", agent_id, "org", None)
+        .await
+        .unwrap();
+    let original = app
+        .store
+        .create_execution(orbit_store::executions::NewExecution {
+            org_id: app.org_id,
+            agent_id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: orbit_domain::HarnessKind::Mock,
+            trigger_source: orbit_domain::TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: json!({ "task": "t", "approvalOverride": "auto", "autonomyOverride": 4 }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: Some(operator.id),
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+    app.store
+        .claim_execution(original.id, "test-worker")
+        .await
+        .unwrap();
+    app.store
+        .mark_execution_running(original.id, Some("s"))
+        .await
+        .unwrap();
+    app.store
+        .finish_execution(
+            original.id,
+            orbit_domain::ExecutionStatus::Succeeded,
+            Some(&json!({})),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let op_token = token_for(&app.store, app.org_id, operator.id, "rr194").await;
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/executions/{}/rerun", original.id),
+            &op_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(body["input"].get("approvalOverride").is_none());
+    assert!(body["input"].get("autonomyOverride").is_none());
+    assert_eq!(body["input"]["rerunOf"], original.id.to_string());
+
+    // Free the agent's single concurrency slot before the second rerun.
+    let first = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    app.store
+        .claim_execution(first, "test-worker")
+        .await
+        .unwrap();
+    app.store.mark_execution_running(first, None).await.unwrap();
+    app.store
+        .finish_execution(
+            first,
+            orbit_domain::ExecutionStatus::Succeeded,
+            Some(&json!({})),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The owner holds approvals:decide: the override is kept, the legacy numeric one is not.
+    let owner_token = token_for(&app.store, app.org_id, owner.id, "rr194-owner").await;
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/executions/{}/rerun", original.id),
+            &owner_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["input"]["approvalOverride"], "auto");
+    assert!(body["input"].get("autonomyOverride").is_none());
+}
