@@ -1223,6 +1223,7 @@ async fn team_output_enqueue_uses_the_partial_unique_index() {
     assert_eq!(deliveries, 1);
 }
 
+#[tokio::test]
 async fn env_mappings_and_outputs_round_trip() {
     let Some(store) = test_store().await else {
         return;
