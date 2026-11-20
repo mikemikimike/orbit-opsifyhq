@@ -156,6 +156,9 @@ Production guardrails. Included from templates/validate.yaml so it runs on every
 {{- fail "ingress.enabled=true with auth.mode=dev and auth.dev.allowAnonymous=true exposes an anonymous Owner UI. Use auth.mode=oidc (see values-prod.example.yaml), set auth.dev.allowAnonymous=false, disable the ingress, or set auth.acknowledgeInsecureDev=true for a throwaway local/test cluster." -}}
 {{- end -}}
 {{- if eq (toString .Values.platform.environment) "production" -}}
+{{- if and .Values.secrets.create (not .Values.secrets.existingSecret) (eq (toString .Values.secrets.masterKey) "b3JiaXQtZGV2LW1hc3Rlci1rZXktMzItYnl0ZXMhISE=") -}}
+{{- fail "platform.environment=production cannot use the published development secrets.masterKey. Generate one with `openssl rand -base64 32` or set secrets.existingSecret." -}}
+{{- end -}}
 {{- if eq (toString .Values.auth.mode) "dev" -}}
 {{- fail "platform.environment=production does not allow auth.mode=dev; configure auth.mode=oidc." -}}
 {{- end -}}
