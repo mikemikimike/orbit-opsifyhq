@@ -242,3 +242,22 @@ cargo build --release -p orbit-worker --bin orbit-worker
 After starting the worker, check `GET /api/v1/workers` — the worker should appear
 with `live: true` within 30 seconds. Executions with matching harness and placement
 will be claimed automatically.
+
+## Production checklist
+
+The default Compose file and `values.yaml` are for local/test use. Before exposing ORBIT
+on a reachable host or cluster, override at least:
+
+| Area | Required override |
+|---|---|
+| Auth | `auth.mode=oidc` with issuer/audience (see `values-prod.example.yaml`); never `dev` auth or `allowAnonymous`. The chart fails to render dev + anonymous + ingress unless `auth.acknowledgeInsecureDev=true` (throwaway clusters only). |
+| Environment | `platform.environment=production`; the chart then rejects `auth.mode=dev` and the default bundled Postgres password. |
+| Database | `externalDatabase.enabled=true` (preferred), or a non-default `postgresql.password` for the bundled instance. |
+| Launcher | A random `launcher.token` / `launcher-token` key in the existing Secret (`openssl rand -base64 36`). In Compose set `ORBIT_LAUNCHER_TOKEN`; the launcher port is not published. |
+| Ingress | `ingress.tls.enabled=true` with a valid certificate Secret; `https://` in `platform.corsOrigins` and `platform.publicBaseUrl`. |
+| Master key | Provide your own `secrets.masterKey` / `ORBIT_MASTER_KEY` (see issue #107 and ADR 0004; unchanged by this checklist). |
+| Seed data | `platform.seedDemo=false`. |
+
+Compose is not a production target: it binds every published port to `127.0.0.1`
+(Postgres 5432, NATS 4222, API 8080, web 3000) and does not publish the NATS monitor or
+the launcher. Do not rebind them to other interfaces while dev defaults are in use.

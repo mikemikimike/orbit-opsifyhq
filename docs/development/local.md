@@ -18,8 +18,8 @@ docker compose -f deploy/compose/compose.yaml logs -f --tail=100 api worker web
 |---|---|---|
 | Web | http://localhost:3000 | Next.js + PWA; API proxied same-origin |
 | API | http://localhost:8080/api/v1 · /docs · /readyz | OpenAPI + Swagger UI |
-| PostgreSQL | `localhost:5432` | `orbit`/`orbit`, database `orbit` |
-| NATS | `localhost:4222`, monitoring `:8222` | JetStream enabled |
+| PostgreSQL | `localhost:5432` (loopback only) | `orbit`/`orbit`, database `orbit` |
+| NATS | `localhost:4222` | JetStream enabled (monitor port 8222 is not published) |
 | worker | — | `ORBIT_WORKER_HARNESSES=mock` (scheduler + mock) |
 
 The first `--build` takes a few minutes (Rust release build); later restarts are seconds.
@@ -64,7 +64,8 @@ pnpm --filter @orbit/web dev       # terminal 3 (http://localhost:3000)
 
 Workers no longer need `ORBIT_DATABASE_URL`, `ORBIT_NATS_URL` or `ORBIT_MASTER_KEY`.
 For Compose set `ORBIT_WORKER_TOKEN` in `.env` (see `.env.example`). The optional
-launcher runs with the Docker socket and exposes Launch/Stop/Logs in Workers:
+launcher runs with the Docker socket (its port is not published on the host; the API
+reaches it over the Compose network) and exposes Launch/Stop/Logs in Workers:
 
 ```bash
 docker compose --env-file .env -f deploy/compose/compose.yaml up -d launcher api
