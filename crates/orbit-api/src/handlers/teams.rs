@@ -311,7 +311,7 @@ async fn validate_native_primary(
     }
 }
 
-async fn require_team_view(
+pub(crate) async fn require_team_view(
     state: &AppState,
     auth: &AuthContext,
     team_id: Uuid,
@@ -327,7 +327,7 @@ async fn require_team_view(
     Ok(team)
 }
 
-async fn require_team_manage(
+pub(crate) async fn require_team_manage(
     state: &AppState,
     auth: &AuthContext,
     team_id: Uuid,
@@ -335,6 +335,24 @@ async fn require_team_manage(
     let team = state.store.get_agent_team(auth.org_id, team_id).await?;
     let access = crate::access::AccessScope::load(state, auth).await?;
     access.require_manage(
+        "agent team",
+        team.owner_user_id,
+        team.owner_team_id,
+        &team.visibility,
+    )?;
+    Ok(team)
+}
+
+/// Require use on a team (view plus run). Used by the queue, whose items execute the
+/// team's agents and connections.
+pub(crate) async fn require_team_use(
+    state: &AppState,
+    auth: &AuthContext,
+    team_id: Uuid,
+) -> Result<orbit_store::AgentTeam, ApiError> {
+    let team = state.store.get_agent_team(auth.org_id, team_id).await?;
+    let access = crate::access::AccessScope::load(state, auth).await?;
+    access.require_use(
         "agent team",
         team.owner_user_id,
         team.owner_team_id,

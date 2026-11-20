@@ -22,6 +22,7 @@ Enforced by `crates/orbit-api/src/access.rs` (`AccessScope`). Invisible resource
 | Approvals | via execution → agent | — | decision inherits execution | — |
 | Dashboard summary | agent/execution/approval/connection/trigger counts, recent executions and usage filtered in SQL (`ResourceAccess`, joined via agent) | — | — | pending approvals via execution → agent |
 | Access teams | member list | member | lead/owner/admin | — |
+| Agent Team queue | team **view** | team **view** | team **use** (enqueue/run/retry/requeue/cancel) | — |
 | Sharing | — | view | manage + license | — |
 | Export | per-kind read permission + view | — | — | — |
 
