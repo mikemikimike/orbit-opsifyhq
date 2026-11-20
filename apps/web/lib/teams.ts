@@ -10,13 +10,25 @@ import type {
   WorkSource,
 } from "./types";
 
-export type TeamStepInput = { agentId: string };
+/** A model override on the team or on one step (provider and model names). */
+export type TeamModel = { provider?: string | null; model?: string | null; management?: string | null };
+
+export type TeamStepInput = { agentId: string; model?: TeamModel | null };
 
 export function listAgentTeams(): Promise<AgentTeam[]> {
   return request<AgentTeam[]>("/api/v1/agent-teams");
 }
 
-type TeamInput = {
+export function getAgentTeam(teamId: string): Promise<AgentTeam> {
+  return request<AgentTeam>(`/api/v1/agent-teams/${teamId}`);
+}
+
+/**
+ * Create/update body. The API rebuilds the whole definition from it, so every field the
+ * team has must be sent back, including the ones no form control edits (team model,
+ * harness, step models): leaving one out clears it.
+ */
+export type TeamInput = {
   name: string;
   description: string;
   mode: "pipeline" | "native";
@@ -28,6 +40,11 @@ type TeamInput = {
   workerProfileId?: string;
   autoLaunch?: boolean;
   skills: string[];
+  model?: TeamModel | null;
+  harness?: string | null;
+  connectionIds: string[];
+  envMappingIds: string[];
+  timeoutSeconds?: number;
   steps: TeamStepInput[];
 };
 

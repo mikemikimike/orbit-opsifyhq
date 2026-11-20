@@ -152,7 +152,7 @@ function Executions() {
                   <div className="flex items-center gap-2 border-b bg-subtle px-4 py-2 text-[13px] sm:px-5">
                     <Workflow className="h-4 w-4 text-muted-foreground" />
                     <Link
-                      href={`/agent-teams?run=${key}`}
+                      href={`/agent-teams/runs/${key}`}
                       className="font-medium text-primary underline-offset-4 hover:underline"
                     >
                       Agent team run

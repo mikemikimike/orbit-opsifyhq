@@ -1,0 +1,202 @@
+"use client";
+
+import Link from "next/link";
+import { useParams } from "next/navigation";
+import { ExternalLink } from "lucide-react";
+
+import { StepNumber, agentLookup, teamMode } from "@/components/teams/team-parts";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Callout } from "@/components/ui/callout";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { DescriptionList } from "@/components/ui/description-list";
+import { EmptyState } from "@/components/ui/empty-state";
+import { PageHeader } from "@/components/ui/page-header";
+import { Skeleton } from "@/components/ui/skeleton";
+import { ExecutionStatusBadge } from "@/components/ui/status-badge";
+import { useAgentTeam, useAllAgents, useTeamRun } from "@/lib/queries";
+import { formatDateTime, relativeTime } from "@/lib/utils";
+import { errorMessage } from "@orbit/api-client";
+
+const DONE_STEP = new Set(["succeeded", "completed"]);
+
+function duration(start?: string | null, end?: string | null): string | null {
+  if (!start) return null;
+  const ms = (end ? new Date(end).getTime() : Date.now()) - new Date(start).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ${seconds % 60} s`;
+  return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+}
+
+/** One team run: progress, each step and its execution. Refreshes until the run ends. */
+export default function TeamRunPage() {
+  const params = useParams<{ runId: string }>();
+  const run = useTeamRun(params.runId);
+  const team = useAgentTeam(run.data?.run.teamId ?? "");
+  const agents = useAllAgents();
+
+  if (run.isLoading) {
+    return (
+      <div className="space-y-4">
+        <Skeleton className="h-10 w-80" />
+        <Skeleton className="h-64 rounded-xl" />
+      </div>
+    );
+  }
+  if (run.isError || !run.data) {
+    return (
+      <EmptyState
+        title="Run not found"
+        description={run.error ? errorMessage(run.error) : undefined}
+        action={
+          <Button asChild>
+            <Link href="/agent-teams#runs">Back to runs</Link>
+          </Button>
+        }
+      />
+    );
+  }
+
+  const { run: detail, steps } = run.data;
+  const task = String(detail.input.task ?? "") || "Agent team run";
+  const repository = (detail.input.payload as { repository?: string } | undefined)?.repository;
+  const done = steps.filter((step) => DONE_STEP.has(step.status)).length;
+  // A pipeline creates each step when the previous one finishes. Show the agents still to
+  // come from the team definition, so the whole line-up and the real total are visible.
+  const agentName = agentLookup(agents.data?.items ?? []);
+  const planned =
+    team.data && teamMode(team.data) === "pipeline" && !detail.finishedAt ? (team.data.definition.steps ?? []) : [];
+  const upcoming = planned.slice(steps.length);
+  const totalSteps = steps.length + upcoming.length;
+  const teamName = team.data?.name ?? "Agent team";
+  const total = duration(detail.createdAt, detail.finishedAt);
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        back={{ href: `/agent-teams/${detail.teamId}#runs`, label: teamName }}
+        title={<span className="line-clamp-3">{task}</span>}
+        meta={
+          <>
+            <ExecutionStatusBadge status={detail.status} />
+            <span className="text-[13px] text-muted-foreground">
+              Started {relativeTime(detail.createdAt)}
+              {total ? `, ${detail.finishedAt ? "took" : "running for"} ${total}` : ""}
+            </span>
+          </>
+        }
+      />
+
+      {detail.error ? (
+        <Callout tone="danger" title="The run failed">
+          {detail.error}
+        </Callout>
+      ) : null}
+
+      <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_20rem] [&>*]:min-w-0">
+        <Card>
+          <CardHeader className="gap-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <CardTitle as="h2">Steps</CardTitle>
+              <p className="tabular text-[13px] text-muted-foreground">
+                {done} of {totalSteps} {totalSteps === 1 ? "step" : "steps"} done
+              </p>
+            </div>
+            <div
+              role="progressbar"
+              aria-label="Steps done"
+              aria-valuemin={0}
+              aria-valuemax={totalSteps}
+              aria-valuenow={done}
+              className="h-1.5 overflow-hidden rounded-full bg-muted"
+            >
+              <div
+                className="h-full bg-primary transition-[width]"
+                style={{ width: `${totalSteps ? (done / totalSteps) * 100 : 0}%` }}
+              />
+            </div>
+          </CardHeader>
+          <CardContent className="p-0 sm:p-0">
+            {steps.length ? (
+              <ol className="divide-y border-t">
+                {steps.map((step) => {
+                  const took = duration(step.startedAt, step.finishedAt);
+                  return (
+                    <li key={step.id} className="flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-3.5 sm:px-5">
+                      <div className="flex min-w-[min(100%,14rem)] flex-1 items-start gap-3">
+                        <StepNumber n={step.stepIndex + 1} className="mt-0.5" />
+                        <div className="min-w-0 space-y-0.5">
+                          <p className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                            <Link href={`/agents/${step.agentId}`} className="min-w-0 break-words hover:text-primary hover:underline">
+                              {step.name}
+                            </Link>
+                            {step.stepIndex === 0 ? <Badge>Primary</Badge> : null}
+                          </p>
+                          <p className="text-xs text-muted-foreground empty:hidden">
+                            {[
+                              took ? `${step.finishedAt ? "Took" : "Running for"} ${took}` : null,
+                              step.skills.length ? `${step.skills.length} ${step.skills.length === 1 ? "skill" : "skills"}` : null,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")}
+                          </p>
+                          {step.error ? <p className="break-words text-[13px] text-destructive">{step.error}</p> : null}
+                        </div>
+                      </div>
+                      <div className="ml-9 flex items-center gap-2 sm:ml-auto">
+                        <ExecutionStatusBadge status={step.status} />
+                        {step.executionId ? (
+                          <Button asChild size="sm" variant="outline">
+                            <Link href={`/executions/${step.executionId}`}>
+                              Open execution <ExternalLink />
+                            </Link>
+                          </Button>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
+                {upcoming.map((step, index) => (
+                  <li key={`upcoming-${index}`} className="flex items-center gap-3 px-4 py-3.5 text-muted-foreground sm:px-5">
+                    <StepNumber n={steps.length + index + 1} className="border-dashed bg-transparent" />
+                    <span className="min-w-0 flex-1 truncate text-sm">{agentName(step.agentId).name}</span>
+                    <span className="text-xs">Up next</span>
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <p className="border-t px-5 py-4 text-sm text-muted-foreground">No steps have been created yet.</p>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle as="h2">Details</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <DescriptionList
+              items={[
+                {
+                  label: "Team",
+                  value: (
+                    <Link href={`/agent-teams/${detail.teamId}`} className="text-primary hover:underline">
+                      {teamName}
+                    </Link>
+                  ),
+                },
+                repository ? { label: "Repository", value: repository, mono: true } : null,
+                { label: "Started", value: formatDateTime(detail.createdAt) },
+                detail.finishedAt ? { label: "Finished", value: formatDateTime(detail.finishedAt) } : null,
+                detail.input.autoApprove === true ? { label: "Approvals", value: "Auto-approved" } : null,
+              ]}
+            />
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}

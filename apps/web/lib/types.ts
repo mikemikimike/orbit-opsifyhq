@@ -50,6 +50,10 @@ export type AgentTeam = {
     workerProfileId?: string | null;
     autoLaunch?: boolean;
     skills?: string[];
+    harness?: string | null;
+    connectionIds?: string[];
+    envMappingIds?: string[];
+    timeoutSeconds?: number | null;
     steps?: Array<{ agentId: string; model?: { provider?: string | null; model?: string | null; management?: string | null } | null }>;
   };
   createdBy?: string | null;

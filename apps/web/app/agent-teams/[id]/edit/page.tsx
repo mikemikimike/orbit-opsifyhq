@@ -1,0 +1,81 @@
+"use client";
+
+import { useState } from "react";
+import Link from "next/link";
+import { useParams, useRouter } from "next/navigation";
+import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+
+import { TeamForm } from "@/components/teams/team-form";
+import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/ui/empty-state";
+import { PageHeader } from "@/components/ui/page-header";
+import { Skeleton } from "@/components/ui/skeleton";
+import { queryKeys, useAgentTeam } from "@/lib/queries";
+import { updateAgentTeam, type TeamInput } from "@/lib/teams";
+import { errorMessage } from "@orbit/api-client";
+
+export default function EditAgentTeamPage() {
+  const params = useParams<{ id: string }>();
+  const teamId = params.id;
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const team = useAgentTeam(teamId);
+  const [submitting, setSubmitting] = useState(false);
+
+  if (team.isLoading) {
+    return (
+      <div className="space-y-4">
+        <Skeleton className="h-10 w-64" />
+        <Skeleton className="h-96 rounded-xl" />
+      </div>
+    );
+  }
+  if (team.isError || !team.data) {
+    return (
+      <EmptyState
+        title="Agent team not found"
+        description={team.error ? errorMessage(team.error) : undefined}
+        action={
+          <Button asChild>
+            <Link href="/agent-teams">Back to agent teams</Link>
+          </Button>
+        }
+      />
+    );
+  }
+
+  async function handleSubmit(input: TeamInput) {
+    setSubmitting(true);
+    try {
+      await updateAgentTeam(teamId, input);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: queryKeys.agentTeams }),
+        queryClient.invalidateQueries({ queryKey: queryKeys.agentTeam(teamId) }),
+      ]);
+      toast.success("Agent team saved");
+      router.push(`/agent-teams/${teamId}`);
+    } catch (error) {
+      toast.error(errorMessage(error));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        back={{ href: `/agent-teams/${teamId}`, label: team.data.name }}
+        title={`Edit ${team.data.name}`}
+        description="Changes apply to runs started after you save."
+      />
+      <TeamForm
+        team={team.data}
+        submitLabel="Save changes"
+        submitting={submitting}
+        onSubmit={handleSubmit}
+        cancelHref={`/agent-teams/${teamId}`}
+      />
+    </div>
+  );
+}
