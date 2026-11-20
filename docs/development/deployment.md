@@ -150,6 +150,10 @@ production-grade database deployment.
 team runs and worker launches older than that window. Records are never deleted; the
 default list simply hides archived runs, and the UI can switch to Active/Archived/All.
 
+`platform.auditRetentionDays` (`ORBIT_AUDIT_RETENTION_DAYS`, default `0`, which keeps
+audit logs forever) deletes audit log entries older than that window once a day. Unlike
+archiving, this permanently removes rows; set `0` if compliance requires indefinite retention.
+
 Image tags default to the chart `appVersion`, so `--version 0.7.0` pulls `orbit-*:0.7.0`
 — the same tags CI publishes for that release. Override per component with
 `--set api.tag=…`, `worker.tag`, `web.tag`, `launcher.tag`, `opencodeWorker.tag` or

@@ -73,15 +73,6 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn worker_heartbeat_age_seconds(&self, worker_id: &str) -> StoreResult<Option<i64>> {
-        Ok(sqlx::query_scalar(
-            "SELECT EXTRACT(EPOCH FROM (now() - last_heartbeat_at))::bigint FROM worker_heartbeats WHERE worker_id = $1",
-        )
-        .bind(worker_id)
-        .fetch_optional(&self.pool)
-        .await?)
-    }
-
     /// Mark executions whose worker heartbeat expired as failed and expire their pending
     /// approvals. Returns the affected executions so the caller can emit events.
     ///

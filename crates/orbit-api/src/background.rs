@@ -151,7 +151,50 @@ pub fn spawn(state: AppState) -> Vec<JoinHandle<()>> {
             }
         },
     ));
+    spawn_audit_retention(state.clone());
     handles
+}
+
+/// Parse `ORBIT_AUDIT_RETENTION_DAYS`. Unset, empty, `0` or invalid -> keep audit logs
+/// forever (`None`). Deleting audit history is opt-in so an upgrade never prunes it.
+fn audit_retention_days(raw: Option<&str>) -> Option<u32> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => None,
+        Some(value) => match value.parse::<u32>() {
+            Ok(0) => None,
+            Ok(days) => Some(days),
+            Err(_) => {
+                tracing::warn!(
+                    value,
+                    "invalid ORBIT_AUDIT_RETENTION_DAYS; keeping audit logs"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Delete audit log rows older than `ORBIT_AUDIT_RETENTION_DAYS` (unset or `0` keeps
+/// everything). Runs daily; the delete is idempotent so multiple API replicas are safe.
+fn spawn_audit_retention(state: AppState) {
+    let Some(days) =
+        audit_retention_days(std::env::var("ORBIT_AUDIT_RETENTION_DAYS").ok().as_deref())
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(24 * 3600));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let cutoff = Utc::now() - chrono::Duration::days(days as i64);
+            match state.store.prune_audit_logs(cutoff).await {
+                Ok(0) => {}
+                Ok(count) => tracing::info!(count, days, "pruned old audit log entries"),
+                Err(error) => tracing::warn!(%error, "audit log pruning failed"),
+            }
+        }
+    });
 }
 
 /// Archive terminal executions, team runs and worker launches older than the configured
@@ -977,4 +1020,18 @@ async fn advance_runtime(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audit_retention_days;
+
+    #[test]
+    fn audit_retention_parsing() {
+        assert_eq!(audit_retention_days(None), None);
+        assert_eq!(audit_retention_days(Some("")), None);
+        assert_eq!(audit_retention_days(Some("90")), Some(90));
+        assert_eq!(audit_retention_days(Some("0")), None);
+        assert_eq!(audit_retention_days(Some("abc")), None);
+    }
 }
