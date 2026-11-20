@@ -1474,13 +1474,165 @@ async fn same_agent_queues_on_different_harnesses() {
 }
 
 
-async fn new_execution(app: &TestApp, agent_id: Uuid) -> Uuid {
-    let (status, execution) = send(
-        &app.router,
-        post(
-            &format!("/api/v1/agents/{agent_id}/executions"),
-            json!({ "task": "approval policy test" }),
-        ),
+/// `runtime_tick` advances every runtime in the shared test database, so tests that tick
+/// (or interleave with a tick) run one at a time.
+static RUNTIME_TICK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn raw_pool() -> sqlx::PgPool {
+    sqlx::PgPool::connect(&std::env::var("ORBIT_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn poisoned_runtimes_do_not_block_healthy_ones() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let pool = raw_pool().await;
+
+    // Oldest runtime: unknown harness (permanent error).
+    let bad_harness = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let rt_harness = app
+        .store
+        .create_agent_runtime(app.org_id, bad_harness, "t", "bogus", 60, None)
+        .await
+        .unwrap();
+    // Second: current spec that no longer deserialises (transient, backs off).
+    let bad_spec = create_demo_agent(&app.store, app.org_id, user.id).await;
+    sqlx::query("UPDATE agent_versions SET spec = '{\"bogus\": true}'::jsonb WHERE agent_id = $1")
+        .bind(bad_spec)
+        .execute(&pool)
+        .await
+        .unwrap();
+    app.store
+        .create_agent_runtime(app.org_id, bad_spec, "t", "mock", 10, None)
+        .await
+        .unwrap();
+    // Healthy runtime created last.
+    let healthy = create_demo_agent(&app.store, app.org_id, user.id).await;
+    app.store
+        .create_agent_runtime(app.org_id, healthy, "t", "mock", 60, None)
+        .await
+        .unwrap();
+
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+
+    let ok = app
+        .store
+        .get_agent_runtime(app.org_id, healthy)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        ok.last_execution_id.is_some(),
+        "healthy runtime must advance"
+    );
+    assert!(ok.last_error.is_none());
+
+    let spec = app
+        .store
+        .get_agent_runtime(app.org_id, bad_spec)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(spec.status, "running");
+    assert!(spec.last_error.as_deref().unwrap().contains("invalid"));
+    assert!(spec.next_run_at > chrono::Utc::now() + chrono::Duration::seconds(30));
+    assert!(spec.last_execution_id.is_none());
+
+    let (status, error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM agent_runtimes WHERE id = $1")
+            .bind(rt_harness.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "stopped");
+    assert!(error.unwrap().contains("unknown harness"));
+}
+
+#[tokio::test]
+async fn runtime_tick_retry_reuses_execution() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let runtime = app
+        .store
+        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
+        .await
+        .unwrap();
+    let pool = raw_pool().await;
+
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let first = app
+        .store
+        .get_agent_runtime(app.org_id, agent_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_execution_id
+        .unwrap();
+
+    // Simulate a crash between create_execution and update_agent_runtime: the execution
+    // exists but the runtime row still points at nothing and is due again.
+    sqlx::query("UPDATE agent_runtimes SET last_execution_id = NULL, next_run_at = now() - interval '1 second' WHERE id = $1")
+        .bind(runtime.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+
+    let retried = app
+        .store
+        .get_agent_runtime(app.org_id, agent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retried.last_execution_id,
+        Some(first),
+        "retry reuses the execution"
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM executions WHERE org_id = $1 AND agent_id = $2")
+            .bind(app.org_id)
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "no duplicate execution");
+}
+
+async fn fail_execution(pool: &sqlx::PgPool, execution_id: uuid::Uuid) {
+    sqlx::query("UPDATE executions SET status = 'failed', error = '\"boom\"'::jsonb, finished_at = now() WHERE id = $1")
+        .bind(execution_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn make_runtime_due(pool: &sqlx::PgPool, runtime_id: uuid::Uuid) {
+    sqlx::query(
+        "UPDATE agent_runtimes SET next_run_at = now() - interval '1 second' WHERE id = $1",
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{execution}");
@@ -1505,19 +1657,9 @@ async fn approval_decisions_require_use_and_optional_four_eyes() {
     let Some(app) = test_app(true).await else {
         return;
     };
-    app.store
-        .create_custom_role(
-            app.org_id,
-            "Approver",
-            &[
-                "agents:read".into(),
-                "executions:read".into(),
-                "approvals:decide".into(),
-            ],
-        )
-        .await
-        .unwrap();
-    let carol = app
+
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let user = app
         .store
         .ensure_user(
             app.org_id,
@@ -1543,8 +1685,68 @@ async fn approval_decisions_require_use_and_optional_four_eyes() {
         .await
         .unwrap();
 
-    // Someone other than Carol owns the agent, so only her team role grants access.
-    let dave = app
+
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let first = runtime_row(&app, agent_id).await.last_execution_id.unwrap();
+    fail_execution(&pool, first).await;
+    make_runtime_due(&pool, runtime.id).await;
+
+    // Failure is accounted for and delays the next run; no new execution yet.
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.status, "running");
+    assert_eq!(row.consecutive_failures, 1);
+    assert_eq!(row.failed_execution_id, Some(first));
+    assert_eq!(row.last_execution_id, Some(first));
+    assert!(row.last_error.as_deref().unwrap().contains("boom"));
+    assert!(row.next_run_at > chrono::Utc::now() + chrono::Duration::seconds(30));
+
+    // Not yet due: still nothing new, and the failure is not double counted.
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.consecutive_failures, 1);
+    assert_eq!(row.last_execution_id, Some(first));
+
+    // Backoff elapsed: the next tick creates a new execution.
+    make_runtime_due(&pool, runtime.id).await;
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    let second = row.last_execution_id.unwrap();
+    assert_ne!(second, first, "runtime must continue after a failure");
+    assert_eq!(row.consecutive_failures, 1, "reset only after a success");
+    assert!(row.last_error.is_none());
+
+    // A successful execution resets the counter on the following launch.
+    sqlx::query("UPDATE executions SET status = 'succeeded', finished_at = now() WHERE id = $1")
+        .bind(second)
+        .execute(&pool)
+        .await
+        .unwrap();
+    make_runtime_due(&pool, runtime.id).await;
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    assert_ne!(row.last_execution_id, Some(second));
+    assert_eq!(row.consecutive_failures, 0);
+    assert!(row.failed_execution_id.is_none());
+}
+
+#[tokio::test]
+async fn runtime_stops_after_consecutive_failures() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let user = app
         .store
         .ensure_user(
             app.org_id,
@@ -2053,4 +2255,250 @@ async fn env_mapping_secret_refs_respect_resource_access() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+async fn runtime_with_first_execution(
+    app: &TestApp,
+) -> (
+    orbit_store::agent_runtimes::AgentRuntime,
+    uuid::Uuid,
+    uuid::Uuid,
+) {
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let runtime = app
+        .store
+        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
+        .await
+        .unwrap();
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let first = runtime_row(app, agent_id).await.last_execution_id.unwrap();
+    (runtime, agent_id, first)
+}
+
+async fn execution_count(pool: &sqlx::PgPool, agent_id: uuid::Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM executions WHERE agent_id = $1")
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn stop_during_inflight_tick_is_not_overwritten_by_launch() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let pool = raw_pool().await;
+    let (runtime, agent_id, exec) = runtime_with_first_execution(&app).await;
+
+    // Rewind to "tick claimed, execution created, runtime row not yet updated".
+    sqlx::query("UPDATE agent_runtimes SET last_execution_id = NULL, next_run_at = now() - interval '1 second' WHERE id = $1")
+        .bind(runtime.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let claimed = app
+        .store
+        .claim_agent_runtime_tick(
+            runtime.id,
+            chrono::Utc::now() + chrono::Duration::seconds(5),
+        )
+        .await
+        .unwrap()
+        .expect("claimed");
+
+    // Operator presses Stop while the tick is in flight.
+    let stopping = app
+        .store
+        .request_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopping.status, "stopping");
+
+    // The tick's final write must not revive the runtime, but must record the execution.
+    let recorded = app
+        .store
+        .record_agent_runtime_launch(
+            runtime.id,
+            exec,
+            true,
+            chrono::Utc::now() + chrono::Duration::seconds(60),
+        )
+        .await
+        .unwrap()
+        .expect("launch is recorded for a stopping runtime");
+    assert_eq!(recorded.status, "stopping");
+    assert_eq!(recorded.last_execution_id, Some(exec));
+    assert_eq!(
+        recorded.next_run_at, claimed.next_run_at,
+        "schedule untouched"
+    );
+
+    // The stopping branch cancels the raced execution, then finishes the stop.
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    assert_eq!(runtime_row(&app, agent_id).await.status, "stopping");
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.status, "stopped");
+    assert!(row.stopped_at.is_some());
+    let status: String = sqlx::query_scalar("SELECT status FROM executions WHERE id = $1")
+        .bind(exec)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "cancelled");
+
+    // No further executions, ever.
+    make_runtime_due(&pool, runtime.id).await;
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    assert_eq!(runtime_row(&app, agent_id).await.status, "stopped");
+    assert_eq!(execution_count(&pool, agent_id).await, 1);
+}
+
+#[tokio::test]
+async fn stop_during_inflight_tick_is_not_overwritten_by_backoff() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let pool = raw_pool().await;
+    let (runtime, agent_id, first) = runtime_with_first_execution(&app).await;
+    fail_execution(&pool, first).await;
+    make_runtime_due(&pool, runtime.id).await;
+    let claimed = app
+        .store
+        .claim_agent_runtime_tick(
+            runtime.id,
+            chrono::Utc::now() + chrono::Duration::seconds(5),
+        )
+        .await
+        .unwrap()
+        .expect("claimed");
+
+    app.store
+        .request_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Failure accounting, plain backoff and the stop-at-limit write are all refused.
+    let later = chrono::Utc::now() + chrono::Duration::seconds(300);
+    assert!(app
+        .store
+        .record_agent_runtime_failure(runtime.id, false, first, 1, "boom", later)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .record_agent_runtime_failure(runtime.id, true, first, 5, "boom", later)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .advance_agent_runtime(runtime.id, Some("transient"), later)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .halt_running_agent_runtime(runtime.id, "permanent")
+        .await
+        .unwrap()
+        .is_none());
+
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.status, "stopping");
+    assert_eq!(row.consecutive_failures, 0);
+    assert_eq!(row.next_run_at, claimed.next_run_at);
+
+    // The last execution is terminal, so the next tick completes the stop.
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    assert_eq!(runtime_row(&app, agent_id).await.status, "stopped");
+    assert_eq!(execution_count(&pool, agent_id).await, 1);
+}
+
+#[tokio::test]
+async fn runtime_status_transitions_are_guarded() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let (runtime, agent_id, exec) = runtime_with_first_execution(&app).await;
+    let soon = chrono::Utc::now() + chrono::Duration::seconds(60);
+
+    // stopping -> stopped only from stopping.
+    assert!(app
+        .store
+        .finish_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(runtime_row(&app, agent_id).await.status, "running");
+
+    app.store
+        .request_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Stop is idempotent while stopping.
+    assert_eq!(
+        app.store
+            .request_agent_runtime_stop(runtime.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "stopping"
+    );
+    app.store
+        .finish_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Once stopped nothing moves it: no restart, no schedule, no launch, no second stop.
+    assert!(app
+        .store
+        .record_agent_runtime_launch(runtime.id, exec, true, soon)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .advance_agent_runtime(runtime.id, None, soon)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .halt_agent_runtime(runtime.id, "x")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .request_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(runtime_row(&app, agent_id).await.status, "stopped");
 }

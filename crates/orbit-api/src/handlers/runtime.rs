@@ -170,14 +170,9 @@ pub async fn stop(
     }
     let runtime = state
         .store
-        .update_agent_runtime(
-            runtime.id,
-            "stopping",
-            runtime.last_execution_id,
-            runtime.last_error.as_deref(),
-            runtime.next_run_at,
-        )
-        .await?;
+        .request_agent_runtime_stop(runtime.id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("agent runtime"))?;
     audit::record(
         &state,
         &auth,
