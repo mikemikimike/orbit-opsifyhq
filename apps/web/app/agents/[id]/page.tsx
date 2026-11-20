@@ -82,6 +82,7 @@ export default function AgentDetailPage() {
         lastHeartbeatAt: string;
         lastExecutionId?: string | null;
         lastError?: string | null;
+        consecutiveFailures?: number;
       } | null>(`/api/v1/agents/${agentId}/runtime`).catch(() => null),
     refetchInterval: 10_000,
   });
@@ -353,7 +354,10 @@ export default function AgentDetailPage() {
           }
         >
           Heartbeat {relativeTime(runtime.data.lastHeartbeatAt)}
-          {runtime.data.lastError ? ` · ${runtime.data.lastError}` : ""}. This runtime creates
+          {runtime.data.lastError ? ` · ${runtime.data.lastError}` : ""}
+          {runtime.data.consecutiveFailures
+            ? ` · ${runtime.data.consecutiveFailures} consecutive failed ${runtime.data.consecutiveFailures === 1 ? "run" : "runs"}, retrying with backoff`
+            : ""}. This runtime creates
           the next execution when the previous one finishes and resumes its session.
         </Callout>
       ) : null}

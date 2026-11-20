@@ -507,160 +507,276 @@ async fn reconcile_worker_tags(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+enum RuntimeTickError {
+    /// Retrying cannot help; the runtime is stopped with a clear `last_error`.
+    Permanent(String),
+    /// Possibly recoverable (store hiccup, agent edited later); retried with backoff.
+    Transient(anyhow::Error),
+}
+
+impl From<orbit_store::StoreError> for RuntimeTickError {
+    fn from(error: orbit_store::StoreError) -> Self {
+        Self::Transient(error.into())
+    }
+}
+
+const RUNTIME_MIN_BACKOFF_SECONDS: i64 = 30;
+const RUNTIME_MAX_BACKOFF_SECONDS: i64 = 900;
+/// A runtime stops after this many failed executions in a row.
+#[doc(hidden)]
+pub const RUNTIME_MAX_CONSECUTIVE_FAILURES: i32 = 5;
+
+/// Exponential backoff from the runtime interval (at least 30s), doubling per
+/// consecutive failure and capped at 15 minutes.
+fn runtime_failure_backoff(interval_seconds: i32, failures: i32) -> chrono::Duration {
+    let base = (interval_seconds as i64).max(RUNTIME_MIN_BACKOFF_SECONDS);
+    let doublings = (failures.max(1) - 1).min(16) as u32;
+    chrono::Duration::seconds(
+        base.saturating_mul(1i64 << doublings)
+            .min(RUNTIME_MAX_BACKOFF_SECONDS),
+    )
+}
+
+fn runtime_tick_key(runtime_id: uuid::Uuid, last_execution_id: Option<uuid::Uuid>) -> String {
+    match last_execution_id {
+        Some(id) => format!("runtime:{runtime_id}:after:{id}"),
+        None => format!("runtime:{runtime_id}:first"),
+    }
+}
+
 /// Advance continuous agent runtimes: create the next execution when the previous one
-/// is terminal, and stop runtimes whose agent is no longer active.
-async fn runtime_tick(state: &AppState) -> anyhow::Result<()> {
+/// is terminal, and stop runtimes whose agent is no longer active. Every runtime is
+/// handled independently: a failure is recorded on that runtime (with backoff, or a stop
+/// for permanent errors) and never prevents the others from advancing.
+#[doc(hidden)]
+pub async fn runtime_tick(state: &AppState) -> anyhow::Result<()> {
     for runtime in state.store.list_running_agent_runtimes().await? {
-        let _ = state.store.heartbeat_agent_runtime(runtime.id).await;
-        let agent = match state
+        let (runtime_id, org_id) = (runtime.id, runtime.org_id);
+        let interval = runtime.interval_seconds;
+        let last_execution_id = runtime.last_execution_id;
+        let Err(failure) = advance_runtime(state, runtime).await else {
+            continue;
+        };
+        let (status, message, next_run_at) = match &failure {
+            RuntimeTickError::Permanent(message) => {
+                ("stopped", message.clone(), chrono::Utc::now())
+            }
+            RuntimeTickError::Transient(error) => (
+                "running",
+                error.to_string(),
+                chrono::Utc::now() + runtime_failure_backoff(interval.max(60), 1),
+            ),
+        };
+        tracing::warn!(%runtime_id, %org_id, status, error = %message, "agent runtime tick failed");
+        if let Err(error) = state
             .store
-            .get_agent(runtime.org_id, runtime.agent_id)
+            .update_agent_runtime(
+                runtime_id,
+                status,
+                last_execution_id,
+                Some(&message),
+                next_run_at,
+            )
             .await
         {
-            Ok(agent) => agent,
-            Err(_) => {
-                let _ = state
-                    .store
-                    .update_agent_runtime(
-                        runtime.id,
-                        "stopped",
-                        runtime.last_execution_id,
-                        Some("agent no longer exists"),
-                        chrono::Utc::now(),
-                    )
-                    .await;
-                continue;
-            }
-        };
-        if agent.status != "active" {
+            tracing::error!(%runtime_id, %org_id, %error, "could not record runtime failure");
+        }
+    }
+    Ok(())
+}
+
+async fn advance_runtime(
+    state: &AppState,
+    runtime: orbit_store::agent_runtimes::AgentRuntime,
+) -> Result<(), RuntimeTickError> {
+    let _ = state.store.heartbeat_agent_runtime(runtime.id).await;
+    let agent = match state
+        .store
+        .get_agent(runtime.org_id, runtime.agent_id)
+        .await
+    {
+        Ok(agent) => agent,
+        Err(_) => {
             let _ = state
                 .store
                 .update_agent_runtime(
                     runtime.id,
                     "stopped",
                     runtime.last_execution_id,
-                    Some("agent is not active"),
+                    Some("agent no longer exists"),
                     chrono::Utc::now(),
                 )
                 .await;
-            continue;
+            return Ok(());
         }
-
-        let last = match runtime.last_execution_id {
-            Some(id) => state.store.get_execution(runtime.org_id, id).await.ok(),
-            None => None,
-        };
-        let last_terminal = last.as_ref().is_none_or(|execution| {
-            matches!(
-                ExecutionStatus::parse(&execution.status),
-                Some(status) if status.is_terminal()
-            )
-        });
-        if runtime.status == "stopping" {
-            if last_terminal {
-                let _ = state
-                    .store
-                    .update_agent_runtime(
-                        runtime.id,
-                        "stopped",
-                        runtime.last_execution_id,
-                        runtime.last_error.as_deref(),
-                        chrono::Utc::now(),
-                    )
-                    .await;
-            }
-            continue;
-        }
-        if !last_terminal {
-            continue;
-        }
-        let Some(runtime) = state
+    };
+    if agent.status != "active" {
+        let _ = state
             .store
-            .claim_agent_runtime_tick(
+            .update_agent_runtime(
                 runtime.id,
-                chrono::Utc::now() + chrono::Duration::seconds(5),
+                "stopped",
+                runtime.last_execution_id,
+                Some("agent is not active"),
+                chrono::Utc::now(),
             )
-            .await?
-        else {
-            continue;
-        };
-        if last
-            .as_ref()
-            .is_some_and(|execution| execution.status == "failed")
-        {
+            .await;
+        return Ok(());
+    }
+
+    let last = match runtime.last_execution_id {
+        Some(id) => state.store.get_execution(runtime.org_id, id).await.ok(),
+        None => None,
+    };
+    let last_terminal = last.as_ref().is_none_or(|execution| {
+        matches!(
+            ExecutionStatus::parse(&execution.status),
+            Some(status) if status.is_terminal()
+        )
+    });
+    if runtime.status == "stopping" {
+        if last_terminal {
             let _ = state
                 .store
                 .update_agent_runtime(
                     runtime.id,
-                    "running",
+                    "stopped",
                     runtime.last_execution_id,
-                    last.as_ref()
-                        .and_then(|execution| execution.error.as_ref())
-                        .map(|error| error.to_string())
-                        .as_deref(),
-                    chrono::Utc::now()
-                        + chrono::Duration::seconds(runtime.interval_seconds.max(30) as i64),
+                    runtime.last_error.as_deref(),
+                    chrono::Utc::now(),
                 )
                 .await;
-            continue;
         }
-
-        let version = state
-            .store
-            .get_current_version(runtime.org_id, &agent)
-            .await?;
-        let spec: orbit_domain::AgentSpec = serde_json::from_value(version.spec.clone())?;
-        let harness_kind = runtime
-            .harness_kind
-            .parse::<orbit_domain::HarnessKind>()
-            .map_err(|_| anyhow::anyhow!("runtime has an unknown harness"))?;
-        let input = serde_json::json!({
-            "task": runtime.task,
-            "payload": { "runtimeId": runtime.id },
-            "provenance": {
-                "source": "runtime",
-                "trusted": true,
-                "subject": runtime.id,
-                "receivedAt": Utc::now(),
-            },
-        });
-        let execution = state
-            .store
-            .create_execution(orbit_store::executions::NewExecution {
-                org_id: runtime.org_id,
-                agent_id: agent.id,
-                agent_version_id: version.id,
-                agent_name: &agent.name,
-                harness_kind,
-                trigger_source: TriggerSource::Manual,
-                placement: spec
-                    .harness
-                    .as_ref()
-                    .map(|harness| harness.placement.as_str())
-                    .unwrap_or("auto"),
-                trigger_id: None,
-                input,
-                session_ref: last
-                    .as_ref()
-                    .and_then(|execution| execution.session_ref.as_deref()),
-                skills: &[],
-                timeout_seconds: spec.resources.timeout_seconds,
-                requested_by: runtime.created_by,
-                idempotency_key: Some(&format!("runtime:{}:{}", runtime.id, uuid::Uuid::now_v7())),
-                team_run_id: None,
-                team_step_index: None,
-            })
-            .await?;
-        state
-            .store
-            .update_agent_runtime(
-                runtime.id,
-                "running",
-                Some(execution.id),
-                None,
-                chrono::Utc::now() + chrono::Duration::seconds(runtime.interval_seconds as i64),
-            )
-            .await?;
+        return Ok(());
     }
+    if !last_terminal {
+        return Ok(());
+    }
+    let Some(runtime) = state
+        .store
+        .claim_agent_runtime_tick(
+            runtime.id,
+            chrono::Utc::now() + chrono::Duration::seconds(5),
+        )
+        .await
+        .map_err(|error| RuntimeTickError::Transient(error.into()))?
+    else {
+        return Ok(());
+    };
+    let last_failed = last
+        .as_ref()
+        .filter(|execution| execution.status == "failed");
+    if let Some(failed) = last_failed {
+        // First time this failure is seen: count it and back off. Once accounted for, the
+        // next due tick falls through and creates a new execution.
+        if runtime.failed_execution_id != Some(failed.id) {
+            let failures = runtime.consecutive_failures.saturating_add(1);
+            let reason = failed
+                .error
+                .as_ref()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "execution failed".into());
+            let (status, message, next_run_at) = if failures >= RUNTIME_MAX_CONSECUTIVE_FAILURES {
+                (
+                    "stopped",
+                    format!("stopped after {failures} consecutive failed executions: {reason}"),
+                    chrono::Utc::now(),
+                )
+            } else {
+                (
+                    "running",
+                    reason,
+                    chrono::Utc::now()
+                        + runtime_failure_backoff(runtime.interval_seconds, failures),
+                )
+            };
+            state
+                .store
+                .record_agent_runtime_failure(
+                    runtime.id,
+                    status,
+                    failed.id,
+                    failures,
+                    &message,
+                    next_run_at,
+                )
+                .await?;
+            return Ok(());
+        }
+    }
+
+    // An unknown harness is a property of the runtime row itself and can never heal:
+    // stop the runtime instead of retrying forever.
+    let harness_kind = runtime
+        .harness_kind
+        .parse::<orbit_domain::HarnessKind>()
+        .map_err(|_| {
+            RuntimeTickError::Permanent(format!(
+                "runtime has an unknown harness '{}'",
+                runtime.harness_kind
+            ))
+        })?;
+    // A missing version or a spec that no longer parses can be fixed by editing the
+    // agent, so these back off and recover on their own.
+    let version = state
+        .store
+        .get_current_version(runtime.org_id, &agent)
+        .await
+        .map_err(|error| RuntimeTickError::Transient(error.into()))?;
+    let spec: orbit_domain::AgentSpec =
+        serde_json::from_value(version.spec.clone()).map_err(|error| {
+            RuntimeTickError::Transient(anyhow::anyhow!("agent spec is invalid: {error}"))
+        })?;
+    let input = serde_json::json!({
+        "task": runtime.task,
+        "payload": { "runtimeId": runtime.id },
+        "provenance": {
+            "source": "runtime",
+            "trusted": true,
+            "subject": runtime.id,
+            "receivedAt": Utc::now(),
+        },
+    });
+    // Deterministic per tick: the previous execution id only changes once the runtime row
+    // is updated below, so a retry after a partial failure reuses the same execution.
+    let idempotency_key = runtime_tick_key(runtime.id, runtime.last_execution_id);
+    let execution = state
+        .store
+        .create_execution(orbit_store::executions::NewExecution {
+            org_id: runtime.org_id,
+            agent_id: agent.id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind,
+            trigger_source: TriggerSource::Manual,
+            placement: spec
+                .harness
+                .as_ref()
+                .map(|harness| harness.placement.as_str())
+                .unwrap_or("auto"),
+            trigger_id: None,
+            input,
+            session_ref: last
+                .as_ref()
+                .and_then(|execution| execution.session_ref.as_deref()),
+            skills: &[],
+            timeout_seconds: spec.resources.timeout_seconds,
+            requested_by: runtime.created_by,
+            idempotency_key: Some(&idempotency_key),
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .map_err(|error| RuntimeTickError::Transient(error.into()))?;
+    state
+        .store
+        .record_agent_runtime_launch(
+            runtime.id,
+            execution.id,
+            last_failed.is_none(),
+            chrono::Utc::now() + chrono::Duration::seconds(runtime.interval_seconds as i64),
+        )
+        .await?;
+
     Ok(())
 }
