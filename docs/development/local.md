@@ -2,7 +2,7 @@
 
 ## Prerequisites
 - Docker (Compose v2) and make
-- Rust stable (>= 1.85; pinned via `rust-toolchain.toml`)
+- Rust stable (>= 1.94; pinned via `rust-toolchain.toml`)
 - Node.js >= 20 and pnpm 10+ (`corepack enable && corepack prepare pnpm@latest --activate`)
 
 ## Fast path (everything in containers)
