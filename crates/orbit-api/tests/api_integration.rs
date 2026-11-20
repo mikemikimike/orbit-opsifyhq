@@ -3119,3 +3119,2811 @@ async fn team_queue_requires_team_view_and_use() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+// ---------------------------------------------------------------------------
+// #113: team run / queue state transitions (restored, #191)
+// ---------------------------------------------------------------------------
+
+async fn make_team(app: &TestApp, steps: Vec<Uuid>, extra: Value) -> Uuid {
+    let mut definition = json!({
+        "mode": "pipeline",
+        "instructions": "do the work",
+        "steps": steps.iter().map(|id| json!({ "agentId": id })).collect::<Vec<_>>(),
+    });
+    for (key, value) in extra.as_object().cloned().unwrap_or_default() {
+        definition[key] = value;
+    }
+    app.store
+        .create_agent_team(app.org_id, "T", "", &definition, None)
+        .await
+        .unwrap()
+        .id
+}
+
+async fn start_run(app: &TestApp, team_id: Uuid) -> Uuid {
+    let (status, body) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/agent-teams/{team_id}/runs"),
+            json!({ "task": "go" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["run"]["id"].as_str().unwrap().parse().unwrap()
+}
+
+async fn succeed_current_step(app: &TestApp, run_id: Uuid) {
+    let step = app.store.current_team_step(run_id).await.unwrap().unwrap();
+    // Since #139 the store refuses queued -> succeeded, so walk the real lifecycle first.
+    let execution_id = step.execution_id.unwrap();
+    app.store
+        .claim_execution(execution_id, "test-worker")
+        .await
+        .unwrap();
+    app.store
+        .mark_execution_running(execution_id, None)
+        .await
+        .unwrap();
+    app.store
+        .finish_execution(
+            step.execution_id.unwrap(),
+            orbit_domain::ExecutionStatus::Succeeded,
+            Some(&json!({ "summary": "ok" })),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+async fn advance_concurrently(
+    state: &AppState,
+    run: &orbit_store::TeamRun,
+    n: usize,
+) -> Vec<anyhow::Result<()>> {
+    let mut tasks = Vec::new();
+    for _ in 0..n {
+        let state = state.clone();
+        let run = run.clone();
+        tasks.push(tokio::spawn(async move {
+            orbit_api::handlers::teams::advance(&state, run).await
+        }));
+    }
+    let mut out = Vec::new();
+    for task in tasks {
+        out.push(task.await.unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn concurrent_advance_creates_one_execution_per_step() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let team = make_team(&app, vec![app.agent_id, app.agent_id], json!({})).await;
+    let run_id = start_run(&app, team).await;
+    succeed_current_step(&app, run_id).await;
+    let run = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    let results = advance_concurrently(&app.state, &run, 4).await;
+    assert!(results.iter().all(|result| result.is_ok()), "{results:?}");
+    let steps = app.store.list_team_steps(run_id).await.unwrap();
+    assert_eq!(steps.len(), 2);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM executions WHERE team_run_id = $1 AND team_step_index = 1",
+    )
+    .bind(run_id)
+    .fetch_one(&raw_pool().await)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "exactly one execution for step 1");
+
+    // Finishing the last step succeeds the run exactly once, even when raced.
+    succeed_current_step(&app, run_id).await;
+    let run = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    advance_concurrently(&app.state, &run, 4).await;
+    let run = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    assert_eq!(run.status, "succeeded");
+}
+
+#[tokio::test]
+async fn advance_resumes_after_step_finished_without_next_step() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let team = make_team(&app, vec![app.agent_id, app.agent_id], json!({})).await;
+    let run_id = start_run(&app, team).await;
+    // Simulate a tick that died right after finishing step 0.
+    let step = app.store.current_team_step(run_id).await.unwrap().unwrap();
+    app.store
+        .finish_team_step(step.id, "succeeded", Some(&json!({ "x": 1 })), None)
+        .await
+        .unwrap()
+        .unwrap();
+    // A second finish is a no-op instead of overwriting.
+    assert!(app
+        .store
+        .finish_team_step(step.id, "failed", None, Some("late"))
+        .await
+        .unwrap()
+        .is_none());
+    let run = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    orbit_api::handlers::teams::advance(&app.state, run)
+        .await
+        .unwrap();
+    assert_eq!(app.store.list_team_steps(run_id).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn failed_next_step_start_is_retried_then_fails_the_run() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    // The second step cannot be started (a non-client, i.e. retryable, error). Team-run
+    // creation now rejects unknown step agents up front, and a deleted agent is a 404 that
+    // fails the run immediately (see #191 notes), so corrupt the second agent's stored
+    // spec: start_step then fails with an internal error.
+    let owner = app.store.list_users(app.org_id).await.unwrap()[0].id;
+    let broken = create_demo_agent(&app.store, app.org_id, owner).await;
+    let team = make_team(&app, vec![app.agent_id, broken], json!({})).await;
+    let run_id = start_run(&app, team).await;
+    sqlx::query("UPDATE agent_versions SET spec = '{}'::jsonb WHERE agent_id = $1")
+        .bind(broken)
+        .execute(&raw_pool().await)
+        .await
+        .unwrap();
+    succeed_current_step(&app, run_id).await;
+    let run = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+
+    // Within the retry window: error, run stays running, step stays succeeded (retryable).
+    assert!(orbit_api::handlers::teams::advance(&app.state, run.clone())
+        .await
+        .is_err());
+    let run_now = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    assert_eq!(run_now.status, "running");
+    let step = app.store.current_team_step(run_id).await.unwrap().unwrap();
+    assert_eq!(step.status, "succeeded");
+    // The lease was released, so the next tick retries.
+    assert!(orbit_api::handlers::teams::advance(&app.state, run.clone())
+        .await
+        .is_err());
+
+    // Past the window: the run fails with a clear error instead of retrying forever.
+    sqlx::query("UPDATE team_steps SET finished_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(step.id)
+        .execute(&raw_pool().await)
+        .await
+        .unwrap();
+    orbit_api::handlers::teams::advance(&app.state, run)
+        .await
+        .unwrap();
+    let run_now = app.store.get_team_run(app.org_id, run_id).await.unwrap();
+    assert_eq!(run_now.status, "failed");
+    assert!(run_now.error.unwrap().contains("could not start step 2"));
+}
+
+async fn queue_item(app: &TestApp, team: Uuid, key: &str, max_attempts: i32) -> Uuid {
+    app.store
+        .try_enqueue_team_item(
+            app.org_id,
+            team,
+            key,
+            None,
+            &json!({ "task": key }),
+            max_attempts,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn concurrent_queue_start_creates_exactly_one_run() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let team = make_team(&app, vec![app.agent_id], json!({})).await;
+    let item = queue_item(&app, team, "gh#1", 1).await;
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        let router = app.router.clone();
+        tasks.push(tokio::spawn(async move {
+            send(
+                &router,
+                post(
+                    &format!("/api/v1/agent-teams/{team}/queue/{item}/run"),
+                    json!({}),
+                ),
+            )
+            .await
+            .0
+        }));
+    }
+    let mut created = 0;
+    for task in tasks {
+        let status = task.await.unwrap();
+        if status == StatusCode::CREATED {
+            created += 1;
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT);
+        }
+    }
+    assert_eq!(created, 1);
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM team_runs WHERE team_id = $1")
+        .bind(team)
+        .fetch_one(&raw_pool().await)
+        .await
+        .unwrap();
+    assert_eq!(runs, 1);
+    let stored = app
+        .store
+        .get_team_queue_item(app.org_id, item)
+        .await
+        .unwrap();
+    assert_eq!(stored.status, "running");
+    assert!(stored.team_run_id.is_some());
+}
+
+#[tokio::test]
+async fn failed_launch_leaves_no_running_orphan() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    // auto_launch with a worker profile that does not exist: launch fails after the run
+    // and its step/execution were created.
+    let team = make_team(
+        &app,
+        vec![app.agent_id],
+        json!({ "autoLaunch": true, "workerProfileId": Uuid::now_v7() }),
+    )
+    .await;
+    let item = queue_item(&app, team, "gh#2", 3).await;
+    let (status, _) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/agent-teams/{team}/queue/{item}/run"),
+            json!({}),
+        ),
+    )
+    .await;
+    assert!(!status.is_success(), "{status}");
+    let stored = app
+        .store
+        .get_team_queue_item(app.org_id, item)
+        .await
+        .unwrap();
+    assert_eq!(stored.status, "failed");
+    assert!(stored.team_run_id.is_none());
+    assert!(stored.error.is_some());
+    let running: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM team_runs WHERE team_id = $1 AND status = 'running'",
+    )
+    .bind(team)
+    .fetch_one(&raw_pool().await)
+    .await
+    .unwrap();
+    assert_eq!(running, 0);
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM executions e JOIN team_runs r ON r.id = e.team_run_id
+         WHERE r.team_id = $1
+           AND e.status NOT IN ('cancelled','failed','succeeded','timed_out','rejected')",
+    )
+    .bind(team)
+    .fetch_one(&raw_pool().await)
+    .await
+    .unwrap();
+    assert_eq!(live, 0, "no executable orphan execution");
+    // The failed item is retryable.
+    assert!(app
+        .store
+        .claim_team_queue_item(app.org_id, item)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn retry_and_requeue_cannot_revive_succeeded_and_retry_respects_max_attempts() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let team = make_team(&app, vec![app.agent_id], json!({})).await;
+    let done = queue_item(&app, team, "gh#3", 3).await;
+    app.store
+        .set_team_queue_status(app.org_id, done, "succeeded", None)
+        .await
+        .unwrap();
+    for action in ["retry", "requeue", "cancel"] {
+        let (status, _) = send(
+            &app.router,
+            post(
+                &format!("/api/v1/agent-teams/{team}/queue/{done}/{action}"),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{action}");
+    }
+    assert_eq!(
+        app.store
+            .get_team_queue_item(app.org_id, done)
+            .await
+            .unwrap()
+            .status,
+        "succeeded"
+    );
+
+    // max_attempts = 1: the first manual retry is allowed, the next is refused.
+    let failed = queue_item(&app, team, "gh#4", 1).await;
+    app.store
+        .set_team_queue_status(app.org_id, failed, "failed", Some("boom"))
+        .await
+        .unwrap();
+    let url = format!("/api/v1/agent-teams/{team}/queue/{failed}/retry");
+    let (status, body) = send(&app.router, post(&url, json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "pending");
+    assert_eq!(body["attempts"], 1);
+    app.store
+        .set_team_queue_status(app.org_id, failed, "failed", Some("boom"))
+        .await
+        .unwrap();
+    let (status, _) = send(&app.router, post(&url, json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // requeue is the explicit reset.
+    let (status, _) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/agent-teams/{team}/queue/{failed}/requeue"),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn terminal_run_with_unclosed_queue_item_is_reconciled() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let team = make_team(&app, vec![app.agent_id], json!({})).await;
+    let item = queue_item(&app, team, "gh#5", 1).await;
+    app.store
+        .claim_team_queue_item(app.org_id, item)
+        .await
+        .unwrap()
+        .unwrap();
+    let run = app
+        .store
+        .create_team_run(app.org_id, team, &json!({}), None)
+        .await
+        .unwrap();
+    assert!(app
+        .store
+        .attach_team_run_to_queue_item(app.org_id, item, run.id)
+        .await
+        .unwrap());
+    // Run reached a terminal state but close_queue_loop never completed.
+    app.store
+        .finish_team_run(run.id, "failed", None, Some("boom"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        app.store
+            .get_team_queue_item(app.org_id, item)
+            .await
+            .unwrap()
+            .status,
+        "running"
+    );
+    orbit_api::handlers::teams::reconcile_team_outcomes(&app.state)
+        .await
+        .unwrap();
+    let stored = app
+        .store
+        .get_team_queue_item(app.org_id, item)
+        .await
+        .unwrap();
+    assert_eq!(stored.status, "failed");
+    assert_eq!(stored.error.as_deref(), Some("boom"));
+}
+
+#[tokio::test]
+async fn enqueue_happens_before_claim_and_claim_failure_withdraws_the_item() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    use orbit_api::dispatcher::{enqueue_then_claim, EnqueueOutcome};
+    let team_id = make_team(&app, vec![app.agent_id], json!({})).await;
+    let team = app.store.get_agent_team(app.org_id, team_id).await.unwrap();
+    let payload = json!({ "task": "t" });
+
+    // Claim only runs after the item is durable.
+    let store = app.store.clone();
+    let outcome = enqueue_then_claim(
+        &app.store,
+        &team,
+        "gh#6",
+        None,
+        &payload,
+        1,
+        || async move {
+            let keys = store.list_team_queue_external_keys(team_id, 10).await?;
+            anyhow::ensure!(
+                keys.contains(&"gh#6".to_string()),
+                "item not enqueued before claim"
+            );
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, EnqueueOutcome::Enqueued);
+
+    // Already queued: no claim attempted.
+    let outcome = enqueue_then_claim(&app.store, &team, "gh#6", None, &payload, 1, || async {
+        anyhow::bail!("must not claim")
+    })
+    .await
+    .unwrap();
+    assert_eq!(outcome, EnqueueOutcome::AlreadyQueued);
+
+    // Claim failure withdraws the item so the next poll retries.
+    let outcome = enqueue_then_claim(&app.store, &team, "gh#7", None, &payload, 1, || async {
+        anyhow::bail!("label update failed")
+    })
+    .await
+    .unwrap();
+    assert!(matches!(outcome, EnqueueOutcome::ClaimFailed(_)));
+    let keys = app
+        .store
+        .list_team_queue_external_keys(team_id, 10)
+        .await
+        .unwrap();
+    assert!(!keys.contains(&"gh#7".to_string()));
+
+    // Enqueue (database) failure: the claim is never attempted, so the issue keeps its labels.
+    let mut broken = team.clone();
+    broken.id = Uuid::now_v7();
+    let claimed = std::sync::atomic::AtomicBool::new(false);
+    let result = enqueue_then_claim(&app.store, &broken, "gh#8", None, &payload, 1, || async {
+        claimed.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    })
+    .await;
+    assert!(result.is_err());
+    assert!(!claimed.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+// ---------------------------------------------------------------------------
+// Output delivery (#112, restored by #191)
+// ---------------------------------------------------------------------------
+
+mod output_delivery {
+    use super::*;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::routing::post as route_post;
+    use orbit_api::handlers::outputs::deliver_pending;
+    use orbit_security::SecretValue;
+    use orbit_store::Output;
+    use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    /// deliver_pending is global across orgs; serialize these tests so counts are exact.
+    fn guard() -> &'static tokio::sync::Mutex<()> {
+        static GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        // The test hooks listen on 127.0.0.1; the outbound guard (#142) blocks loopback
+        // unless explicitly allowlisted.
+        static ALLOW: std::sync::Once = std::sync::Once::new();
+        ALLOW.call_once(|| std::env::set_var("ORBIT_OUTBOUND_ALLOWED_HOSTS", "127.0.0.1"));
+        GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[derive(Clone)]
+    struct Hook {
+        url: String,
+        hits: Arc<StdMutex<Vec<HeaderMap>>>,
+        status: Arc<AtomicU16>,
+        delay_ms: Arc<AtomicU64>,
+    }
+
+    impl Hook {
+        fn count(&self) -> usize {
+            self.hits.lock().unwrap().len()
+        }
+    }
+
+    async fn start_hook() -> Hook {
+        let hook = Hook {
+            url: String::new(),
+            hits: Arc::new(StdMutex::new(Vec::new())),
+            status: Arc::new(AtomicU16::new(200)),
+            delay_ms: Arc::new(AtomicU64::new(0)),
+        };
+        async fn handle(State(hook): State<Hook>, headers: HeaderMap) -> StatusCode {
+            hook.hits.lock().unwrap().push(headers);
+            let delay = hook.delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+            StatusCode::from_u16(hook.status.load(Ordering::SeqCst)).unwrap()
+        }
+        let router = axum::Router::new()
+            .route("/hook", route_post(handle))
+            .with_state(hook.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Hook { url, ..hook }
+    }
+
+    async fn make_output(app: &TestApp, hook: &Hook, kind: &str) -> Output {
+        let secret_ref = format!("secret://output/{}", Uuid::now_v7());
+        app.store
+            .put_secret(
+                Some(app.org_id),
+                &secret_ref,
+                &SecretValue::new(hook.url.clone()),
+                "test hook",
+            )
+            .await
+            .unwrap();
+        app.store
+            .create_output(
+                app.org_id,
+                &format!("hook-{}", Uuid::now_v7()),
+                kind,
+                None,
+                None,
+                &["succeeded".to_string(), "failed".to_string()],
+                &secret_ref,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn finished_execution(app: &TestApp) -> Uuid {
+        let path = format!("/api/v1/agents/{}/executions", app.agent_id);
+        let request = Request::builder()
+            .method("POST")
+            .uri(&path)
+            .header("content-type", "application/json")
+            .header("idempotency-key", Uuid::now_v7().to_string())
+            .body(Body::from(json!({ "task": "notify" }).to_string()))
+            .unwrap();
+        let (status, body) = send(&app.router, request).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+        app.store.claim_execution(id, "test-worker").await.unwrap();
+        app.store.mark_execution_running(id, None).await.unwrap();
+        app.store
+            .finish_execution(
+                id,
+                orbit_domain::ExecutionStatus::Succeeded,
+                Some(&json!({ "text": "done" })),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Pretend the run finished `hours` ago (e.g. while the API was down).
+    async fn backdate_execution(app: &TestApp, id: Uuid, hours: i32) {
+        sqlx::query(
+            "UPDATE executions SET finished_at = now() - make_interval(hours => $2), \
+             updated_at = now() - make_interval(hours => $2) WHERE id = $1",
+        )
+        .bind(id)
+        .bind(hours)
+        .execute(app.store.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn backdate_output(app: &TestApp, id: Uuid, hours: i32) {
+        sqlx::query(
+            "UPDATE outputs SET enqueue_from = now() - make_interval(hours => $2), \
+             enqueue_cursor = now() - make_interval(hours => $2) WHERE id = $1",
+        )
+        .bind(id)
+        .bind(hours)
+        .execute(app.store.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn rows(app: &TestApp, output_id: Uuid) -> Vec<(String, i32, Option<i32>)> {
+        sqlx::query_as(
+            "SELECT status, attempts, response_status FROM output_deliveries \
+             WHERE output_id = $1 ORDER BY created_at",
+        )
+        .bind(output_id)
+        .fetch_all(app.store.pool())
+        .await
+        .unwrap()
+    }
+
+    async fn make_due(app: &TestApp, output_id: Uuid) {
+        sqlx::query("UPDATE output_deliveries SET next_attempt_at = now() WHERE output_id = $1")
+            .bind(output_id)
+            .execute(app.store.pool())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_deliver_pending_sends_each_delivery_once() {
+        let Some(app) = test_app(true).await else {
+            return;
+        };
+        let _guard = guard().lock().await;
+        let hook = start_hook().await;
+        hook.delay_ms.store(300, Ordering::SeqCst);
+        let output = make_output(&app, &hook, "webhook").await;
+        for _ in 0..3 {
+            finished_execution(&app).await;
+        }
+        tokio::join!(
+            deliver_pending(&app.state),
+            deliver_pending(&app.state),
+            deliver_pending(&app.state)
+        );
+        assert_eq!(hook.count(), 3, "each delivery sent exactly once");
+        let rows = rows(&app, output.id).await;
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter().all(|r| r.0 == "succeeded" && r.1 == 1),
+            "{rows:?}"
+        );
+        // Idempotency headers carry the delivery id and are unique per delivery.
+        let ids: std::collections::HashSet<String> = hook
+            .hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| h["idempotency-key"].to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(hook
+            .hits
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|h| h.contains_key("x-orbit-delivery-id")));
+        // A later tick does not resend.
+        deliver_pending(&app.state).await;
+        assert_eq!(hook.count(), 3);
+    }
+
+    #[tokio::test]
+    async fn interrupted_send_is_retried_after_lease_expiry() {
+        let Some(app) = test_app(true).await else {
+            return;
+        };
+        let _guard = guard().lock().await;
+        let hook = start_hook().await;
+        let output = make_output(&app, &hook, "slack").await;
+        finished_execution(&app).await;
+        app.store.enqueue_output_deliveries().await.unwrap();
+        // A replica claims the row and "crashes" before sending.
+        let claimed = app
+            .store
+            .claim_output_deliveries(10, chrono::Duration::seconds(120))
+            .await
+            .unwrap();
+        assert!(claimed.iter().any(|j| j.output_id == output.id));
+        // While the lease is live, nobody else sends it.
+        deliver_pending(&app.state).await;
+        assert_eq!(hook.count(), 0);
+        assert_eq!(rows(&app, output.id).await[0].0, "sending");
+        // Lease expires: the row is reclaimed and delivered; the stale claim cannot finish.
+        sqlx::query("UPDATE output_deliveries SET lease_until = now() - interval '1 second' WHERE output_id = $1")
+            .bind(output.id)
+            .execute(app.store.pool())
+            .await
+            .unwrap();
+        deliver_pending(&app.state).await;
+        assert_eq!(hook.count(), 1);
+        let stale = claimed.iter().find(|j| j.output_id == output.id).unwrap();
+        let finished = app
+            .store
+            .finish_output_delivery(
+                stale.id,
+                stale.claim_token,
+                orbit_store::outputs::DeliveryOutcome::Failed,
+                None,
+                Some("stale"),
+                stale.attempts,
+            )
+            .await
+            .unwrap();
+        assert!(!finished, "stale claim must not overwrite the result");
+        let rows = rows(&app, output.id).await;
+        assert_eq!(rows[0].0, "succeeded");
+        assert_eq!(rows[0].1, 2, "interrupted attempt counts");
+    }
+
+    #[tokio::test]
+    async fn runs_finished_during_long_outage_are_delivered_once() {
+        let Some(app) = test_app(true).await else {
+            return;
+        };
+        let _guard = guard().lock().await;
+        let hook = start_hook().await;
+        let output = make_output(&app, &hook, "webhook").await;
+        // Output existed 5h ago; the API has been down since; the run finished 2h ago.
+        backdate_output(&app, output.id, 5).await;
+        let id = finished_execution(&app).await;
+        backdate_execution(&app, id, 2).await;
+        deliver_pending(&app.state).await;
+        assert_eq!(hook.count(), 1);
+        deliver_pending(&app.state).await;
+        deliver_pending(&app.state).await;
+        assert_eq!(hook.count(), 1, "exactly once");
+        assert_eq!(rows(&app, output.id).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn new_output_does_not_backfill_old_runs() {
+        let Some(app) = test_app(true).await else {
+            return;
+        };
+        let _guard = guard().lock().await;
+        let hook = start_hook().await;
+        finished_execution(&app).await;
+        let old = finished_execution(&app).await;
+        backdate_execution(&app, old, 2).await;
+        let output = make_output(&app, &hook, "webhook").await;
+        deliver_pending(&app.state).await;
+        assert_eq!(hook.count(), 0);
+        assert!(rows(&app, output.id).await.is_empty());
+        // A run that finishes after creation is delivered.
+        finished_execution(&app).await;
+        deliver_pending(&app.state).await;
+        assert_eq!(hook.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn client_errors_are_permanent_and_server_errors_retry() {
+        let Some(app) = test_app(true).await else {
+            return;
+        };
+        let _guard = guard().lock().await;
+
+        // 404: permanent, never retried.
+        let hook = start_hook().await;
+        hook.status.store(404, Ordering::SeqCst);
+        let output = make_output(&app, &hook, "slack").await;
+        finished_execution(&app).await;
+        deliver_pending(&app.state).await;
+        assert_eq!(
+            rows(&app, output.id).await,
+            vec![("failed".to_string(), 1, Some(404))]
+        );
+        make_due(&app, output.id).await;
+        deliver_pending(&app.state).await;
+        assert_eq!(hook.count(), 1, "4xx is not retried");
+
+        // 503: retried with backoff, dead after the final attempt.
+        let hook = start_hook().await;
+        hook.status.store(503, Ordering::SeqCst);
+        let output = make_output(&app, &hook, "mattermost").await;
+        finished_execution(&app).await;
+        deliver_pending(&app.state).await;
+        assert_eq!(
+            rows(&app, output.id).await,
+            vec![("pending".to_string(), 1, Some(503))]
+        );
+        deliver_pending(&app.state).await;
+        assert_eq!(hook.count(), 1, "backoff holds the retry");
+        make_due(&app, output.id).await;
+        deliver_pending(&app.state).await;
+        assert_eq!(hook.count(), 2);
+        sqlx::query("UPDATE output_deliveries SET attempts = 4, next_attempt_at = now() WHERE output_id = $1")
+            .bind(output.id)
+            .execute(app.store.pool())
+            .await
+            .unwrap();
+        deliver_pending(&app.state).await;
+        assert_eq!(
+            rows(&app, output.id).await,
+            vec![("dead".to_string(), 5, Some(503))]
+        );
+
+        // 429 is retryable.
+        let hook = start_hook().await;
+        hook.status.store(429, Ordering::SeqCst);
+        let output = make_output(&app, &hook, "slack").await;
+        finished_execution(&app).await;
+        deliver_pending(&app.state).await;
+        assert_eq!(rows(&app, output.id).await[0].0, "pending");
+    }
+
+    #[tokio::test]
+    async fn deleted_or_disabled_output_leaves_no_pending_rows() {
+        let Some(app) = test_app(true).await else {
+            return;
+        };
+        let _guard = guard().lock().await;
+        let hook = start_hook().await;
+
+        // Disabled after enqueue: skipped, nothing sent.
+        let disabled = make_output(&app, &hook, "webhook").await;
+        finished_execution(&app).await;
+        app.store.enqueue_output_deliveries().await.unwrap();
+        sqlx::query("UPDATE outputs SET enabled = false WHERE id = $1")
+            .bind(disabled.id)
+            .execute(app.store.pool())
+            .await
+            .unwrap();
+        deliver_pending(&app.state).await;
+        assert_eq!(hook.count(), 0);
+        let rows_disabled = rows(&app, disabled.id).await;
+        assert_eq!(rows_disabled.len(), 1);
+        assert_eq!(rows_disabled[0].0, "skipped");
+
+        // Deleted: its rows are removed with it (cascade), nothing pending remains.
+        let deleted = make_output(&app, &hook, "webhook").await;
+        finished_execution(&app).await;
+        app.store.enqueue_output_deliveries().await.unwrap();
+        app.store
+            .delete_output(app.org_id, deleted.id)
+            .await
+            .unwrap();
+        deliver_pending(&app.state).await;
+        assert!(rows(&app, deleted.id).await.is_empty());
+        assert_eq!(hook.count(), 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #139: worker identity binding, memory scoping, launch visibility (restored, #191)
+// ---------------------------------------------------------------------------
+
+async fn worker_token(store: &Store, org_id: Uuid, name: &str) -> String {
+    let issued = orbit_security::issue_worker_token();
+    store
+        .create_worker_token(
+            org_id,
+            None,
+            name,
+            &issued.prefix,
+            &issued.hash,
+            &["mock".to_string()],
+        )
+        .await
+        .expect("worker token");
+    issued.token
+}
+
+async fn queue_execution(app: &TestApp, key: &str) -> Uuid {
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agents/{}/executions", app.agent_id),
+            "test-token",
+            json!({ "task": key }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    Uuid::parse_str(body["id"].as_str().unwrap()).unwrap()
+}
+
+async fn claim_as(app: &TestApp, token: &str, worker_id: &str) -> Option<Uuid> {
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/claim",
+            token,
+            Some(json!({ "workerId": worker_id, "harnesses": ["mock"], "target": "local" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["execution"]["execution"]["id"]
+        .as_str()
+        .map(|id| Uuid::parse_str(id).unwrap())
+}
+
+#[tokio::test]
+async fn worker_cannot_act_on_execution_claimed_by_another_worker() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let token_a = worker_token(&app.store, app.org_id, "worker-a").await;
+    let token_b = worker_token(&app.store, app.org_id, "worker-b").await;
+    let queued = queue_execution(&app, "bound execution").await;
+
+    // Unclaimed executions are not reachable through the worker surface.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            &format!("/api/v1/worker/executions/{queued}/events"),
+            &token_a,
+            Some(json!({ "kind": "log", "level": "info", "message": "early" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let claimed = claim_as(&app, &token_a, "worker-a").await.expect("claimed");
+    assert_eq!(claimed, queued);
+
+    let base = format!("/api/v1/worker/executions/{claimed}");
+    // Worker B is rejected on every execution-scoped endpoint, with the error envelope.
+    let attempts = [
+        ("GET", format!("{base}/context"), None),
+        ("GET", format!("{base}/cancel"), None),
+        (
+            "POST",
+            format!("{base}/running"),
+            Some(json!({ "sessionRef": "s" })),
+        ),
+        (
+            "POST",
+            format!("{base}/events"),
+            Some(json!({ "kind": "log", "level": "info", "message": "forged" })),
+        ),
+        (
+            "POST",
+            format!("{base}/complete"),
+            Some(json!({ "status": "succeeded", "output": { "forged": true } })),
+        ),
+        (
+            "POST",
+            "/api/v1/worker/approvals".to_string(),
+            Some(json!({ "executionId": claimed, "action": { "a": 1 } })),
+        ),
+        (
+            "POST",
+            "/api/v1/worker/audit".to_string(),
+            Some(json!({ "executionId": claimed, "action": "x" })),
+        ),
+    ];
+    for (method, path, body) in attempts {
+        let (status, body) = send(&app.router, worker_request(method, &path, &token_b, body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+        assert!(body["error"]["code"].is_string(), "{path}: {body}");
+    }
+    let untouched = app.store.get_execution(app.org_id, claimed).await.unwrap();
+    assert_eq!(untouched.status, "dispatched");
+    assert!(untouched.output.is_none());
+
+    // The claiming worker still drives its execution end to end.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            &format!("{base}/running"),
+            &token_a,
+            Some(json!({ "sessionRef": "s" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            &format!("{base}/events"),
+            &token_a,
+            Some(json!({ "kind": "log", "level": "info", "message": "ok" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            &format!("{base}/complete"),
+            &token_a,
+            Some(json!({ "status": "succeeded", "output": { "ok": true } })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["updated"], true);
+}
+
+#[tokio::test]
+async fn illegal_status_transitions_are_rejected() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    // queued -> succeeded is refused by the store.
+    let queued = queue_execution(&app, "illegal transition").await;
+    let result = app
+        .store
+        .finish_execution(
+            queued,
+            orbit_domain::ExecutionStatus::Succeeded,
+            Some(&json!({ "forged": true })),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(result.is_none());
+    let current = app.store.get_execution(app.org_id, queued).await.unwrap();
+    assert_eq!(current.status, "queued");
+    assert!(current.output.is_none());
+
+    // Cancellation from queued is still allowed (and frees the agent's concurrency slot).
+    let cancelled = app
+        .store
+        .request_execution_cancel(app.org_id, queued)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status, "cancelled");
+
+    // dispatched -> succeeded (skipping `running`) is refused through the API too.
+    queue_execution(&app, "dispatched transition").await;
+    let token = worker_token(&app.store, app.org_id, "worker-t").await;
+    let claimed = claim_as(&app, &token, "worker-t").await.unwrap();
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            &format!("/api/v1/worker/executions/{claimed}/complete"),
+            &token,
+            Some(json!({ "status": "succeeded", "output": { "x": 1 } })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["updated"], false);
+    let current = app.store.get_execution(app.org_id, claimed).await.unwrap();
+    assert_eq!(current.status, "dispatched");
+}
+
+#[tokio::test]
+async fn worker_memory_requires_a_bound_execution_and_uses_its_agent() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let token_a = worker_token(&app.store, app.org_id, "mem-a").await;
+    let token_b = worker_token(&app.store, app.org_id, "mem-b").await;
+    let execution = queue_execution(&app, "memory").await;
+    claim_as(&app, &token_a, "mem-a").await.expect("claimed");
+    let owner = app.store.list_users(app.org_id).await.unwrap()[0].id;
+    let other_agent = create_demo_agent(&app.store, app.org_id, owner).await;
+
+    // execution_id is mandatory.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/memory/store",
+            &token_a,
+            Some(json!({ "agentId": other_agent, "kind": "short_term", "content": "x" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Another worker cannot use the execution to reach the agent's memory.
+    for path in ["list", "store"] {
+        let (status, _) = send(
+            &app.router,
+            worker_request(
+                "POST",
+                &format!("/api/v1/worker/memory/{path}"),
+                &token_b,
+                Some(json!({ "executionId": execution, "kind": "k", "content": "x" })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+
+    // A caller-supplied agent id that differs from the execution's agent is refused.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/memory/store",
+            &token_a,
+            Some(json!({
+                "executionId": execution,
+                "agentId": other_agent,
+                "kind": "short_term",
+                "content": "poison"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(app
+        .store
+        .list_memory(app.org_id, other_agent, None, 20)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Without agentId the entry lands on the execution's own agent.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/memory/store",
+            &token_a,
+            Some(json!({ "executionId": execution, "kind": "short_term", "content": "mine" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, listed) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/memory/list",
+            &token_a,
+            Some(json!({ "executionId": execution })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed[0]["content"], "mine");
+
+    // Oversize content is rejected with a 413 envelope.
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/memory/store",
+            &token_a,
+            Some(json!({
+                "executionId": execution,
+                "kind": "short_term",
+                "content": "x".repeat(64 * 1024 + 1)
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(body["error"]["code"], "payload_too_large");
+}
+
+#[tokio::test]
+async fn worker_offline_and_heartbeat_are_owner_scoped() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let token_a = worker_token(&app.store, app.org_id, "hb-a").await;
+    let token_b = worker_token(&app.store, app.org_id, "hb-b").await;
+    let worker_id = format!("hb-worker-{}", Uuid::now_v7());
+    let beat = json!({ "workerId": worker_id, "harnesses": ["mock"], "target": "local" });
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/heartbeat",
+            &token_a,
+            Some(beat.clone()),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Another token can neither take over nor delete the record.
+    let (status, _) = send(
+        &app.router,
+        worker_request("POST", "/api/v1/worker/heartbeat", &token_b, Some(beat)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "DELETE",
+            &format!("/api/v1/worker/heartbeat/{worker_id}"),
+            &token_b,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let listed = app.store.list_worker_heartbeats(app.org_id).await.unwrap();
+    assert!(listed.iter().any(|w| w.worker_id == worker_id));
+    assert!(app
+        .store
+        .list_worker_heartbeats(Uuid::now_v7())
+        .await
+        .unwrap()
+        .is_empty());
+
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "DELETE",
+            &format!("/api/v1/worker/heartbeat/{worker_id}"),
+            &token_a,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn worker_launches_follow_profile_visibility() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "launch-alice@test.local",
+            "Alice",
+            UserRole::Viewer,
+        )
+        .await
+        .unwrap();
+    let bob = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "launch-bob@test.local",
+            "Bob",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "alice").await;
+    let bob_token = token_for(&app.store, app.org_id, bob.id, "bob").await;
+    let profile = app
+        .store
+        .create_worker_profile(
+            app.org_id,
+            "Bob private worker",
+            "mock",
+            "local",
+            "process",
+            "orbit-worker",
+            "test",
+            "all",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &json!({}),
+            &json!({}),
+            &json!({}),
+            false,
+            false,
+            false,
+            false,
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    make_private(
+        &app.store,
+        app.org_id,
+        "worker_profiles",
+        profile.id,
+        bob.id,
+    )
+    .await;
+    let launch = app
+        .store
+        .create_worker_launch(
+            app.org_id,
+            profile.id,
+            &profile.name,
+            "local",
+            "orbit-worker:test",
+            None,
+            Some(bob.id),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let (status, listed) = send(
+        &app.router,
+        auth_get("/api/v1/worker-launches?includeInactive=true", &alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["id"] != launch.id.to_string()));
+    for suffix in ["", "/logs"] {
+        let (status, _) = send(
+            &app.router,
+            auth_get(
+                &format!("/api/v1/worker-launches/{}{suffix}", launch.id),
+                &alice_token,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "alice {suffix}");
+    }
+
+    // The profile owner sees it (logs then fail only because no launcher is configured).
+    let (status, listed) = send(
+        &app.router,
+        auth_get("/api/v1/worker-launches?includeInactive=true", &bob_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == launch.id.to_string()));
+    let (status, _) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/worker-launches/{}", launch.id),
+            &bob_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/worker-launches/{}/logs", launch.id),
+            &bob_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// ---------------------------------------------------------------------------
+// #44: embedded docs (restored, #191)
+// ---------------------------------------------------------------------------
+
+async fn send_raw(
+    router: &axum::Router,
+    request: Request<Body>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let response = router.clone().oneshot(request).await.expect("response");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, headers, bytes.to_vec())
+}
+
+#[tokio::test]
+async fn docs_index_lists_categories_and_excludes_planning() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(&app.router, get("/api/v1/docs")).await;
+    assert_eq!(status, StatusCode::OK);
+    let categories = body["categories"].as_array().expect("categories");
+    assert!(categories.len() >= 4);
+    let ids: Vec<&str> = categories.iter().filter_map(|c| c["id"].as_str()).collect();
+    assert!(ids.contains(&"guide") && ids.contains(&"architecture"));
+    let slugs: Vec<&str> = categories
+        .iter()
+        .flat_map(|c| c["pages"].as_array().unwrap())
+        .filter_map(|p| p["slug"].as_str())
+        .collect();
+    assert!(slugs.contains(&"architecture/overview"));
+    assert!(!slugs.iter().any(|s| s.starts_with("planning")));
+    let first = &categories[0]["pages"][0];
+    assert!(first["title"].as_str().is_some_and(|t| !t.is_empty()));
+    assert!(first["url"].as_str().unwrap().starts_with("/api/v1/docs/"));
+
+    let (status, headers, bytes) = send_raw(&app.router, get("/api/v1/docs?format=html")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert!(String::from_utf8_lossy(&bytes).contains("architecture/overview"));
+}
+
+#[tokio::test]
+async fn docs_page_rewrites_links_and_supports_html() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(&app.router, get("/api/v1/docs/index")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["slug"], "index");
+    let markdown = body["markdown"].as_str().unwrap();
+    assert!(
+        markdown.contains("](/api/v1/docs/architecture/overview)"),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("overview.md)"));
+
+    let (status, headers, bytes) = send_raw(
+        &app.router,
+        get("/api/v1/docs/architecture/overview?format=markdown"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/markdown"));
+    assert!(String::from_utf8_lossy(&bytes).starts_with("# "));
+
+    let request = Request::builder()
+        .uri("/api/v1/docs/index")
+        .header("accept", "text/html")
+        .body(Body::empty())
+        .unwrap();
+    let (status, headers, bytes) = send_raw(&app.router, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert!(headers.contains_key("content-security-policy"));
+    let html = String::from_utf8_lossy(&bytes);
+    assert!(html.contains("<h1 id="));
+    assert!(html.contains("href=\"/api/v1/docs/"));
+}
+
+#[tokio::test]
+async fn docs_assets_are_served_with_content_type() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, headers, bytes) = send_raw(
+        &app.router,
+        get("/api/v1/docs/assets/architecture/orbit-overview.png"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/png");
+    assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+
+    let (status, headers, _) = send_raw(
+        &app.router,
+        get("/api/v1/docs/assets/architecture/orbit-overview.svg"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/svg+xml");
+
+    // A page whose slug starts with `assets/` is still reachable.
+    let (status, body) = send(&app.router, get("/api/v1/docs/assets/brand")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["slug"], "assets/brand");
+}
+
+#[tokio::test]
+async fn docs_reject_traversal_unknown_and_planning() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    for path in [
+        "/api/v1/docs/../Cargo.toml",
+        "/api/v1/docs/..%2F..%2FCargo.toml",
+        "/api/v1/docs/%2e%2e/%2e%2e/Cargo.toml",
+        "/api/v1/docs/assets/../../Cargo.toml",
+        "/api/v1/docs/assets/..%2F..%2FCargo.toml",
+        "/api/v1/docs/does/not/exist",
+        "/api/v1/docs/planning/provider-ux-and-harness-decoupling",
+        "/api/v1/docs/assets/planning/provider-ux-and-harness-decoupling.md",
+        "/api/v1/docs/assets/nope.png",
+    ] {
+        let (status, body) = send(&app.router, get(path)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(body["error"]["code"], "not_found", "{path}");
+        assert!(!body["error"]["requestId"].as_str().unwrap_or("").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn docs_require_authentication_but_swagger_stays_public() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    for path in [
+        "/api/v1/docs",
+        "/api/v1/docs/index",
+        "/api/v1/docs/assets/architecture/orbit-overview.png",
+    ] {
+        let (status, body) = send(&app.router, get(path)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        assert_eq!(body["error"]["code"], "unauthorized");
+    }
+    let (status, _) = send(&app.router, auth_get("/api/v1/docs", "test-token")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&app.router, get("/api/v1/openapi.json")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send(&app.router, get("/api/v1/meta")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["docsUrl"], "/api/v1/docs");
+}
+
+// ---------------------------------------------------------------------------
+// #140: shared execution preflight and permission checks (restored, #191)
+// ---------------------------------------------------------------------------
+
+async fn token_with_scopes(
+    store: &Store,
+    org_id: Uuid,
+    user_id: Uuid,
+    name: &str,
+    scopes: &[&str],
+) -> String {
+    let issued = orbit_security::issue_api_token();
+    let scopes: Vec<String> = scopes.iter().map(|scope| (*scope).to_string()).collect();
+    store
+        .create_api_token(
+            org_id,
+            user_id,
+            name,
+            &issued.prefix,
+            &issued.hash,
+            &scopes,
+            None,
+        )
+        .await
+        .expect("api token");
+    issued.token
+}
+
+fn auth_json(method: &str, path: &str, token: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+async fn webhook_connection(app: &TestApp, name: &str, owner: Uuid) -> Uuid {
+    let connector = app
+        .store
+        .get_connector_by_slug(app.org_id, "webhook")
+        .await
+        .unwrap()
+        .expect("webhook connector");
+    let connection = app
+        .store
+        .create_connection(
+            app.org_id,
+            connector.id,
+            name,
+            &json!({ "url": "http://127.0.0.1:9/hook" }),
+            &[],
+            None,
+            Some(owner),
+        )
+        .await
+        .unwrap();
+    make_private(&app.store, app.org_id, "connections", connection.id, owner).await;
+    connection.id
+}
+
+/// Agent owned by `owner` with optional connection binding and hourly quota.
+async fn bound_agent(
+    app: &TestApp,
+    owner: Uuid,
+    connection: Option<Uuid>,
+    max_per_hour: Option<u32>,
+) -> Uuid {
+    let mut value = definition();
+    if let Some(connection) = connection {
+        value["spec"]["connectors"] =
+            json!([{ "connector": "webhook", "connectionId": connection }]);
+    }
+    if let Some(max) = max_per_hour {
+        value["spec"]["autonomy"]["maxExecutionsPerHour"] = json!(max);
+    }
+    let definition: orbit_domain::AgentDefinition = serde_json::from_value(value).unwrap();
+    let (agent, _) = app
+        .store
+        .create_agent(app.org_id, Some(owner), &definition)
+        .await
+        .unwrap();
+    app.store
+        .set_agent_status(app.org_id, agent.id, orbit_domain::AgentStatus::Active)
+        .await
+        .unwrap();
+    app.store
+        .assign_resource_owner(app.org_id, "agents", agent.id, owner)
+        .await
+        .unwrap();
+    agent.id
+}
+
+async fn share_org(app: &TestApp, table: &str, id: Uuid) {
+    app.store
+        .set_resource_visibility(app.org_id, table, id, "org", None)
+        .await
+        .unwrap();
+}
+
+async fn operator(app: &TestApp, email: &str) -> orbit_store::User {
+    app.store
+        .ensure_user(app.org_id, email, email, UserRole::Operator)
+        .await
+        .unwrap()
+}
+
+async fn access_team(app: &TestApp, slug: &str) -> Uuid {
+    app.store
+        .create_access_team(app.org_id, slug, slug, None)
+        .await
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn agent_specs_require_use_of_referenced_connections_and_providers() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = operator(&app, "pf-spec-alice@test.local").await;
+    let bob = operator(&app, "pf-spec-bob@test.local").await;
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "alice").await;
+    let bob_token = token_for(&app.store, app.org_id, bob.id, "bob").await;
+    let alice_connection = webhook_connection(&app, "Alice hook", alice.id).await;
+
+    let mut with_connection = definition();
+    with_connection["spec"]["connectors"] =
+        json!([{ "connector": "webhook", "connectionId": alice_connection }]);
+
+    // Invisible connection: 404 with the field path in the envelope details.
+    let (status, body) = send(
+        &app.router,
+        auth_post("/api/v1/agents", &bob_token, with_connection.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["error"]["details"][0]["path"],
+        "spec.connectors[0].connectionId"
+    );
+
+    // The owner can bind it.
+    let (status, body) = send(
+        &app.router,
+        auth_post("/api/v1/agents", &alice_token, with_connection.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Updating an existing agent re-checks the references.
+    let bob_agent = bound_agent(&app, bob.id, None, None).await;
+    let (status, _) = send(
+        &app.router,
+        auth_patch(
+            &format!("/api/v1/agents/{bob_agent}"),
+            &bob_token,
+            json!({ "definition": with_connection.clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Visible but not usable (team viewer): 403.
+    let team = access_team(&app, "pf-spec-team").await;
+    app.store
+        .upsert_team_member(team, bob.id, "viewer")
+        .await
+        .unwrap();
+    app.store
+        .set_resource_visibility(
+            app.org_id,
+            "connections",
+            alice_connection,
+            "team",
+            Some(team),
+        )
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &app.router,
+        auth_post("/api/v1/agents", &bob_token, with_connection),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Providers: a private provider cannot be bound by another user.
+    let provider = app
+        .store
+        .create_provider(
+            app.org_id,
+            "pf-alice-provider",
+            "openai_compatible",
+            &json!({ "baseUrl": "http://127.0.0.1:9/v1" }),
+            None,
+        )
+        .await
+        .unwrap();
+    make_private(&app.store, app.org_id, "providers", provider.id, alice.id).await;
+    let mut with_provider = definition();
+    with_provider["spec"]["model"] =
+        json!({ "management": "platform", "provider": "pf-alice-provider", "model": "m" });
+    let (status, body) = send(
+        &app.router,
+        auth_post("/api/v1/agents", &bob_token, with_provider.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["details"][0]["path"], "spec.model.provider");
+    let (status, body) = send(
+        &app.router,
+        auth_post("/api/v1/agents", &alice_token, with_provider),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn rerun_applies_the_execute_preflight() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = operator(&app, "pf-rerun-alice@test.local").await;
+    let bob = operator(&app, "pf-rerun-bob@test.local").await;
+    let bob_token = token_for(&app.store, app.org_id, bob.id, "bob").await;
+    // Alice owns the connection and shares it org-wide; bob's agent binds it.
+    let connection = webhook_connection(&app, "Shared hook", alice.id).await;
+    share_org(&app, "connections", connection).await;
+    let agent = bound_agent(&app, bob.id, Some(connection), None).await;
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agents/{agent}/executions"),
+            &bob_token,
+            json!({ "task": "first" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let execution_id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    app.store
+        .request_execution_cancel(app.org_id, execution_id)
+        .await
+        .unwrap();
+
+    // Baseline: rerun works while bob can use the connection.
+    let rerun = format!("/api/v1/executions/{execution_id}/rerun");
+    let (status, body) = send(&app.router, auth_post(&rerun, &bob_token, json!({}))).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let second: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    app.store
+        .request_execution_cancel(app.org_id, second)
+        .await
+        .unwrap();
+
+    // Connection access revoked (alice makes it private again): the rerun is refused.
+    make_private(&app.store, app.org_id, "connections", connection, alice.id).await;
+    let (status, body) = send(&app.router, auth_post(&rerun, &bob_token, json!({}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        body["error"]["details"][0]["path"],
+        "spec.connectors[0].connectionId"
+    );
+
+    // Quota: maxExecutionsPerHour is enforced with 429.
+    let limited = bound_agent(&app, bob.id, None, Some(1)).await;
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agents/{limited}/executions"),
+            &bob_token,
+            json!({ "task": "once" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let first: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    app.store
+        .request_execution_cancel(app.org_id, first)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/executions/{first}/rerun"),
+            &bob_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+
+    // A harness that cannot run executions blocks the rerun.
+    let planned = HarnessRegistry::builtin()
+        .descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.kind == orbit_domain::HarnessKind::ClaudeCode)
+        .expect("claude code descriptor");
+    assert_ne!(planned.implementation_status.as_str(), "available");
+    app.store.upsert_harness_descriptor(&planned).await.unwrap();
+    let plain = bound_agent(&app, bob.id, None, None).await;
+    let agent_row = app.store.get_agent(app.org_id, plain).await.unwrap();
+    let version = app
+        .store
+        .get_current_version(app.org_id, &agent_row)
+        .await
+        .unwrap();
+    let blocked = app
+        .store
+        .create_execution(orbit_store::executions::NewExecution {
+            org_id: app.org_id,
+            agent_id: plain,
+            agent_version_id: version.id,
+            agent_name: &agent_row.name,
+            harness_kind: orbit_domain::HarnessKind::ClaudeCode,
+            trigger_source: orbit_domain::TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: json!({ "task": "x" }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: Some(bob.id),
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+    app.store
+        .request_execution_cancel(app.org_id, blocked.id)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/executions/{}/rerun", blocked.id),
+            &bob_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["details"][0]["path"], "harness");
+}
+
+#[tokio::test]
+async fn cancel_and_team_runs_require_use_not_just_view() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = operator(&app, "pf-use-alice@test.local").await;
+    let viola = operator(&app, "pf-use-viola@test.local").await;
+    let mark = operator(&app, "pf-use-mark@test.local").await;
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "alice").await;
+    let viola_token = token_for(&app.store, app.org_id, viola.id, "viola").await;
+    let mark_token = token_for(&app.store, app.org_id, mark.id, "mark").await;
+    let team = access_team(&app, "pf-use-team").await;
+    app.store
+        .upsert_team_member(team, viola.id, "viewer")
+        .await
+        .unwrap();
+    app.store
+        .upsert_team_member(team, mark.id, "member")
+        .await
+        .unwrap();
+
+    let agent = bound_agent(&app, alice.id, None, None).await;
+    app.store
+        .set_resource_visibility(app.org_id, "agents", agent, "team", Some(team))
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agents/{agent}/executions"),
+            &alice_token,
+            json!({ "task": "run" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let execution = body["id"].as_str().unwrap().to_string();
+
+    // A team viewer can see the execution but not cancel it.
+    let (status, _) = send(
+        &app.router,
+        auth_get(&format!("/api/v1/executions/{execution}"), &viola_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/executions/{execution}/cancel"),
+            &viola_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/executions/{execution}/cancel"),
+            &mark_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Team runs: viewer refused, member allowed.
+    let team_definition = json!({ "steps": [{ "agentId": agent }] });
+    let team_row = app
+        .store
+        .create_agent_team(app.org_id, "Use team", "", &team_definition, Some(alice.id))
+        .await
+        .unwrap();
+    app.store
+        .assign_resource_owner(app.org_id, "agent_teams", team_row.id, alice.id)
+        .await
+        .unwrap();
+    app.store
+        .set_resource_visibility(app.org_id, "agent_teams", team_row.id, "team", Some(team))
+        .await
+        .unwrap();
+    let runs = format!("/api/v1/agent-teams/{}/runs", team_row.id);
+    let (status, _) = send(
+        &app.router,
+        auth_post(&runs, &viola_token, json!({ "task": "go" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A caller-supplied repository outside the team's configured set is refused.
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &runs,
+            &mark_token,
+            json!({ "task": "go", "payload": { "repository": "evil/repo" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["details"][0]["path"], "payload.repository");
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(&runs, &mark_token, json!({ "task": "go" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A step agent bound to a connection the member cannot use blocks the run.
+    let secret = webhook_connection(&app, "Alice private hook", alice.id).await;
+    let bound = bound_agent(&app, alice.id, Some(secret), None).await;
+    app.store
+        .set_resource_visibility(app.org_id, "agents", bound, "team", Some(team))
+        .await
+        .unwrap();
+    let team2 = app
+        .store
+        .create_agent_team(
+            app.org_id,
+            "Bound team",
+            "",
+            &json!({ "steps": [{ "agentId": bound }] }),
+            Some(alice.id),
+        )
+        .await
+        .unwrap();
+    app.store
+        .set_resource_visibility(app.org_id, "agent_teams", team2.id, "team", Some(team))
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/agent-teams/{}/runs", team2.id),
+            &mark_token,
+            json!({ "task": "go" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn tool_policies_require_manage_on_the_target_agent() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = operator(&app, "pf-policy-alice@test.local").await;
+    let carol = operator(&app, "pf-policy-carol@test.local").await;
+    // Since #136 a token never exceeds its owner's current role and only owners hold
+    // settings:write among the built-in roles (owners manage everything). A custom role
+    // gives carol settings:write without privileged resource access, which is the case
+    // this test is about.
+    app.store
+        .create_custom_role(
+            app.org_id,
+            "Policy author",
+            &[
+                "settings:write".into(),
+                "settings:read".into(),
+                "agents:read".into(),
+            ],
+        )
+        .await
+        .unwrap();
+    app.store
+        .set_user_role_name(app.org_id, carol.id, "Policy author")
+        .await
+        .unwrap();
+    let carol_token = token_with_scopes(
+        &app.store,
+        app.org_id,
+        carol.id,
+        "carol",
+        &["settings:write", "settings:read", "agents:read"],
+    )
+    .await;
+    let alice_agent = bound_agent(&app, alice.id, None, None).await;
+    make_private(&app.store, app.org_id, "agents", alice_agent, alice.id).await;
+    let carol_agent = bound_agent(&app, carol.id, None, None).await;
+    let policy = |agent: Option<Uuid>| {
+        json!({
+            "name": "allow bash",
+            "agentId": agent,
+            "action": "allow",
+            "matcher": { "tool": "bash" }
+        })
+    };
+
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/tool-policies",
+            &carol_token,
+            policy(Some(alice_agent)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/tool-policies",
+            &carol_token,
+            policy(Some(carol_agent)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let policy_id = body["id"].as_str().unwrap().to_string();
+
+    // Moving the policy onto an agent she cannot manage is refused too.
+    let (status, _) = send(
+        &app.router,
+        auth_json(
+            "PATCH",
+            &format!("/api/v1/tool-policies/{policy_id}"),
+            &carol_token,
+            policy(Some(alice_agent)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Org-wide policies keep requiring only settings:write.
+    let (status, body) = send(
+        &app.router,
+        auth_post("/api/v1/tool-policies", &carol_token, policy(None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn export_checks_the_read_permission_of_the_resource_kind() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let dave = operator(&app, "pf-export-dave@test.local").await;
+    let agents_only = token_with_scopes(
+        &app.store,
+        app.org_id,
+        dave.id,
+        "agents-only",
+        &["agents:read"],
+    )
+    .await;
+    let dave_agent = bound_agent(&app, dave.id, None, None).await;
+    let provider = app
+        .store
+        .create_provider(
+            app.org_id,
+            "pf-export-provider",
+            "openai_compatible",
+            &json!({ "baseUrl": "http://127.0.0.1:9/v1" }),
+            None,
+        )
+        .await
+        .unwrap();
+    share_org(&app, "providers", provider.id).await;
+
+    let (status, _) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/export/providers/{}", provider.id),
+            &agents_only,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = send(
+        &app.router,
+        auth_get(&format!("/api/v1/export/agents/{dave_agent}"), &agents_only),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let providers_reader = token_with_scopes(
+        &app.store,
+        app.org_id,
+        dave.id,
+        "providers",
+        &["agents:read", "providers:read"],
+    )
+    .await;
+    let (status, _) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/export/providers/{}", provider.id),
+            &providers_reader,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn scheduled_trigger_fails_when_its_owner_lost_connection_access() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = operator(&app, "pf-trigger-alice@test.local").await;
+    let bob = operator(&app, "pf-trigger-bob@test.local").await;
+    // Bob owns the connection and shares it org-wide; alice's agent and trigger use it.
+    let connection = webhook_connection(&app, "Bob trigger hook", bob.id).await;
+    share_org(&app, "connections", connection).await;
+    let agent = bound_agent(&app, alice.id, Some(connection), None).await;
+    let trigger = app
+        .store
+        .create_trigger(
+            app.org_id,
+            agent,
+            "schedule",
+            None,
+            json!({ "cron": "* * * * *" }),
+            true,
+        )
+        .await
+        .unwrap();
+    app.store
+        .assign_resource_owner(app.org_id, "triggers", trigger.id, alice.id)
+        .await
+        .unwrap();
+
+    // While the owner can use the connection the trigger runs.
+    let current = app.store.get_trigger(app.org_id, trigger.id).await.unwrap();
+    orbit_api::background::fire_trigger(&app.state, current)
+        .await
+        .expect("first fire succeeds");
+    let (executions, _, _) = app
+        .store
+        .list_executions(app.org_id, 50, None, None, Some(agent), None, None)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    app.store
+        .request_execution_cancel(app.org_id, executions[0].id)
+        .await
+        .unwrap();
+
+    // Bob withdraws the connection: the trigger owner has lost access at fire time.
+    make_private(&app.store, app.org_id, "connections", connection, bob.id).await;
+    let current = app.store.get_trigger(app.org_id, trigger.id).await.unwrap();
+    let error = orbit_api::background::fire_trigger(&app.state, current)
+        .await
+        .expect_err("fire is refused");
+    assert!(error.to_string().contains("refused"), "{error}");
+    let (executions, _, _) = app
+        .store
+        .list_executions(app.org_id, 50, None, None, Some(agent), None, None)
+        .await
+        .unwrap();
+    assert_eq!(executions.len(), 1, "no execution may be created");
+    let (logs, _) = app
+        .store
+        .list_audit_logs(app.org_id, 10, None, Some("trigger.fire_denied"))
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// #123: error envelope and validated settings (restored, #191)
+// ---------------------------------------------------------------------------
+
+fn put(path: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn assert_envelope(status: StatusCode, body: &Value, expected: StatusCode, code: &str) {
+    assert_eq!(status, expected, "{body}");
+    assert_eq!(body["error"]["code"], code, "{body}");
+    assert!(body["error"]["message"].is_string(), "{body}");
+    assert!(body["error"]["details"].is_array(), "{body}");
+    assert!(
+        !body["error"]["requestId"].as_str().unwrap_or("").is_empty(),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn path_query_route_and_method_rejections_use_the_error_envelope() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+
+    let (status, body) = send(&app.router, get("/api/v1/agents/not-a-uuid")).await;
+    assert_envelope(status, &body, StatusCode::BAD_REQUEST, "bad_request");
+
+    let (status, body) = send(&app.router, get("/api/v1/agents?limit=abc")).await;
+    assert_envelope(status, &body, StatusCode::BAD_REQUEST, "bad_request");
+
+    let (status, body) = send(&app.router, get("/api/v1/no/such/route")).await;
+    assert_envelope(status, &body, StatusCode::NOT_FOUND, "not_found");
+
+    let request = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/meta")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert!(response.headers().contains_key("allow"));
+    assert!(response.headers().contains_key("x-request-id"));
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_envelope(
+        StatusCode::METHOD_NOT_ALLOWED,
+        &body,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method_not_allowed",
+    );
+
+    // Existing envelope errors and successful responses are unchanged.
+    let missing = format!("/api/v1/agents/{}", Uuid::now_v7());
+    let (status, body) = send(&app.router, get(&missing)).await;
+    assert_envelope(status, &body, StatusCode::NOT_FOUND, "not_found");
+    let (status, body) = send(&app.router, post("/api/v1/agents", json!({"bad": true}))).await;
+    assert!(status.is_client_error(), "{body}");
+    assert!(body["error"]["requestId"].is_string(), "{body}");
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(get("/api/v1/agents"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+}
+
+#[tokio::test]
+async fn settings_updates_are_validated_enveloped_and_audited() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+
+    // Malformed bodies use the envelope for all three handlers.
+    for path in [
+        "/api/v1/settings/oidc",
+        "/api/v1/settings/access",
+        "/api/v1/settings/harness",
+    ] {
+        let request = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let (status, body) = send(&app.router, request).await;
+        assert_envelope(status, &body, StatusCode::BAD_REQUEST, "bad_request");
+    }
+
+    // Invalid OIDC settings are rejected with field-level details.
+    let (status, body) = send(
+        &app.router,
+        put(
+            "/api/v1/settings/oidc",
+            json!({"settings": {
+                "issuer": "not a url",
+                "defaultRole": "viewer",
+                "groupRoles": {"admins": "no-such-role"},
+            }}),
+        ),
+    )
+    .await;
+    assert_envelope(
+        status,
+        &body,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "validation_error",
+    );
+    let paths: Vec<&str> = body["error"]["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"settings.issuer"), "{paths:?}");
+    assert!(paths.contains(&"settings.groupRoles.admins"), "{paths:?}");
+
+    // Valid updates succeed and write audit rows.
+    let (status, _) = send(
+        &app.router,
+        put(
+            "/api/v1/settings/oidc",
+            json!({"settings": {
+                "issuer": "https://idp.example.com",
+                "clientId": "orbit",
+                "defaultRole": "viewer",
+                "groupRoles": {"admins": "admin"},
+            }}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app.router,
+        put("/api/v1/settings/access", json!({"teamIsolation": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &app.router,
+        put(
+            "/api/v1/settings/harness",
+            json!({"defaultHarness": "mock"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for (action, key, expected) in [
+        (
+            "settings.oidc.update",
+            "after",
+            json!("https://idp.example.com"),
+        ),
+        ("settings.access.update", "after", json!(false)),
+        ("settings.harness.update", "after", json!("mock")),
+    ] {
+        let (rows, _) = app
+            .store
+            .list_audit_logs(app.org_id, 10, None, Some(action))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{action}");
+        let after = &rows[0].metadata[key];
+        let found = match action {
+            "settings.oidc.update" => &after["issuer"],
+            "settings.access.update" => &after["teamIsolation"],
+            _ => &after["defaultHarness"],
+        };
+        assert_eq!(found, &expected, "{action}");
+        assert!(rows[0].request_id.is_some());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #122: list visibility applied in SQL (restored, #191)
+// ---------------------------------------------------------------------------
+
+async fn seed_execution(store: &Store, org_id: Uuid, agent_id: Uuid) -> Uuid {
+    let agent = store.get_agent(org_id, agent_id).await.unwrap();
+    let version = store.get_current_version(org_id, &agent).await.unwrap();
+    store
+        .create_execution(orbit_store::executions::NewExecution {
+            org_id,
+            agent_id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: orbit_domain::HarnessKind::Mock,
+            trigger_source: orbit_domain::TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: json!({ "task": "seeded" }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: None,
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn execution_list_applies_visibility_before_paging() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "page-alice@test.local",
+            "Alice",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let bob = app
+        .store
+        .ensure_user(app.org_id, "page-bob@test.local", "Bob", UserRole::Operator)
+        .await
+        .unwrap();
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "alice").await;
+    let agent_a = create_demo_agent(&app.store, app.org_id, alice.id).await;
+    let agent_b = create_demo_agent(&app.store, app.org_id, bob.id).await;
+    make_private(&app.store, app.org_id, "agents", agent_a, alice.id).await;
+    make_private(&app.store, app.org_id, "agents", agent_b, bob.id).await;
+
+    // 3 visible executions first, then 7 newer hidden ones.
+    let mut visible_ids = Vec::new();
+    for _ in 0..3 {
+        visible_ids.push(seed_execution(&app.store, app.org_id, agent_a).await);
+    }
+    for _ in 0..7 {
+        seed_execution(&app.store, app.org_id, agent_b).await;
+    }
+
+    let (status, page1) = send(
+        &app.router,
+        auth_get("/api/v1/executions?limit=2", &alice_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page1}");
+    assert_eq!(page1["items"].as_array().unwrap().len(), 2);
+    assert!(page1["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["agentId"] == agent_a.to_string()));
+    assert_eq!(page1["total"], 3);
+    let cursor = page1["nextCursor"]
+        .as_str()
+        .expect("next cursor")
+        .to_string();
+
+    let (status, page2) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/executions?limit=2&cursor={cursor}"),
+            &alice_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page2}");
+    assert_eq!(page2["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page2["items"][0]["agentId"], agent_a.to_string());
+    assert!(page2["nextCursor"].is_null(), "{page2}");
+    assert_eq!(page2["total"], 3);
+
+    let mut seen: Vec<String> = [&page1, &page2]
+        .iter()
+        .flat_map(|p| p["items"].as_array().unwrap().iter())
+        .map(|item| item["id"].as_str().unwrap().to_string())
+        .collect();
+    seen.sort();
+    let mut expected: Vec<String> = visible_ids.iter().map(|id| id.to_string()).collect();
+    expected.sort();
+    assert_eq!(seen, expected);
+
+    // The org owner (dev identity) sees everything: 10 executions, one full page.
+    let (status, owner) = send(&app.router, get("/api/v1/executions?limit=50")).await;
+    assert_eq!(status, StatusCode::OK, "{owner}");
+    assert_eq!(owner["items"].as_array().unwrap().len(), 10);
+    assert_eq!(owner["total"], 10);
+}
+
+#[tokio::test]
+async fn approval_list_applies_visibility_in_sql() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let alice = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "appr-alice@test.local",
+            "Alice",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let bob = app
+        .store
+        .ensure_user(app.org_id, "appr-bob@test.local", "Bob", UserRole::Operator)
+        .await
+        .unwrap();
+    let agent_a = create_demo_agent(&app.store, app.org_id, alice.id).await;
+    let agent_b = create_demo_agent(&app.store, app.org_id, bob.id).await;
+    make_private(&app.store, app.org_id, "agents", agent_a, alice.id).await;
+    make_private(&app.store, app.org_id, "agents", agent_b, bob.id).await;
+
+    let mut visible = Vec::new();
+    for _ in 0..2 {
+        let execution = seed_execution(&app.store, app.org_id, agent_a).await;
+        let approval = app
+            .store
+            .create_approval(app.org_id, execution, json!({ "action": "a" }), None)
+            .await
+            .unwrap();
+        visible.push(approval.id);
+    }
+    for _ in 0..5 {
+        let execution = seed_execution(&app.store, app.org_id, agent_b).await;
+        app.store
+            .create_approval(app.org_id, execution, json!({ "action": "b" }), None)
+            .await
+            .unwrap();
+    }
+
+    // Operators cannot decide approvals over HTTP, so exercise the store predicate the
+    // handler passes for non-privileged callers: newer hidden rows must not consume the
+    // page limit.
+    let alice_access =
+        orbit_store::access::ResourceAccess::new(alice.id, false, vec![]).with_team_isolation(true);
+    let rows = app
+        .store
+        .list_approvals(app.org_id, Some("pending"), 2, Some(&alice_access))
+        .await
+        .unwrap();
+    let mut got: Vec<Uuid> = rows.iter().map(|r| r.approval.id).collect();
+    got.sort();
+    visible.sort();
+    assert_eq!(got, visible);
+    assert!(rows.iter().all(|r| r.agent_id == agent_a));
+
+    // Internal access and the privileged owner see all 7 rows.
+    let all = app
+        .store
+        .list_approvals(app.org_id, Some("pending"), 50, None)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 7);
+    let (status, body) = send(&app.router, get("/api/v1/approvals?status=pending")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 7);
+}
+
+// ---------------------------------------------------------------------------
+// #150: runtime continues after a failed execution (restored, #191)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn runtime_backs_off_then_continues_after_failed_execution() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let runtime = app
+        .store
+        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
+        .await
+        .unwrap();
+    let pool = raw_pool().await;
+
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let first = runtime_row(&app, agent_id).await.last_execution_id.unwrap();
+    fail_execution(&pool, first).await;
+    make_runtime_due(&pool, runtime.id).await;
+
+    // Failure is accounted for and delays the next run; no new execution yet.
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.status, "running");
+    assert_eq!(row.consecutive_failures, 1);
+    assert_eq!(row.failed_execution_id, Some(first));
+    assert_eq!(row.last_execution_id, Some(first));
+    assert!(row.last_error.as_deref().unwrap().contains("boom"));
+    assert!(row.next_run_at > chrono::Utc::now() + chrono::Duration::seconds(30));
+
+    // Not yet due: still nothing new, and the failure is not double counted.
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.consecutive_failures, 1);
+    assert_eq!(row.last_execution_id, Some(first));
+
+    // Backoff elapsed: the next tick creates a new execution.
+    make_runtime_due(&pool, runtime.id).await;
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    let second = row.last_execution_id.unwrap();
+    assert_ne!(second, first, "runtime must continue after a failure");
+    assert_eq!(row.consecutive_failures, 1, "reset only after a success");
+    assert!(row.last_error.is_none());
+
+    // A successful execution resets the counter on the following launch.
+    sqlx::query("UPDATE executions SET status = 'succeeded', finished_at = now() WHERE id = $1")
+        .bind(second)
+        .execute(&pool)
+        .await
+        .unwrap();
+    make_runtime_due(&pool, runtime.id).await;
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    assert_ne!(row.last_execution_id, Some(second));
+    assert_eq!(row.consecutive_failures, 0);
+    assert!(row.failed_execution_id.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// #142: provider credential exposure (restored, #191)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn changing_provider_base_url_requires_reentering_the_credential() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(
+        &app.router,
+        post(
+            "/api/v1/providers",
+            json!({
+                "name": "Rebind Gateway",
+                "kind": "openai_compatible",
+                "config": { "baseUrl": "http://10.1.2.3:9999/v1", "model": "qwen" },
+                "credential": "sk-rebind-secret"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+    let path = format!("/api/v1/providers/{id}");
+    let patch = |body: Value| {
+        Request::builder()
+            .method("PATCH")
+            .uri(&path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    // New host without a new key: refused, nothing changes.
+    let (status, body) = send(
+        &app.router,
+        patch(json!({ "config": { "baseUrl": "http://evil.example/v1", "model": "qwen" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("re-enter the API key"));
+    let stored: Value = sqlx::query_scalar("SELECT config FROM providers WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_one(app.store.pool())
+        .await
+        .unwrap();
+    assert_eq!(stored["baseUrl"], "http://10.1.2.3:9999/v1");
+
+    // Same URL (trailing slash only) keeps the credential.
+    let (status, body) = send(
+        &app.router,
+        patch(json!({ "config": { "baseUrl": "http://10.1.2.3:9999/v1", "model": "other" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // New host with a freshly supplied key is accepted.
+    let (status, body) = send(
+        &app.router,
+        patch(json!({
+            "config": { "baseUrl": "http://10.9.9.9:9999/v1", "model": "qwen" },
+            "credential": "sk-new-key"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn provider_probe_requires_manage_and_refuses_metadata_addresses() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let provider = app
+        .store
+        .create_provider(
+            app.org_id,
+            "Metadata probe",
+            "openai_compatible",
+            &json!({ "baseUrl": "http://169.254.169.254/v1", "model": "m" }),
+            None,
+        )
+        .await
+        .unwrap();
+    // An operator can see org-visible providers but cannot probe (send credentials).
+    let operator = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "probe-op@test.local",
+            "Operator",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let operator_token = token_for(&app.store, app.org_id, operator.id, "probe-op").await;
+    let path = format!("/api/v1/providers/{}/test", provider.id);
+    let (status, _) = send(&app.router, auth_post(&path, &operator_token, json!({}))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The manager's probe is refused by the outbound guard with a generic category.
+    let (status, body) = send(&app.router, post(&path, json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"], "endpoint refused (blocked)");
+}

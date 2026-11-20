@@ -8,6 +8,14 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ## [Unreleased]
 
+### Tests
+
+- Restored 41 regression tests that were dropped while integrating PRs #145-#183: team run
+  and queue transitions (#113), output delivery (#112), worker scoping (#139), embedded docs
+  (#44), execution preflight (#140), error envelope (#123), SQL list visibility (#122),
+  runtime continue-after-failure (#150), credential exposure (#142), org-scoped secret
+  resolution (#144) and launcher pod naming (#106) (#191).
+
 ### Fixed
 
 - Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval

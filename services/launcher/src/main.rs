@@ -1210,6 +1210,45 @@ async fn logs(
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dns_label_safe(name: &str) -> bool {
+        name.len() <= 63
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && name.ends_with(|c: char| c.is_ascii_alphanumeric())
+    }
+
+    #[test]
+    fn back_to_back_launches_get_distinct_names() {
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        assert_ne!(pod_name(a), pod_name(b));
+    }
+
+    #[test]
+    fn names_are_dns_safe_and_short_enough_for_pod_suffixes() {
+        let name = pod_name(Uuid::now_v7());
+        assert!(dns_label_safe(&name), "{name}");
+        // Deployment pods append `-<10 char hash>-<5 char suffix>`.
+        assert!(name.len() + 17 <= 63, "{name}");
+        assert!(dns_label_safe(&legacy_pod_name(Uuid::now_v7())));
+    }
+
+    #[test]
+    fn legacy_label_must_match_exact_launch() {
+        let id = Uuid::now_v7();
+        assert!(label_matches_launch(&format!("{id}\n"), id));
+        assert!(!label_matches_launch(&Uuid::now_v7().to_string(), id));
+        assert!(!label_matches_launch("", id));
+        assert_ne!(legacy_pod_name(id), pod_name(id));
+    }
+}
+
+#[cfg(test)]
 mod credential_tests {
     use super::*;
 

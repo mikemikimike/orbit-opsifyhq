@@ -2399,3 +2399,37 @@ async fn agent_version_sync_keeps_api_triggers_and_stable_ids() {
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].id, api_trigger.id);
 }
+
+// ---------------------------------------------------------------------------
+// #144: org-scoped secret resolution (restored, #191)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn secret_resolution_is_org_scoped() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org_a, _) = seed_org(&store).await;
+    let (org_b, _) = seed_org(&store).await;
+    let reference = format!("connection/{}", uuid::Uuid::now_v7());
+    store
+        .put_secret(Some(org_a), &reference, &SecretValue::new("a-secret"), "t")
+        .await
+        .unwrap();
+    let own = store
+        .get_secret_value_for_org(org_a, &reference)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(own.expose(), "a-secret");
+    assert!(store
+        .get_secret_value_for_org(org_b, &reference)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .secret_owner(org_b, &reference)
+        .await
+        .unwrap()
+        .is_none());
+}
