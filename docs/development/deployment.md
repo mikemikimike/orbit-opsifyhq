@@ -4,9 +4,9 @@
 
 | Image | Dockerfile | Notes |
 |---|---|---|
-| `ghcr.io/orbit-platform/orbit-api` | `deploy/docker/api.Dockerfile` | multi-stage, non-root, embedded migrations |
-| `ghcr.io/orbit-platform/orbit-worker` | `deploy/docker/worker.Dockerfile` | non-root, harness adapters |
-| `ghcr.io/orbit-platform/orbit-web` | `deploy/docker/web.Dockerfile` | Next.js standalone output, non-root |
+| `ghcr.io/opsifyhq/orbit/orbit-api` | `deploy/docker/api.Dockerfile` | multi-stage, non-root, embedded migrations |
+| `ghcr.io/opsifyhq/orbit/orbit-worker` | `deploy/docker/worker.Dockerfile` | non-root, harness adapters |
+| `ghcr.io/opsifyhq/orbit/orbit-web` | `deploy/docker/web.Dockerfile` | Next.js standalone output, non-root |
 
 ```bash
 docker build -f deploy/docker/api.Dockerfile -t orbit-api:dev .
@@ -69,7 +69,7 @@ profile's worker token: long-lived profiles run as a Deployment (Kubernetes recr
 maintenance/eviction), single-execution launches run as a Job with a TTL for cleanup. Harness auth is mounted from a Secret when configured.
 
 Ingress routes: `/docs`, `/healthz`, `/readyz` → `orbit-api`; `/api` → `orbit-web`
-(the web container proxies `/api/*` to the API at harness, injecting the dev token
+(the web container proxies `/api/*` to the API at runtime, injecting the dev token
 server-side when dev auth is enabled and forwarding OIDC/API bearer headers otherwise);
 `/` → `orbit-web`.
 The chart sets SSE-friendly nginx annotations (`proxy-buffering: off`, long
@@ -149,6 +149,10 @@ production-grade database deployment.
 `platform.archiveAfterDays` (default `30`, `0` disables) archives terminal executions,
 team runs and worker launches older than that window. Records are never deleted; the
 default list simply hides archived runs, and the UI can switch to Active/Archived/All.
+
+`platform.auditRetentionDays` (`ORBIT_AUDIT_RETENTION_DAYS`, default `0`, which keeps
+audit logs forever) deletes audit log entries older than that window once a day. Unlike
+archiving, this permanently removes rows; set `0` if compliance requires indefinite retention.
 
 Image tags default to the chart `appVersion`, so `--version 0.7.0` pulls `orbit-*:0.7.0`
 — the same tags CI publishes for that release. Override per component with
@@ -238,3 +242,22 @@ cargo build --release -p orbit-worker --bin orbit-worker
 After starting the worker, check `GET /api/v1/workers` — the worker should appear
 with `live: true` within 30 seconds. Executions with matching harness and placement
 will be claimed automatically.
+
+## Production checklist
+
+The default Compose file and `values.yaml` are for local/test use. Before exposing ORBIT
+on a reachable host or cluster, override at least:
+
+| Area | Required override |
+|---|---|
+| Auth | `auth.mode=oidc` with issuer/audience (see `values-prod.example.yaml`); never `dev` auth or `allowAnonymous`. The chart fails to render dev + anonymous + ingress unless `auth.acknowledgeInsecureDev=true` (throwaway clusters only). |
+| Environment | `platform.environment=production`; the chart then rejects `auth.mode=dev` and the default bundled Postgres password. |
+| Database | `externalDatabase.enabled=true` (preferred), or a non-default `postgresql.password` for the bundled instance. |
+| Launcher | A random `launcher.token` / `launcher-token` key in the existing Secret (`openssl rand -base64 36`). In Compose set `ORBIT_LAUNCHER_TOKEN`; the launcher port is not published. |
+| Ingress | `ingress.tls.enabled=true` with a valid certificate Secret; `https://` in `platform.corsOrigins` and `platform.publicBaseUrl`. |
+| Master key | Provide your own `secrets.masterKey` / `ORBIT_MASTER_KEY` (see issue #107 and ADR 0004; unchanged by this checklist). |
+| Seed data | `platform.seedDemo=false`. |
+
+Compose is not a production target: it binds every published port to `127.0.0.1`
+(Postgres 5432, NATS 4222, API 8080, web 3000) and does not publish the NATS monitor or
+the launcher. Do not rebind them to other interfaces while dev defaults are in use.

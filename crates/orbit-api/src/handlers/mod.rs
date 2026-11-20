@@ -5,11 +5,13 @@ pub mod approvals;
 pub mod auth_oidc;
 pub mod catalog;
 pub mod dashboard;
+pub mod docs;
 pub mod env_mappings;
 pub mod executions;
 pub mod export;
 pub mod health;
 pub mod import;
+pub mod import_portable;
 pub mod license;
 pub mod outputs;
 pub mod roles;
@@ -67,7 +69,7 @@ pub(crate) async fn load_agent_detail(
         .await?;
     let (executions, _, _) = state
         .store
-        .list_executions(auth.org_id, 5, None, None, Some(agent.id), None)
+        .list_executions(auth.org_id, 5, None, None, Some(agent.id), None, None)
         .await?;
 
     Ok(AgentDetail {

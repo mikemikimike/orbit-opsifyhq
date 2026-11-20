@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "orbit-api"
@@ -26,3 +27,5 @@ serde_json.workspace = true
 axum.workspace = true
 sqlx.workspace = true
 dotenvy.workspace = true
+tokio-util.workspace = true
+futures.workspace = true

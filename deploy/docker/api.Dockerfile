@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # ORBIT control plane (orbit-api). Multi-stage, non-root, reproducible with --locked.
-FROM rust:1-bookworm AS builder
+FROM rust:1.100-bookworm AS builder
 WORKDIR /app
 
 # Dependency layer: manifests first for better build caching.
@@ -31,6 +31,8 @@ RUN mkdir -p crates/orbit-domain/src crates/orbit-contracts/src crates/orbit-sto
     && cargo fetch --locked
 
 COPY crates ./crates
+# Documentation is embedded into orbit-api at compile time (crates/orbit-api/src/docs.rs).
+COPY docs ./docs
 COPY services ./services
 RUN cargo build --release --locked -p orbit-api-server --bin orbit-api
 

@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::process_env::child_environment;
 use orbit_contracts::{
     CreateInstanceRequest, ExecutionOutcome, ExecutionRequest, HarnessAdapter, HarnessCapabilities,
     HarnessConfig, HarnessDescriptor, HarnessError, HarnessErrorKind, HarnessEvent,
@@ -23,7 +24,7 @@ use orbit_domain::{
 ///
 /// Executes `opencode run --standalone --format json` in a per-execution workspace and
 /// maps OpenCode's NDJSON event stream to ORBIT harness events. Tested against
-/// OpenCode **v2.2.5** (see `tests/opencode_e2e.rs`).
+/// OpenCode **v2.3.0** (see `tests/opencode_e2e.rs`).
 ///
 /// Authentication is harness-managed: the worker image/container must provide an
 /// OpenCode auth store (mounted Secret in Kubernetes) or provider credentials in its
@@ -182,7 +183,7 @@ impl OpenCodeHarnessAdapter {
             kind: HarnessKind::OpenCode,
             name: "OpenCode".into(),
             description:
-                "OpenCode CLI harness with sessions, streaming NDJSON events, tool calls and harness-managed providers. Tested against OpenCode v2.2.5."
+                "OpenCode CLI harness with sessions, streaming NDJSON events, tool calls and harness-managed providers. Tested against OpenCode v2.3.0."
                     .into(),
             capabilities: HarnessCapabilities {
                 supports_sessions: true,
@@ -193,7 +194,7 @@ impl OpenCodeHarnessAdapter {
                 supports_tool_events: true,
                 supports_usage_reporting: true,
                 harness_managed_providers: true,
-                supports_platform_providers: false,
+                supports_platform_providers: true,
                 execution_modes: vec![ExecutionMode::OnDemand],
                 max_timeout_seconds: 86_400,
                 max_memory_mb: 16_384,
@@ -204,7 +205,7 @@ impl OpenCodeHarnessAdapter {
                 "additionalProperties": false,
                 "properties": {
                     "binary": { "type": "string", "description": "opencode binary (default: opencode)" },
-                    "workspaceSubdir": { "type": "string" },
+                    "workspaceSubdir": { "type": "string", "description": "Working directory relative to the execution workspace (no absolute paths or '..')" },
                     "provider": { "type": "string", "description": "harness-managed provider, e.g. opencode-go" },
                     "model": { "type": "string", "description": "model id; provider/model derived when needed" },
                     "agent": { "type": "string" },
@@ -222,7 +223,10 @@ impl OpenCodeHarnessAdapter {
     pub async fn probe(&self, settings: &OpenCodeSettings) -> Result<String, HarnessError> {
         let candidate = settings.binary();
         let mut command = Command::new(candidate);
-        command.arg("--version");
+        command
+            .arg("--version")
+            .env_clear()
+            .envs(child_environment(std::env::vars_os(), std::iter::empty()));
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         let output = tokio::time::timeout(Duration::from_secs(8), command.output())
@@ -337,6 +341,7 @@ fn write_open_code_policy_plugin(workspace: &Path) -> std::io::Result<()> {
     std::fs::write(
         dir.join("orbit-policy.ts"),
         r#"import { Plugin } from "@opencode/plugin"
+import { createHash } from "node:crypto"
 
 const POLICY_TOOLS = new Set([
   "read", "grep", "glob", "list",
@@ -344,9 +349,22 @@ const POLICY_TOOLS = new Set([
   "webfetch", "websearch", "subagent", "task", "question",
 ])
 
-const READ_ONLY = new Set(["read", "grep", "glob", "list"])
+// Stable hash of the call: tool name + canonical JSON (sorted keys). Must match the
+// broker's `arguments_hash`; approvals are bound to it.
+function canon(value: any): string {
+  if (Array.isArray(value)) return "[" + value.map(canon).join(",") + "]"
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value).filter((k) => value[k] !== undefined).sort()
+      .map((k) => JSON.stringify(k) + ":" + canon(value[k])).join(",") + "}"
+  }
+  return JSON.stringify(value ?? null)
+}
+function callHash(tool: string, input: unknown) {
+  return createHash("sha256").update(tool + "\u001f" + canon(input ?? {})).digest("hex")
+}
 
-async function checkPolicy(tool: string, input: unknown) {
+// The effect is derived by the broker from the tool name; it is never declared here.
+async function checkPolicy(tool: string, input: unknown): Promise<string | undefined> {
   const base = process.env.ORBIT_BROKER_URL
   const token = process.env.ORBIT_BROKER_TOKEN
   if (!base || !token) throw new Error("ORBIT policy broker is unavailable")
@@ -359,12 +377,12 @@ async function checkPolicy(tool: string, input: unknown) {
     },
     body: JSON.stringify({
       tool,
-      effect: READ_ONLY.has(tool) ? "read" : "write",
       arguments: input ?? {},
+      argumentsHash: callHash(tool, input),
     }),
   })
-  if (response.ok) return
   const body = await response.json().catch(() => ({}))
+  if (response.ok) return body.argumentsHash as string | undefined
   throw new Error(body.reason ?? body.error ?? `ORBIT policy denied ${tool}`)
 }
 
@@ -378,7 +396,12 @@ export default Plugin.define({
         editor.update(tool.id, (draft: any) => {
           const original = draft.execute
           draft.execute = async (input: any, context: any) => {
-            await checkPolicy(tool.id, input)
+            const approved = await checkPolicy(tool.id, input)
+            // The approval is bound to the arguments that were checked: refuse to run
+            // anything else (for example if the input was mutated after the check).
+            if (!approved || approved !== callHash(tool.id, input)) {
+              throw new Error(`ORBIT policy: arguments changed after approval for ${tool.id}`)
+            }
             return original(input, context)
           }
         })
@@ -409,6 +432,11 @@ fn write_open_code_mcp_config(workspace: &Path, bridge: &OrbitMcpBridge) -> std:
     let root = config.as_object_mut().unwrap();
     root.entry("$schema")
         .or_insert_with(|| json!("https://opencode.ai/config.json"));
+    let environment = bridge
+        .environment
+        .keys()
+        .map(|name| (name.clone(), open_code_environment_reference(name)))
+        .collect::<std::collections::BTreeMap<_, _>>();
     root.insert(
         "mcp".into(),
         json!({
@@ -416,7 +444,7 @@ fn write_open_code_mcp_config(workspace: &Path, bridge: &OrbitMcpBridge) -> std:
                 "orbit": {
                     "type": "local",
                     "command": bridge.command,
-                    "environment": bridge.environment,
+                    "environment": environment,
                 }
             }
         }),
@@ -427,20 +455,26 @@ fn write_open_code_mcp_config(workspace: &Path, bridge: &OrbitMcpBridge) -> std:
     )
 }
 
+fn open_code_environment_reference(name: &str) -> String {
+    format!("{{env:{name}}}")
+}
+
 /// Write a platform-managed provider into opencode.json so OpenCode can use
 /// ORBIT-resolved OpenAI-compatible endpoints (e.g. vLLM).
 fn write_open_code_provider_config(
     workspace: &Path,
     model: &orbit_contracts::ResolvedModel,
-) -> std::io::Result<()> {
+    environment_index: usize,
+) -> std::io::Result<Vec<(String, String)>> {
     use orbit_contracts::ModelSelection;
     let (provider_name, endpoint, credential) =
         match (&model.selection, &model.endpoint, &model.credential) {
             (ModelSelection::Platform { provider_name, .. }, Some(endpoint), credential) => {
                 (provider_name.clone(), endpoint.clone(), credential.clone())
             }
-            _ => return Ok(()),
+            _ => return Ok(Vec::new()),
         };
+    let mut environment = Vec::new();
 
     // Read existing config or start fresh.
     let path = workspace.join("opencode.json");
@@ -462,10 +496,20 @@ fn write_open_code_provider_config(
     let mut options = serde_json::Map::new();
     options.insert("baseURL".into(), serde_json::json!(endpoint.base_url));
     if let Some(cred) = &credential {
-        options.insert("apiKey".into(), serde_json::json!(cred.expose()));
+        let name = format!("ORBIT_PROVIDER_API_KEY_{environment_index}");
+        options.insert(
+            "apiKey".into(),
+            serde_json::json!(open_code_environment_reference(&name)),
+        );
+        environment.push((name, cred.expose().to_string()));
     }
-    for (key, value) in &endpoint.headers {
-        options.insert(key.clone(), serde_json::json!(value));
+    for (header_index, (key, value)) in endpoint.headers.iter().enumerate() {
+        let name = format!("ORBIT_PROVIDER_HEADER_{environment_index}_{header_index}");
+        options.insert(
+            key.clone(),
+            serde_json::json!(open_code_environment_reference(&name)),
+        );
+        environment.push((name, value.clone()));
     }
     provider.insert("options".into(), serde_json::Value::Object(options));
 
@@ -494,7 +538,8 @@ fn write_open_code_provider_config(
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&config).unwrap_or_else(|_| "{}".into()),
-    )
+    )?;
+    Ok(environment)
 }
 
 fn write_agent_instructions(workspace: &Path, request: &ExecutionRequest) -> std::io::Result<()> {
@@ -705,17 +750,27 @@ impl OpenCodeHarnessAdapter {
         settings: OpenCodeSettings,
         session_ref: Option<String>,
     ) -> Result<(ExecutionOutcome, Option<String>, Usage), HarnessError> {
-        let workspace = PathBuf::from(&request.workspace.root);
+        let workspace_root = PathBuf::from(&request.workspace.root);
+        // `workspaceSubdir` is agent-author input: confine it to the execution workspace.
         let workspace = match &settings.workspace_subdir {
-            Some(sub) if !sub.trim().is_empty() => workspace.join(sub),
-            _ => workspace,
+            Some(sub) if !sub.trim().is_empty() => {
+                crate::paths::resolve_confined_dir(&workspace_root, sub).await?
+            }
+            _ => {
+                tokio::fs::create_dir_all(&workspace_root)
+                    .await
+                    .map_err(|e| {
+                        HarnessError::new(
+                            HarnessErrorKind::Internal,
+                            format!(
+                                "could not create workspace {}: {e}",
+                                workspace_root.display()
+                            ),
+                        )
+                    })?;
+                workspace_root
+            }
         };
-        tokio::fs::create_dir_all(&workspace).await.map_err(|e| {
-            HarnessError::new(
-                HarnessErrorKind::Internal,
-                format!("could not create workspace {}: {e}", workspace.display()),
-            )
-        })?;
         if let Err(err) = write_agent_instructions(&workspace, &request) {
             return Err(HarnessError::new(
                 HarnessErrorKind::Internal,
@@ -749,21 +804,31 @@ impl OpenCodeHarnessAdapter {
                 )
             })?;
         }
+        let mut provider_environment = Vec::new();
+        let mut provider_environment_index = 0;
         if let Some(model) = &request.model {
-            write_open_code_provider_config(&workspace, model).map_err(|error| {
-                HarnessError::new(
-                    HarnessErrorKind::Internal,
-                    format!("could not write provider config: {error}"),
-                )
-            })?;
+            provider_environment.extend(
+                write_open_code_provider_config(&workspace, model, provider_environment_index)
+                    .map_err(|error| {
+                        HarnessError::new(
+                            HarnessErrorKind::Internal,
+                            format!("could not write provider config: {error}"),
+                        )
+                    })?,
+            );
+            provider_environment_index += 1;
         }
         for model in &request.subagent_models {
-            write_open_code_provider_config(&workspace, model).map_err(|error| {
-                HarnessError::new(
-                    HarnessErrorKind::Internal,
-                    format!("could not write subagent provider config: {error}"),
-                )
-            })?;
+            provider_environment.extend(
+                write_open_code_provider_config(&workspace, model, provider_environment_index)
+                    .map_err(|error| {
+                        HarnessError::new(
+                            HarnessErrorKind::Internal,
+                            format!("could not write subagent provider config: {error}"),
+                        )
+                    })?,
+            );
+            provider_environment_index += 1;
         }
         let model = settings.model_selector(request.model.as_ref());
         let prompt = build_prompt(&request);
@@ -772,11 +837,28 @@ impl OpenCodeHarnessAdapter {
         let mut command = Command::new(settings.binary());
         command.args(&args);
         command.current_dir(&workspace);
+        let mut explicit_env = request
+            .extra_env
+            .iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect::<Vec<_>>();
         // Worker-profile connection mappings, resolved by the control plane.
-        command.envs(&request.extra_env);
         if let Some(bridge) = &settings.orbit_mcp {
-            command.envs(&bridge.environment);
+            explicit_env.extend(
+                bridge
+                    .environment
+                    .iter()
+                    .map(|(name, value)| (name.into(), value.into())),
+            );
         }
+        explicit_env.extend(
+            provider_environment
+                .iter()
+                .map(|(name, value)| (name.into(), value.into())),
+        );
+        command
+            .env_clear()
+            .envs(child_environment(std::env::vars_os(), explicit_env));
         // OpenCode resolves its project/workspace from PWD in some code paths; the
         // worker's PWD points at the ORBIT repository, so explicitly set it to the
         // per-execution workspace. This also keeps shell tools inside the sandbox.
@@ -992,6 +1074,11 @@ impl HarnessAdapter for OpenCodeHarnessAdapter {
                         report.push("serverUrl", "must be an http(s) URL");
                     }
                 }
+                if let Some(sub) = &settings.workspace_subdir {
+                    if let Err(message) = crate::paths::validate_relative_subpath(sub) {
+                        report.push("workspaceSubdir", message);
+                    }
+                }
             }
             Err(err) => report.push("config", err.message),
         }
@@ -1101,6 +1188,30 @@ impl HarnessAdapter for OpenCodeHarnessAdapter {
 mod tests {
     use super::*;
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn validate_config_rejects_escaping_workspace_subdir() {
+        let adapter = OpenCodeHarnessAdapter;
+        for bad in ["/etc", "../other-execution", "a/../../b"] {
+            let report = adapter
+                .validate_config(&HarnessConfig {
+                    kind: HarnessKind::OpenCode,
+                    settings: serde_json::json!({ "workspaceSubdir": bad }),
+                })
+                .await;
+            assert!(
+                report.issues.iter().any(|i| i.path == "workspaceSubdir"),
+                "{bad} accepted"
+            );
+        }
+        let ok = adapter
+            .validate_config(&HarnessConfig {
+                kind: HarnessKind::OpenCode,
+                settings: serde_json::json!({ "workspaceSubdir": "repo/app" }),
+            })
+            .await;
+        assert!(ok.issues.iter().all(|i| i.path != "workspaceSubdir"));
+    }
 
     #[test]
     fn builds_cli_arguments_without_hardcoded_providers() {
@@ -1249,8 +1360,31 @@ mod tests {
 }
 
 #[cfg(test)]
-mod permission_tests {
+mod config_tests {
     use super::*;
+
+    fn assert_workspace_has_no_secrets(workspace: &Path, secrets: &[&str]) {
+        let mut pending = vec![workspace.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    pending.push(path);
+                } else if file_type.is_file() {
+                    let contents = std::fs::read(path).unwrap();
+                    let contents = String::from_utf8_lossy(&contents);
+                    for secret in secrets {
+                        assert!(
+                            !contents.contains(secret),
+                            "a runtime secret was persisted in the workspace"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn writes_web_tool_permissions() {
@@ -1267,15 +1401,74 @@ mod permission_tests {
         assert_eq!(config["websearch"], false);
         let bridge = OrbitMcpBridge {
             command: vec!["orbit".into()],
-            environment: Default::default(),
+            environment: std::collections::BTreeMap::from([
+                ("ORBIT_BROKER_URL".into(), "http://127.0.0.1:1234".into()),
+                ("ORBIT_BROKER_TOKEN".into(), "broker-secret-value".into()),
+            ]),
         };
         write_open_code_mcp_config(&dir, &bridge).unwrap();
-        let merged: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("opencode.json")).unwrap())
-                .unwrap();
+        let model = orbit_contracts::ResolvedModel {
+            selection: orbit_contracts::ModelSelection::Platform {
+                provider_id: uuid::Uuid::now_v7(),
+                provider_name: "corp".into(),
+                model: "internal-model".into(),
+            },
+            endpoint: Some(orbit_contracts::ModelEndpoint {
+                base_url: "http://llm.internal/v1".into(),
+                model: "internal-model".into(),
+                headers: std::collections::BTreeMap::from([(
+                    "Authorization".into(),
+                    "Bearer header-secret-value".into(),
+                )]),
+                request_params: serde_json::json!({}),
+                compat: Default::default(),
+                context_window: None,
+                max_output_tokens: None,
+            }),
+            credential: Some(orbit_contracts::SecretLease::new(
+                "provider/corp",
+                "provider-secret-value",
+            )),
+        };
+        let provider_environment = write_open_code_provider_config(&dir, &model, 0).unwrap();
+        let contents = std::fs::read_to_string(dir.join("opencode.json")).unwrap();
+        let merged: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(merged["tools"]["websearch"], false);
         assert_eq!(merged["websearch"], false);
         assert!(merged["mcp"]["servers"]["orbit"].is_object());
+        assert_eq!(
+            merged["mcp"]["servers"]["orbit"]["environment"]["ORBIT_BROKER_TOKEN"],
+            "{env:ORBIT_BROKER_TOKEN}"
+        );
+        assert_eq!(
+            merged["provider"]["corp"]["options"]["apiKey"],
+            "{env:ORBIT_PROVIDER_API_KEY_0}"
+        );
+        assert_eq!(
+            merged["provider"]["corp"]["options"]["Authorization"],
+            "{env:ORBIT_PROVIDER_HEADER_0_0}"
+        );
+        assert_workspace_has_no_secrets(
+            &dir,
+            &[
+                "broker-secret-value",
+                "provider-secret-value",
+                "Bearer header-secret-value",
+            ],
+        );
+        assert_eq!(
+            provider_environment,
+            vec![
+                (
+                    "ORBIT_PROVIDER_API_KEY_0".into(),
+                    "provider-secret-value".into()
+                ),
+                (
+                    "ORBIT_PROVIDER_HEADER_0_0".into(),
+                    "Bearer header-secret-value".into()
+                )
+            ]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

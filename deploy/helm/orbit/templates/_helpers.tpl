@@ -147,3 +147,20 @@ differs per render. Set `launcher.token` explicitly (or put `launcher-token` in
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Production guardrails. Included from templates/validate.yaml so it runs on every render.
+*/}}
+{{- define "orbit.validate" -}}
+{{- if and .Values.ingress.enabled (eq (toString .Values.auth.mode) "dev") .Values.auth.dev.allowAnonymous (not .Values.auth.acknowledgeInsecureDev) -}}
+{{- fail "ingress.enabled=true with auth.mode=dev and auth.dev.allowAnonymous=true exposes an anonymous Owner UI. Use auth.mode=oidc (see values-prod.example.yaml), set auth.dev.allowAnonymous=false, disable the ingress, or set auth.acknowledgeInsecureDev=true for a throwaway local/test cluster." -}}
+{{- end -}}
+{{- if eq (toString .Values.platform.environment) "production" -}}
+{{- if eq (toString .Values.auth.mode) "dev" -}}
+{{- fail "platform.environment=production does not allow auth.mode=dev; configure auth.mode=oidc." -}}
+{{- end -}}
+{{- if and .Values.postgresql.enabled (eq (toString .Values.postgresql.password) "orbit") -}}
+{{- fail "platform.environment=production with the bundled PostgreSQL requires a non-default postgresql.password (or use externalDatabase.enabled=true)." -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

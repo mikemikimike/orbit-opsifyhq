@@ -34,7 +34,8 @@ impl Store {
         let query = format!(
             "SELECT owner_user_id, owner_team_id, visibility FROM {table} WHERE org_id = $1 AND id = $2"
         );
-        sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>, String)>(&query)
+        // Safe: `table` comes from the SHAREABLE allowlist; all values are bound.
+        sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>, String)>(sqlx::AssertSqlSafe(query))
             .bind(org_id)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -59,7 +60,8 @@ impl Store {
         let query = format!(
             "UPDATE {table} SET visibility = $3, owner_team_id = $4, updated_at = now() WHERE org_id = $1 AND id = $2"
         );
-        let result = sqlx::query(&query)
+        // Safe: `table` comes from the SHAREABLE allowlist; all values are bound.
+        let result = sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(org_id)
             .bind(id)
             .bind(visibility)
@@ -86,7 +88,8 @@ impl Store {
         let query = format!(
             "UPDATE {table} SET owner_user_id = COALESCE(owner_user_id, $3), updated_at = now() WHERE org_id = $1 AND id = $2"
         );
-        sqlx::query(&query)
+        // Safe: `table` comes from the SHAREABLE allowlist; all values are bound.
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(org_id)
             .bind(id)
             .bind(user_id)

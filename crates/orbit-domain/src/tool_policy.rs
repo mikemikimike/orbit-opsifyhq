@@ -56,10 +56,12 @@ pub struct ToolPolicyMatcher {
     /// Glob against the connection name/slug.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection: Option<String>,
-    /// Glob against path-like arguments (`path`, `file_path`, `paths`, …).
+    /// Glob against path-like arguments (`path`, `file_path`, `paths`, …). Deny and
+    /// require-approval rules also match when no path can be extracted (fail closed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_glob: Option<String>,
-    /// Regular expression against shell commands (`command`, `cmd`).
+    /// Regular expression against shell commands (`command`, `cmd`). Best-effort, not a
+    /// sandbox; deny and require-approval rules match when no command can be extracted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_regex: Option<String>,
 }
@@ -124,6 +126,11 @@ pub struct ToolCall {
     pub connection: Option<String>,
     #[serde(default)]
     pub arguments: serde_json::Value,
+    /// Working directory of the call, used to resolve relative paths. When absent,
+    /// relative paths that escape upwards (`..`) are treated as unresolvable and match
+    /// absolute-path restrictions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// Final decision plus provenance for audit/UI.
@@ -253,10 +260,18 @@ pub fn validate_tool_policy(rule: &ToolPolicyRule) -> Vec<String> {
     issues
 }
 
+/// Whether a rule applies to a call.
+///
+/// Matchers fail closed for restrictive rules: when a `deny` or `require_approval` rule
+/// configures `pathGlob` / `commandRegex` but the call carries nothing the matcher can
+/// inspect (an unexpected argument shape, an unlisted key), the rule MATCHES. An `allow`
+/// rule in the same situation does not match, so unknown shapes never gain permission.
 fn matches(rule: &ToolPolicyRule, call: &ToolCall) -> bool {
     let matcher = &rule.matcher;
+    let fail_closed = rule.action != ToolPolicyAction::Allow;
     if let Some(pattern) = &matcher.tool {
-        if !glob_match(pattern, &call.tool) {
+        // Tool names differ in case between harnesses (`bash` vs `Bash`).
+        if !glob_match(&pattern.to_lowercase(), &call.tool.to_lowercase()) {
             return false;
         }
     }
@@ -282,31 +297,51 @@ fn matches(rule: &ToolPolicyRule, call: &ToolCall) -> bool {
         }
     }
     if let Some(pattern) = &matcher.path_glob {
-        let paths = argument_paths(&call.arguments);
-        if paths.is_empty() || !paths.iter().any(|path| path_matches(pattern, path)) {
+        let paths = argument_paths(&call.tool, &call.arguments, fail_closed);
+        let hit = if paths.is_empty() {
+            fail_closed
+        } else {
+            paths
+                .iter()
+                .any(|path| path_matches(pattern, path, call.cwd.as_deref(), fail_closed))
+        };
+        if !hit {
             return false;
         }
     }
     if let Some(pattern) = &matcher.command_regex {
         let pattern = pattern.trim();
-        if pattern.is_empty() {
-            return false;
-        }
-        let Ok(regex) = Regex::new(pattern) else {
-            return false;
+        let hit = if pattern.is_empty() {
+            false
+        } else {
+            match Regex::new(pattern) {
+                Ok(regex) => match argument_command(&call.arguments) {
+                    Some(command) => regex.is_match(&command),
+                    None => fail_closed,
+                },
+                // A rule that cannot be evaluated must not silently stop restricting.
+                Err(_) => fail_closed,
+            }
         };
-        let Some(command) = argument_command(&call.arguments) else {
-            return false;
-        };
-        if !regex.is_match(&command) {
+        if !hit {
             return false;
         }
     }
     true
 }
 
+const COMMAND_KEYS: [&str; 7] = [
+    "command",
+    "cmd",
+    "script",
+    "commandLine",
+    "command_line",
+    "cmdline",
+    "argv",
+];
+
 fn argument_command(arguments: &serde_json::Value) -> Option<String> {
-    for key in ["command", "cmd", "script"] {
+    for key in COMMAND_KEYS {
         let Some(value) = arguments.get(key) else {
             continue;
         };
@@ -324,44 +359,88 @@ fn argument_command(arguments: &serde_json::Value) -> Option<String> {
     None
 }
 
-fn argument_paths(arguments: &serde_json::Value) -> Vec<String> {
-    const KEYS: [&str; 8] = [
-        "path",
-        "file_path",
-        "filePath",
-        "paths",
-        "files",
-        "target",
-        "destination",
-        "directory",
-    ];
-    let mut paths = Vec::new();
-    for key in KEYS {
-        let Some(value) = arguments.get(key) else {
-            continue;
-        };
-        match value {
-            serde_json::Value::String(path) => paths.push(path.clone()),
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    match item {
-                        serde_json::Value::String(path) => paths.push(path.clone()),
-                        serde_json::Value::Object(object) => {
-                            if let Some(path) = object.get("path").and_then(|v| v.as_str()) {
-                                paths.push(path.to_string());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+/// Argument keys treated as filesystem paths. `pattern` is deliberately absent: for
+/// `grep` it is a content regex, not a path (see [`PATTERN_PATH_TOOLS`]).
+const PATH_KEYS: [&str; 23] = [
+    "path",
+    "file_path",
+    "filePath",
+    "paths",
+    "files",
+    "file",
+    "filename",
+    "fileName",
+    "target",
+    "destination",
+    "directory",
+    "dir",
+    "cwd",
+    "workdir",
+    "workingDirectory",
+    "old_path",
+    "oldPath",
+    "new_path",
+    "newPath",
+    "src",
+    "dst",
+    "source",
+    "dest",
+];
+
+/// Tools whose `pattern` argument is a path glob rather than a content regex.
+const PATTERN_PATH_TOOLS: [&str; 4] = ["glob", "find", "ls", "list"];
+
+fn push_path_value(value: &serde_json::Value, paths: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(path) => paths.push(path.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                push_path_value(item, paths);
             }
-            serde_json::Value::Object(object) => {
-                if let Some(path) = object.get("path").and_then(|v| v.as_str()) {
-                    paths.push(path.to_string());
-                }
-            }
-            _ => {}
         }
+        serde_json::Value::Object(object) => {
+            if let Some(path) = object.get("path").and_then(|v| v.as_str()) {
+                paths.push(path.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recursively collect string leaves that look like paths, from keys we do not know.
+fn collect_pathlike(value: &serde_json::Value, paths: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.len() <= 4096
+                && !text.contains('\n')
+                && (text.contains('/') || text.starts_with('~') || text.starts_with(".."))
+            {
+                paths.push(text.to_string());
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|i| collect_pathlike(i, paths)),
+        serde_json::Value::Object(map) => map.values().for_each(|v| collect_pathlike(v, paths)),
+        _ => {}
+    }
+}
+
+/// Paths a call refers to. With `deep` (restrictive rules), path-like strings under
+/// unrecognised keys are inspected too, so renaming the key does not hide a path.
+fn argument_paths(tool: &str, arguments: &serde_json::Value, deep: bool) -> Vec<String> {
+    let mut paths = Vec::new();
+    for key in PATH_KEYS {
+        if let Some(value) = arguments.get(key) {
+            push_path_value(value, &mut paths);
+        }
+    }
+    if PATTERN_PATH_TOOLS.contains(&tool.to_lowercase().as_str()) {
+        if let Some(value) = arguments.get("pattern") {
+            push_path_value(value, &mut paths);
+        }
+    }
+    if deep {
+        collect_pathlike(arguments, &mut paths);
     }
     paths
 }
@@ -394,18 +473,24 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     p == pattern.len()
 }
 
-fn path_matches(pattern: &str, path: &str) -> bool {
-    let path = normalize_path(path);
+fn path_matches(pattern: &str, path: &str, cwd: Option<&str>, fail_closed: bool) -> bool {
+    let resolved = resolve_path(path, cwd);
     let pattern = pattern.trim();
-    if glob_match(pattern, &path) {
+    if glob_match(pattern, &resolved.path) {
         return true;
     }
     if pattern.starts_with('/') {
-        return false;
+        // A path we cannot anchor (`../../etc/shadow` without a known cwd, `~/x`) may
+        // land anywhere; restrictive rules must assume it hits an absolute pattern.
+        return fail_closed && resolved.unresolved;
     }
     // Relative patterns also match any component-aligned suffix, so `src/**` matches
     // `/workspace/src/lib.rs` and `*.env` matches `/repo/.env`.
-    let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let components: Vec<&str> = resolved
+        .path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
     for index in 0..components.len() {
         let suffix = components[index..].join("/");
         if glob_match(pattern, &suffix) {
@@ -415,19 +500,60 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     false
 }
 
-/// Lexically normalize a path: collapse `.`/`..` and duplicate separators without
-/// touching the filesystem.
+struct ResolvedPath {
+    path: String,
+    /// Relative path that escapes its base (`..` first) or `~`-rooted: its real
+    /// location is unknown without a cwd / home directory.
+    unresolved: bool,
+}
+
+/// Lexically resolve a path against `cwd` (when absolute) without touching the
+/// filesystem. Leading `..` of an unanchored relative path is preserved.
+fn resolve_path(path: &str, cwd: Option<&str>) -> ResolvedPath {
+    let path = path.trim().replace('\\', "/");
+    if path.starts_with('~') {
+        return ResolvedPath {
+            path,
+            unresolved: true,
+        };
+    }
+    if path.starts_with('/') {
+        return ResolvedPath {
+            path: normalize_path(&path),
+            unresolved: false,
+        };
+    }
+    if let Some(cwd) = cwd.map(|c| c.trim().replace('\\', "/")) {
+        if cwd.starts_with('/') {
+            return ResolvedPath {
+                path: normalize_path(&format!("{cwd}/{path}")),
+                unresolved: false,
+            };
+        }
+    }
+    let normalized = normalize_path(&path);
+    let unresolved = normalized == ".." || normalized.starts_with("../");
+    ResolvedPath {
+        path: normalized,
+        unresolved,
+    }
+}
+
+/// Lexically normalize a path: collapse `.`/`..` and duplicate separators. `..` above
+/// the root of an absolute path is dropped; on a relative path it is preserved.
 fn normalize_path(path: &str) -> String {
     let absolute = path.starts_with('/');
     let mut stack: Vec<&str> = Vec::new();
     for component in path.split('/') {
         match component {
             "" | "." => {}
-            ".." => {
-                if !stack.is_empty() {
+            ".." => match stack.last() {
+                Some(&last) if last != ".." => {
                     stack.pop();
                 }
-            }
+                _ if absolute => {}
+                _ => stack.push(".."),
+            },
             other => stack.push(other),
         }
     }
@@ -466,6 +592,7 @@ mod tests {
             effect: None,
             connection: None,
             arguments,
+            cwd: None,
         }
     }
 
@@ -645,5 +772,137 @@ mod tests {
             },
         );
         assert!(!validate_tool_policy(&bad).is_empty());
+    }
+
+    fn path_rule(action: ToolPolicyAction, glob: &str) -> ToolPolicyRule {
+        rule(
+            "p",
+            action,
+            ToolPolicyMatcher {
+                path_glob: Some(glob.into()),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn deny_path_glob_fails_closed_when_nothing_extractable() {
+        let deny = path_rule(ToolPolicyAction::Deny, "/etc/**");
+        assert!(matches(
+            &deny,
+            &call("Read", serde_json::json!({ "weird": 1 }))
+        ));
+        assert!(matches(&deny, &call("Read", serde_json::json!({}))));
+        let ask = path_rule(ToolPolicyAction::RequireApproval, "/etc/**");
+        assert!(matches(
+            &ask,
+            &call("Read", serde_json::json!({ "weird": 1 }))
+        ));
+    }
+
+    #[test]
+    fn allow_path_glob_does_not_match_when_nothing_extractable() {
+        let allow = path_rule(ToolPolicyAction::Allow, "/work/**");
+        assert!(!matches(
+            &allow,
+            &call("Read", serde_json::json!({ "weird": 1 }))
+        ));
+        assert!(!matches(&allow, &call("Read", serde_json::json!({}))));
+    }
+
+    #[test]
+    fn deny_path_glob_sees_paths_under_unlisted_keys() {
+        let deny = path_rule(ToolPolicyAction::Deny, "/etc/**");
+        assert!(matches(
+            &deny,
+            &call(
+                "Read",
+                serde_json::json!({ "location": { "p": "/etc/shadow" } })
+            )
+        ));
+        // An allow rule only trusts recognised keys.
+        let allow = path_rule(ToolPolicyAction::Allow, "/etc/**");
+        assert!(!matches(
+            &allow,
+            &call("Read", serde_json::json!({ "location": "/etc/shadow" }))
+        ));
+        // Extended keys are recognised.
+        assert!(matches(
+            &deny,
+            &call("Read", serde_json::json!({ "oldPath": "/etc/shadow" }))
+        ));
+    }
+
+    #[test]
+    fn traversal_is_resolved_against_cwd() {
+        let deny = path_rule(ToolPolicyAction::Deny, "/etc/**");
+        let mut traversal = call("Read", serde_json::json!({ "path": "../../etc/x" }));
+        traversal.cwd = Some("/work".into());
+        assert!(matches(&deny, &traversal));
+        // Stays inside cwd: not a match.
+        let mut inside = call("Read", serde_json::json!({ "path": "../work/src/x" }));
+        inside.cwd = Some("/work".into());
+        assert!(!matches(&deny, &inside));
+    }
+
+    #[test]
+    fn traversal_without_cwd_matches_absolute_deny_but_not_allow() {
+        let traversal = call("Read", serde_json::json!({ "path": "../../etc/x" }));
+        assert!(matches(
+            &path_rule(ToolPolicyAction::Deny, "/etc/**"),
+            &traversal
+        ));
+        assert!(!matches(
+            &path_rule(ToolPolicyAction::Allow, "/etc/**"),
+            &traversal
+        ));
+        // Plain relative paths without `..` stay unanchored and do not match.
+        assert!(!matches(
+            &path_rule(ToolPolicyAction::Deny, "/etc/**"),
+            &call("Read", serde_json::json!({ "path": "src/x" }))
+        ));
+        assert_eq!(normalize_path("../../etc/x"), "../../etc/x");
+        assert_eq!(normalize_path("/../etc/x"), "/etc/x");
+    }
+
+    #[test]
+    fn tool_name_match_is_case_insensitive() {
+        let r = rule(
+            "t",
+            ToolPolicyAction::Deny,
+            ToolPolicyMatcher {
+                tool: Some("bash".into()),
+                ..Default::default()
+            },
+        );
+        assert!(matches(&r, &call("Bash", serde_json::json!({}))));
+        assert!(matches(&r, &call("BASH", serde_json::json!({}))));
+    }
+
+    #[test]
+    fn command_regex_fails_closed_for_restrictive_rules_only() {
+        let matcher = ToolPolicyMatcher {
+            command_regex: Some("rm\\s+-rf".into()),
+            ..Default::default()
+        };
+        let odd = call("Bash", serde_json::json!({ "line": "rm -rf /" }));
+        assert!(matches(
+            &rule("d", ToolPolicyAction::Deny, matcher.clone()),
+            &odd
+        ));
+        assert!(!matches(&rule("a", ToolPolicyAction::Allow, matcher), &odd));
+    }
+
+    #[test]
+    fn grep_pattern_is_not_a_path_but_glob_pattern_is() {
+        let allow = path_rule(ToolPolicyAction::Allow, "/etc/**");
+        assert!(!matches(
+            &allow,
+            &call("grep", serde_json::json!({ "pattern": "/etc/shadow" }))
+        ));
+        assert!(matches(
+            &allow,
+            &call("glob", serde_json::json!({ "pattern": "/etc/*" }))
+        ));
     }
 }

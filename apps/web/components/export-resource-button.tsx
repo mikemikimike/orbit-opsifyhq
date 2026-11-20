@@ -4,21 +4,23 @@ import { Download } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button, type ButtonProps } from "@/components/ui/button";
-import { request } from "@/lib/http";
+import { downloadExport, type ExportFormat } from "@/lib/portable";
 import { errorMessage } from "@orbit/api-client";
 
-/** Download a secret-free JSON export of a shareable resource. */
-export async function exportResource(resource: string, resourceId: string, name: string) {
+/**
+ * Download a secret-free, portable export of a shareable resource (YAML by default;
+ * `markdown` gives a SKILL.md for skills). Credentials are never included: the file
+ * says so, and they are set again after importing.
+ */
+export async function exportResource(
+  resource: string,
+  resourceId: string,
+  name: string,
+  format: ExportFormat = "yaml",
+) {
   try {
-    const payload = await request<unknown>(`/api/v1/export/${resource}/${resourceId}`);
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `${name.replace(/[^a-z0-9._-]+/gi, "-").toLowerCase()}-${resourceId.slice(0, 8)}.json`;
-    anchor.click();
-    URL.revokeObjectURL(url);
-    toast.success("Export downloaded");
+    await downloadExport(resource, resourceId, name, format);
+    toast.success(format === "markdown" ? "SKILL.md downloaded" : "Export downloaded");
   } catch (error) {
     toast.error(`Export failed: ${errorMessage(error)}`);
   }
@@ -32,12 +34,14 @@ export function ExportResourceButton({
   resource,
   resourceId,
   name,
+  format,
   size = "sm",
   variant = "ghost",
 }: {
   resource: string;
   resourceId: string;
   name: string;
+  format?: ExportFormat;
   size?: ButtonProps["size"];
   variant?: ButtonProps["variant"];
 }) {
@@ -46,7 +50,7 @@ export function ExportResourceButton({
       type="button"
       size={size}
       variant={variant}
-      onClick={() => void exportResource(resource, resourceId, name)}
+      onClick={() => void exportResource(resource, resourceId, name, format)}
     >
       <Download /> Export
     </Button>

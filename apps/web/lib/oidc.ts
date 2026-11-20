@@ -1,5 +1,7 @@
 "use client";
 
+import { safeNextPath } from "@/lib/safe-redirect";
+
 const VERIFIER_KEY = "orbit.oidc.verifier";
 const STATE_KEY = "orbit.oidc.state";
 const NEXT_KEY = "orbit.oidc.next";
@@ -51,7 +53,7 @@ export async function beginOidcLogin(next = "/") {
   const codeChallenge = await challenge(verifier);
   sessionStorage.setItem(VERIFIER_KEY, verifier);
   sessionStorage.setItem(STATE_KEY, state);
-  sessionStorage.setItem(NEXT_KEY, next);
+  sessionStorage.setItem(NEXT_KEY, safeNextPath(next));
   const url = new URL(config.authorizationEndpoint);
   url.searchParams.set("response_type", "code");
   url.searchParams.set("client_id", config.clientId);
@@ -73,7 +75,7 @@ export async function completeOidcLogin(): Promise<string> {
   const state = params.get("state");
   const expectedState = sessionStorage.getItem(STATE_KEY);
   const verifier = sessionStorage.getItem(VERIFIER_KEY);
-  const next = sessionStorage.getItem(NEXT_KEY) || "/";
+  const next = safeNextPath(sessionStorage.getItem(NEXT_KEY));
   if (!code || !state || !expectedState || state !== expectedState || !verifier) {
     throw new Error("OIDC state or code is invalid; start the login again.");
   }

@@ -7,7 +7,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Ban, Bot, Copy, RotateCw } from "lucide-react";
+import { Ban, Bot, CloudOff, Copy, RefreshCw, RotateCw, ShieldX } from "lucide-react";
 import { toast } from "sonner";
 
 import { executionTask, executionTitle } from "@/components/executions/execution-row";
@@ -25,7 +25,7 @@ import { ExecutionStatusBadge } from "@/components/ui/status-badge";
 import { Switch } from "@/components/ui/switch";
 import { api } from "@/lib/api";
 import { copyText } from "@/lib/browser";
-import { request } from "@/lib/http";
+import { errorStatus, request } from "@/lib/http";
 import {
   queryKeys,
   unwrap,
@@ -150,14 +150,47 @@ export default function ExecutionDetailPage() {
   }
 
   if (!execution) {
+    const failureStatus = errorStatus(executionQuery.error) ?? live.fatal?.status;
+    const failureMessage = executionQuery.error
+      ? errorMessage(executionQuery.error)
+      : live.fatal?.message;
+    const back = (
+      <Button asChild variant="outline">
+        <Link href="/executions">Back to executions</Link>
+      </Button>
+    );
+    if (failureStatus === 403) {
+      return (
+        <EmptyState
+          icon={<ShieldX />}
+          title="You don't have access to this execution"
+          description="It belongs to an agent you can't view."
+          action={back}
+        />
+      );
+    }
+    if (failureStatus === undefined || failureStatus === 404) {
+      return (
+        <EmptyState
+          title="Execution not found"
+          description="It may have been deleted, or the link is wrong."
+          action={back}
+        />
+      );
+    }
+    // 401 is being redirected to sign-in; 5xx and network errors are worth another try.
     return (
       <EmptyState
-        title="Execution not found"
-        description={executionQuery.error ? errorMessage(executionQuery.error) : undefined}
+        icon={<CloudOff />}
+        title="Couldn't load this execution"
+        description={failureMessage}
         action={
-          <Button asChild>
-            <Link href="/executions">Back to executions</Link>
-          </Button>
+          <div className="flex flex-wrap justify-center gap-2">
+            <Button onClick={() => void executionQuery.refetch()} loading={executionQuery.isFetching}>
+              <RefreshCw /> Retry
+            </Button>
+            {back}
+          </div>
         }
       />
     );
@@ -499,8 +532,13 @@ export default function ExecutionDetailPage() {
         </div>
       </div>
 
-      {live.error ? (
-        <p className="text-[13px] text-warning">Live updates are interrupted: {live.error}</p>
+      {live.fatal ? (
+        <p className="text-[13px] text-warning">
+          Live updates stopped ({live.fatal.status === 404 ? "stream not found" : live.fatal.status === 403 ? "no access to the stream" : live.fatal.message}).
+          Reload the page to try again.
+        </p>
+      ) : live.error ? (
+        <p className="text-[13px] text-warning">Reconnecting, live updates are interrupted: {live.error}</p>
       ) : null}
     </div>
   );

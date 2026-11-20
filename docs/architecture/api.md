@@ -33,13 +33,23 @@ Codes: `bad_request`, `validation_error`, `unauthorized`, `forbidden`, `not_foun
 endpoints additionally return `launcher_unavailable`, `launcher_error` and
 `launch_failed`.
 
+The envelope is enforced centrally: a middleware in `orbit-api` rewrites any 4xx/5xx
+response that is not already JSON (malformed path/query parameters, unknown routes,
+`method_not_allowed`, `payload_too_large`, `unsupported_media_type`, ...) into the envelope,
+keeping headers such as `Allow`. Successful responses, SSE streams, `HEAD` responses and the
+Swagger UI (`/docs`) are never rewritten. Settings updates (`PUT /api/v1/settings/*`) are
+validated with field-level `details` and recorded in the audit log.
+
 ## Resources
 
 | Method & path | Purpose |
 |---|---|
-| `GET /healthz`, `GET /readyz` | liveness / dependency readiness |
+| `GET /healthz`, `GET /readyz` | liveness / readiness (database gates; event bus reported as degraded) |
 | `GET /metrics` | Prometheus metrics |
 | `GET /api/v1/meta` | platform version, auth mode, capabilities |
+| `GET /api/v1/docs` | embedded documentation index (categories and pages); authenticated |
+| `GET /api/v1/docs/{slug}` | one page: JSON with Markdown, `?format=markdown`, or HTML (`?format=html` / `Accept: text/html`); relative links are rewritten to `/api/v1/docs/...` |
+| `GET /api/v1/docs/assets/{path}` | embedded images used by the docs |
 | `GET /api/v1/me` | current user, organization, role, permissions |
 | `GET/POST /api/v1/agents` | list (filter/search) / create agent + version 1 |
 | `GET/PATCH/DELETE /api/v1/agents/{id}` | read / new version or metadata / archive |

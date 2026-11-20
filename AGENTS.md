@@ -25,7 +25,7 @@ crates/orbit-contracts/ Harness/provider/connector/event contracts (traits + DTO
 crates/orbit-store/    PostgreSQL repositories + SQL migrations
 crates/orbit-events/   Event bus (memory + NATS JetStream)
 crates/orbit-security/ Auth abstractions, permissions, secret encryption
-crates/orbit-harness/  Harness registry + adapters (mock implemented, opencode scaffolded)
+crates/orbit-harness/  Harness registry + adapters (mock, opencode and pi available)
 crates/orbit-api/      HTTP router, handlers, OpenAPI, SSE
 deploy/                Compose, Docker files, Helm chart, seed data
 docs/                  Architecture, ADRs, development and deployment docs
@@ -83,8 +83,8 @@ helm template orbit deploy/helm/orbit -f deploy/helm/orbit/values.yaml
 5. **Durable state lives in PostgreSQL.** The event bus is an accelerator, not the source
    of truth. Any bus loss must be recoverable by polling/replay.
 6. **Honesty about integrations.** An adapter is only "available" after integration tests
-   against the real harness. `mock` is available; `opencode` is scaffolded; Claude Code,
-   Pi and generic are planned. Keep `ImplementationStatus` accurate.
+   against the real harness. `mock`, `opencode` and `pi` are available; Claude Code
+   and generic are planned. Keep `ImplementationStatus` accurate.
 7. **Migrations are append-only.** Never edit an applied migration; add a new one.
 8. **UI must be responsive and mobile-first.** No desktop-only tables as the primary
    mobile experience.
@@ -109,14 +109,14 @@ helm template orbit deploy/helm/orbit -f deploy/helm/orbit/values.yaml
 4. Register it in `HarnessRegistry::builtin()`.
 5. Pass `orbit_harness::testing::assert_adapter_contract` in `crates/orbit-harness/tests`.
 6. Add a compliance test against the real harness binary/container and document the
-   tested version in `docs/architecture/harness-contract.md`.
+   tested version in `docs/architecture/runtime-contract.md`.
 7. Never hardcode provider names or model inventories.
 
 ## Adding a provider kind
 
 1. Add a `ProviderKind` variant and config struct in `crates/orbit-contracts/src/provider.rs`.
 2. Implement config validation and capability flags (explicit, not assumed).
-3. Extend worker resolution (`services/worker/src/resolver.rs`).
+3. Extend worker resolution (`services/worker/src/client.rs` and `crates/orbit-api/src/handlers/worker_api.rs`).
 4. Update the Models UI and OpenAPI schemas.
 5. Add contract tests for valid/invalid configs.
 
@@ -139,7 +139,7 @@ helm template orbit deploy/helm/orbit -f deploy/helm/orbit/values.yaml
 
 ## Local requirements
 
-- Rust stable (>= 1.85, pinned by `rust-toolchain.toml`)
+- Rust 1.100.0 (pinned in `rust-toolchain.toml`; CI and Docker use the same version; MSRV is 1.94). Bump all three together
 - Node >= 20 and pnpm 10+ (`corepack enable`)
 - Docker + Compose v2
 - Helm 3 and (for cluster validation) kubectl + kind/k3d

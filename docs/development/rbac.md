@@ -42,6 +42,14 @@ At authentication time ORBIT resolves the stored role name:
 Custom roles currently apply to organization-level actions only. Roles are visible through
 `GET /api/v1/me` via the effective `permissions` list.
 
+
+## Approvals
+
+Deciding an approval requires `approvals:decide` **and** use/manage access to the agent
+the execution belongs to (see `docs/security/idor-matrix.md`). With
+`approvalsRequireDifferentApprover` enabled (`GET/PUT /api/v1/settings/approvals`,
+default off, API only) the user who requested the execution cannot decide its approvals.
+
 ## Not implemented yet (issue #15)
 
 - Resource-level permissions (per agent/connection/team)

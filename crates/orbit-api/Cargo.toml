@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 orbit-domain.workspace = true
@@ -19,6 +20,8 @@ tower-http.workspace = true
 http.workspace = true
 utoipa.workspace = true
 utoipa-swagger-ui.workspace = true
+pulldown-cmark.workspace = true
+rust-embed.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -38,6 +41,7 @@ sha2.workspace = true
 reqwest.workspace = true
 async-stream.workspace = true
 croner.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

@@ -184,7 +184,7 @@ pub async fn delete_skill(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn validate_skill(
+pub(crate) fn validate_skill(
     slug: &str,
     name: &str,
     content: &str,

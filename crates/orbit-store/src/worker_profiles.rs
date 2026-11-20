@@ -46,14 +46,6 @@ impl Store {
         .ok_or_else(|| StoreError::NotFound("worker profile".into()))
     }
 
-    pub async fn get_worker_profile_by_id(&self, profile_id: Uuid) -> StoreResult<WorkerProfile> {
-        sqlx::query_as::<_, WorkerProfile>("SELECT * FROM worker_profiles WHERE id = $1")
-            .bind(profile_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| StoreError::NotFound("worker profile".into()))
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub async fn create_worker_profile(
         &self,

@@ -132,7 +132,6 @@ export default function EnvironmentMappingsPage() {
     });
     return result;
     // The query results change identity every render; their data timestamps do not.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profiles.data, usageStamp]);
 
   const connectionById = useMemo(

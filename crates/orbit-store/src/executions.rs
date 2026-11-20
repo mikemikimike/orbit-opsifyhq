@@ -116,8 +116,10 @@ impl Store {
         .await?)
     }
 
-    /// Keyset-paginated execution list with optional filters.
-    #[allow(clippy::type_complexity)]
+    /// Keyset-paginated execution list with optional filters. Visibility is applied in SQL
+    /// via the owning agent (`access = None` means org-wide/internal). The returned total
+    /// uses the same predicate, so it is the visible total for the filter.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub async fn list_executions(
         &self,
         org_id: Uuid,
@@ -126,6 +128,7 @@ impl Store {
         status: Option<&str>,
         agent_id: Option<Uuid>,
         archived: Option<bool>,
+        access: Option<&crate::access::ResourceAccess>,
     ) -> StoreResult<(Vec<ExecutionRecord>, Option<String>, i64)> {
         let (cursor_ts, cursor_id) = match cursor {
             Some(raw) => match decode_cursor(raw)? {
@@ -134,15 +137,22 @@ impl Store {
             },
             None => (None, None),
         };
+        let (privileged, user_id, team_ids, isolation) = crate::access::binds(access);
         let rows = sqlx::query_as::<_, ExecutionRecord>(
             r#"
-            SELECT * FROM executions
-            WHERE org_id = $1
-              AND ($2::text IS NULL OR status = $2)
-              AND ($3::uuid IS NULL OR agent_id = $3)
-              AND ($4::timestamptz IS NULL OR (created_at, id) < ($4::timestamptz, $5::uuid))
-              AND ($6::boolean IS NULL OR ($6 = FALSE AND archived_at IS NULL) OR ($6 = TRUE AND archived_at IS NOT NULL))
-            ORDER BY created_at DESC, id DESC
+            SELECT e.* FROM executions e
+            JOIN agents a ON a.id = e.agent_id
+            WHERE e.org_id = $1
+              AND ($2::text IS NULL OR e.status = $2)
+              AND ($3::uuid IS NULL OR e.agent_id = $3)
+              AND ($4::timestamptz IS NULL OR (e.created_at, e.id) < ($4::timestamptz, $5::uuid))
+              AND ($6::boolean IS NULL OR ($6 = FALSE AND e.archived_at IS NULL) OR ($6 = TRUE AND e.archived_at IS NOT NULL))
+              AND ($8::bool OR a.owner_user_id = $9
+                   OR CASE WHEN $11::bool AND a.owner_team_id IS NOT NULL
+                        THEN a.owner_team_id = ANY($10)
+                        ELSE a.visibility = 'org'
+                             OR (a.visibility = 'team' AND a.owner_team_id = ANY($10)) END)
+            ORDER BY e.created_at DESC, e.id DESC
             LIMIT $7
             "#,
         )
@@ -153,22 +163,36 @@ impl Store {
         .bind(cursor_id)
         .bind(archived)
         .bind(limit + 1)
+        .bind(privileged)
+        .bind(user_id)
+        .bind(&team_ids)
+        .bind(isolation)
         .fetch_all(&self.pool)
         .await?;
 
         let total: i64 = sqlx::query_scalar(
             r#"
-            SELECT COUNT(*) FROM executions
-            WHERE org_id = $1
-              AND ($2::text IS NULL OR status = $2)
-              AND ($3::uuid IS NULL OR agent_id = $3)
-              AND ($4::boolean IS NULL OR ($4 = FALSE AND archived_at IS NULL) OR ($4 = TRUE AND archived_at IS NOT NULL))
+            SELECT COUNT(*) FROM executions e
+            JOIN agents a ON a.id = e.agent_id
+            WHERE e.org_id = $1
+              AND ($2::text IS NULL OR e.status = $2)
+              AND ($3::uuid IS NULL OR e.agent_id = $3)
+              AND ($4::boolean IS NULL OR ($4 = FALSE AND e.archived_at IS NULL) OR ($4 = TRUE AND e.archived_at IS NOT NULL))
+              AND ($5::bool OR a.owner_user_id = $6
+                   OR CASE WHEN $8::bool AND a.owner_team_id IS NOT NULL
+                        THEN a.owner_team_id = ANY($7)
+                        ELSE a.visibility = 'org'
+                             OR (a.visibility = 'team' AND a.owner_team_id = ANY($7)) END)
             "#,
         )
         .bind(org_id)
         .bind(status)
         .bind(agent_id)
         .bind(archived)
+        .bind(privileged)
+        .bind(user_id)
+        .bind(&team_ids)
+        .bind(isolation)
         .fetch_one(&self.pool)
         .await?;
 
@@ -239,8 +263,9 @@ impl Store {
         .await?)
     }
 
-    /// Move an execution to a terminal state. Terminal states are never overwritten and
-    /// cancellation always wins over a late harness result.
+    /// Move an execution to a terminal state. Terminal states are never overwritten,
+    /// cancellation always wins over a late harness result, and only transitions allowed by
+    /// `ExecutionStatus::can_transition_to` are accepted (`None` otherwise).
     pub async fn finish_execution(
         &self,
         execution_id: Uuid,
@@ -255,6 +280,12 @@ impl Store {
                 "finish_execution requires a terminal status".into(),
             ));
         }
+        // The source states come from the domain transition table, so e.g.
+        // queued -> succeeded is rejected (returns None) instead of fabricating a result.
+        let from: Vec<String> = ExecutionStatus::sources_for(status)
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect();
         Ok(sqlx::query_as::<_, ExecutionRecord>(
             r#"
             UPDATE executions
@@ -266,7 +297,7 @@ impl Store {
                 finished_at = now(),
                 updated_at = now()
             WHERE id = $1
-              AND status NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'rejected')
+              AND status = ANY($7)
             RETURNING *
             "#,
         )
@@ -276,29 +307,7 @@ impl Store {
         .bind(error)
         .bind(usage)
         .bind(session_ref)
-        .fetch_optional(&self.pool)
-        .await?)
-    }
-
-    /// Update non-terminal progress (e.g. awaiting approval).
-    pub async fn update_execution_status(
-        &self,
-        execution_id: Uuid,
-        from: &[ExecutionStatus],
-        to: ExecutionStatus,
-    ) -> StoreResult<Option<ExecutionRecord>> {
-        let from_values: Vec<String> = from.iter().map(|s| s.as_str().to_string()).collect();
-        Ok(sqlx::query_as::<_, ExecutionRecord>(
-            r#"
-            UPDATE executions
-            SET status = $2, updated_at = now()
-            WHERE id = $1 AND status = ANY($3)
-            RETURNING *
-            "#,
-        )
-        .bind(execution_id)
-        .bind(to.as_str())
-        .bind(&from_values)
+        .bind(&from)
         .fetch_optional(&self.pool)
         .await?)
     }
@@ -375,7 +384,19 @@ impl Store {
         message: &str,
         data: &Value,
     ) -> StoreResult<ExecutionEventRecord> {
-        sqlx::query_as::<_, ExecutionEventRecord>(
+        // seq is MAX+1 per execution. Under READ COMMITTED concurrent appends would read the
+        // same MAX and collide on UNIQUE (execution_id, seq), so serialize allocation per
+        // execution with a transaction-scoped advisory lock. An advisory lock (rather than
+        // `SELECT ... FOR UPDATE` on the execution row) never blocks claim/finish/cancel
+        // updates, and it is released automatically on commit/rollback.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('execution_events:' || $1::text, 0))",
+        )
+        .bind(execution_id)
+        .execute(&mut *tx)
+        .await?;
+        let record = sqlx::query_as::<_, ExecutionEventRecord>(
             r#"
             WITH next_seq AS (
                 SELECT COALESCE(MAX(seq), 0) + 1 AS seq
@@ -393,9 +414,10 @@ impl Store {
         .bind(level.as_str())
         .bind(message)
         .bind(data)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(Into::into)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(record)
     }
 
     pub async fn list_execution_events(
@@ -454,45 +476,11 @@ impl Store {
         .fetch_one(&self.pool)
         .await?)
     }
-
-    /// Executions requested but not claimed within the reclaim window.
-    pub async fn list_stale_queued_executions(
-        &self,
-        older_than_seconds: i64,
-        limit: i64,
-    ) -> StoreResult<Vec<ExecutionRecord>> {
-        Ok(sqlx::query_as::<_, ExecutionRecord>(
-            r#"
-            SELECT * FROM executions
-            WHERE status = 'queued' AND created_at < now() - ($1 || ' seconds')::interval
-            ORDER BY created_at ASC
-            LIMIT $2
-            "#,
-        )
-        .bind(older_than_seconds.to_string())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?)
-    }
-
-    pub async fn list_agents_with_harness(&self, org_id: Uuid) -> StoreResult<Vec<(Uuid, String)>> {
-        Ok(sqlx::query_as::<_, (Uuid, String)>(
-            r#"
-            SELECT DISTINCT a.id,
-                   COALESCE(av.spec->'harness'->>'type', 'mock')
-            FROM agents a
-            JOIN agent_versions av ON av.agent_id = a.id AND av.version = a.current_version
-            WHERE a.org_id = $1 AND a.status = 'active'
-            "#,
-        )
-        .bind(org_id)
-        .fetch_all(&self.pool)
-        .await?)
-    }
 }
 
 impl Store {
     /// Claim the oldest queued execution atomically.
+    #[allow(clippy::too_many_arguments)]
     pub async fn claim_next_queued(
         &self,
         org_id: Uuid,
@@ -501,13 +489,14 @@ impl Store {
         worker_target: &str,
         agent_ids: &[Uuid],
         profile_team_id: Option<Uuid>,
+        worker_token_id: Option<Uuid>,
     ) -> StoreResult<Option<ExecutionRecord>> {
         let team_filter = if profile_team_id.is_some() {
             r#"
                   AND EXISTS (
                       SELECT 1 FROM agents a
                       WHERE a.id = executions.agent_id
-                        AND (a.visibility = 'org' OR a.owner_team_id = $6)
+                        AND (a.visibility = 'org' OR a.owner_team_id = $7)
                   )
             "#
         } else {
@@ -516,7 +505,7 @@ impl Store {
         let sql = format!(
             r#"
             UPDATE executions
-            SET status = 'dispatched', worker_id = $2,
+            SET status = 'dispatched', worker_id = $2, worker_token_id = $6,
                 started_at = COALESCE(started_at, now()), updated_at = now()
             WHERE id = (
                 SELECT id FROM executions
@@ -533,12 +522,14 @@ impl Store {
             RETURNING *
             "#
         );
-        let mut query = sqlx::query_as::<_, ExecutionRecord>(&sql)
+        // Safe: `team_filter` is one of two static strings; all values are bound.
+        let mut query = sqlx::query_as::<_, ExecutionRecord>(sqlx::AssertSqlSafe(sql))
             .bind(org_id)
             .bind(worker_id)
             .bind(harnesses)
             .bind(worker_target)
-            .bind(agent_ids);
+            .bind(agent_ids)
+            .bind(worker_token_id);
         if let Some(team_id) = profile_team_id {
             query = query.bind(team_id);
         }
@@ -553,6 +544,32 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| StoreError::NotFound("execution".into()))
+    }
+
+    /// Record which worker token owns a claimed execution (single-execution launches,
+    /// where the API claims on behalf of the launched worker).
+    pub async fn bind_execution_worker_token(
+        &self,
+        execution_id: Uuid,
+        worker_token_id: Uuid,
+    ) -> StoreResult<()> {
+        sqlx::query("UPDATE executions SET worker_token_id = $2 WHERE id = $1")
+            .bind(execution_id)
+            .bind(worker_token_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Token that claimed the execution (`None` for unclaimed or pre-binding legacy rows).
+    pub async fn execution_worker_token(&self, execution_id: Uuid) -> StoreResult<Option<Uuid>> {
+        Ok(
+            sqlx::query_scalar("SELECT worker_token_id FROM executions WHERE id = $1")
+                .bind(execution_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
     }
 
     /// Bind an already-dispatched execution to a specific worker (used by the

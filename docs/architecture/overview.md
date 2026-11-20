@@ -60,7 +60,7 @@ ORBIT is a Rust workspace with a Next.js frontend:
 | `services/worker` | Execution-plane binary |
 | `apps/web` | Next.js web app |
 
-See [AGENTS.md](../../AGENTS.md) for the full repository map.
+See `AGENTS.md` in the repository root for the full repository map.
 
 ## 4. Request & execution flow
 
@@ -87,7 +87,7 @@ live in PostgreSQL (`processed_events`, unique `idempotency_key`), not in memory
 
 - Agent tasks are **never** executed inside `orbit-api`.
 - Adapters receive a constrained `HarnessExecutionContext` (timeout, CPU/memory,
-  network policy, filesystem policy, injected secret handles — never raw secrets in
+  network policy (recorded, not yet enforced), filesystem policy, injected secret handles — never raw secrets in
   prompts or logs).
 - Autonomy is enforced by the platform before dispatch and at capability invocation
   time: connector capabilities are checked against per-agent allowlists and autonomy
@@ -118,7 +118,7 @@ Expo/React Native client can share `packages/api-client` and `packages/contracts
 ## 8. Observability
 
 - Structured JSON logs (`tracing`) with request IDs and trace IDs.
-- `GET /healthz` (liveness) and `GET /readyz` (DB + event bus readiness).
+- `GET /healthz` (liveness) and `GET /readyz` (readiness depends on the database; event bus health is reported but non-gating).
 - `GET /metrics` Prometheus text endpoint (core counters; OpenTelemetry export seam).
 - Execution events carry `execution_id`, `agent_id`, `harness`, and timestamps for
   correlation across control and execution planes.

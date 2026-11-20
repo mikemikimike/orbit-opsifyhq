@@ -8,7 +8,7 @@ use orbit_domain::{
 };
 use orbit_security::{SecretCipher, SecretValue};
 use orbit_store::executions::NewExecution;
-use orbit_store::Store;
+use orbit_store::{Store, WorkerProfile};
 
 async fn test_store() -> Option<Store> {
     let url = std::env::var("ORBIT_TEST_DATABASE_URL").ok()?;
@@ -556,7 +556,14 @@ async fn orphaned_executions_are_failed_and_approvals_expired() {
         .await
         .unwrap();
     store
-        .upsert_worker_heartbeat("worker-alive", &["mock".into()], "local", Some("test"))
+        .upsert_worker_heartbeat(
+            org,
+            uuid::Uuid::now_v7(),
+            "worker-alive",
+            &["mock".into()],
+            "local",
+            Some("test"),
+        )
         .await
         .unwrap();
 
@@ -591,7 +598,14 @@ async fn unstarted_executions_on_a_live_worker_are_ended() {
         .await
         .unwrap();
     store
-        .upsert_worker_heartbeat("worker-skewed", &["mock".into()], "local", Some("test"))
+        .upsert_worker_heartbeat(
+            org,
+            uuid::Uuid::now_v7(),
+            "worker-skewed",
+            &["mock".into()],
+            "local",
+            Some("test"),
+        )
         .await
         .unwrap();
 
@@ -631,18 +645,18 @@ async fn unstarted_executions_on_a_live_worker_are_ended() {
     let age = |id: uuid::Uuid, interval: &'static str| {
         let store = &store;
         async move {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE executions SET created_at = now() - interval '{interval}', \
                  started_at = now() - interval '{interval}', updated_at = now() - interval '{interval}' \
                  WHERE id = $1"
-            ))
+            )))
             .bind(id)
             .execute(store.pool())
             .await
             .unwrap();
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE execution_events SET created_at = now() - interval '{interval}' WHERE execution_id = $1"
-            ))
+            )))
             .bind(id)
             .execute(store.pool())
             .await
@@ -717,6 +731,119 @@ async fn unstarted_executions_on_a_live_worker_are_ended() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn running_executions_past_timeout_and_grace_are_ended_on_a_live_worker() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, version) = store
+        .create_agent(org, Some(user), &definition("Timeout Reaper Agent"))
+        .await
+        .unwrap();
+    store
+        .upsert_worker_heartbeat(
+            org,
+            uuid::Uuid::now_v7(),
+            "worker-timeout",
+            &["mock".into()],
+            "local",
+            Some("test"),
+        )
+        .await
+        .unwrap();
+
+    let started = |key: &'static str| {
+        let store = &store;
+        let agent = &agent;
+        async move {
+            let execution = store
+                .create_execution(NewExecution {
+                    org_id: org,
+                    agent_id: agent.id,
+                    agent_version_id: version.id,
+                    agent_name: &agent.name,
+                    harness_kind: HarnessKind::Mock,
+                    trigger_source: TriggerSource::Manual,
+                    placement: "auto",
+                    trigger_id: None,
+                    input: serde_json::json!({ "task": "x", "payload": {}, "provenance": { "source": "test", "trusted": true, "receivedAt": chrono::Utc::now() } }),
+                    session_ref: None,
+                    skills: &[],
+                    timeout_seconds: 30,
+                    requested_by: Some(user),
+                    idempotency_key: Some(key),
+                    team_run_id: None,
+                    team_step_index: None,
+                })
+                .await
+                .unwrap();
+            store
+                .claim_execution(execution.id, "worker-timeout")
+                .await
+                .unwrap();
+            store
+                .mark_execution_running(execution.id, Some("s"))
+                .await
+                .unwrap();
+            execution
+        }
+    };
+    let age = |id: uuid::Uuid, interval: &'static str| {
+        let store = &store;
+        async move {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE executions SET started_at = now() - interval '{interval}' WHERE id = $1"
+            )))
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+    };
+
+    // timeout 30s + grace 300s = 330s. Ten minutes old: stuck.
+    let stuck = started("timeout-stuck").await;
+    age(stuck.id, "10 minutes").await;
+    // Past its timeout but still inside the grace window: left alone.
+    let in_grace = started("timeout-grace").await;
+    age(in_grace.id, "2 minutes").await;
+    // Fresh.
+    let fresh = started("timeout-fresh").await;
+
+    let reaped = store
+        .reap_timed_out_executions(Some(org), 300)
+        .await
+        .unwrap();
+    assert_eq!(reaped.len(), 1, "only the stuck run is ended");
+    assert_eq!(reaped[0].id, stuck.id);
+    assert_eq!(reaped[0].status, "timed_out");
+    assert_eq!(
+        reaped[0].error.as_ref().unwrap()["code"],
+        "execution_timeout"
+    );
+    for (id, name) in [(in_grace.id, "grace"), (fresh.id, "fresh")] {
+        assert_eq!(
+            store.get_execution(org, id).await.unwrap().status,
+            "running",
+            "{name} run must survive"
+        );
+    }
+
+    // A second sweep (another replica) finds nothing, and a late worker report cannot
+    // overwrite the terminal state.
+    assert!(store
+        .reap_timed_out_executions(Some(org), 300)
+        .await
+        .unwrap()
+        .is_empty());
+    let late = store
+        .finish_execution(stuck.id, ExecutionStatus::Succeeded, None, None, None, None)
+        .await
+        .unwrap();
+    assert!(late.is_none());
 }
 
 #[tokio::test]
@@ -858,6 +985,7 @@ async fn skills_profiles_and_agent_scoped_claims() {
             &["mock".into()],
             "local",
             &[agent_a.id],
+            None,
             None,
         )
         .await
@@ -1298,6 +1426,7 @@ async fn team_worker_cannot_claim_another_teams_execution() {
             "local",
             &[],
             Some(uuid::Uuid::now_v7()),
+            None,
         )
         .await
         .unwrap();
@@ -1312,6 +1441,7 @@ async fn team_worker_cannot_claim_another_teams_execution() {
             "local",
             &[],
             Some(team_a.id),
+            None,
         )
         .await
         .unwrap()
@@ -1326,6 +1456,7 @@ async fn team_worker_cannot_claim_another_teams_execution() {
             "local",
             &[],
             Some(team_a.id),
+            None,
         )
         .await
         .unwrap();
@@ -1385,4 +1516,581 @@ async fn agent_spec_triggers_are_reconciled() {
         .await
         .unwrap()
         .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_event_appends_get_dense_unique_seq() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, version) = store
+        .create_agent(org, Some(user), &definition("Concurrent Events Agent"))
+        .await
+        .unwrap();
+    let execution = store
+        .create_execution(NewExecution {
+            org_id: org,
+            agent_id: agent.id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: HarnessKind::Mock,
+            trigger_source: TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: serde_json::json!({ "task": "concurrent" }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: Some(user),
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+
+    const N: i64 = 50;
+    let mut tasks = Vec::new();
+    for i in 0..N {
+        let store = store.clone();
+        let execution_id = execution.id;
+        tasks.push(tokio::spawn(async move {
+            store
+                .append_execution_event(
+                    org,
+                    execution_id,
+                    "log",
+                    LogLevel::Info,
+                    &format!("event {i}"),
+                    &serde_json::json!({ "i": i }),
+                )
+                .await
+        }));
+    }
+    let mut returned = Vec::new();
+    for task in tasks {
+        let event = task
+            .await
+            .unwrap()
+            .expect("concurrent append must not fail");
+        returned.push(event.seq);
+    }
+    returned.sort_unstable();
+    assert_eq!(returned, (1..=N).collect::<Vec<_>>());
+
+    let stored = store
+        .list_execution_events(org, execution.id, 0, 1000)
+        .await
+        .unwrap();
+    let seqs: Vec<i64> = stored.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, (1..=N).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn single_execution_launch_tokens_are_revoked_when_execution_is_terminal() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, version) = store
+        .create_agent(org, Some(user), &definition("Launch Token Agent"))
+        .await
+        .unwrap();
+    let execution = store
+        .create_execution(NewExecution {
+            org_id: org,
+            agent_id: agent.id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: HarnessKind::Mock,
+            trigger_source: TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: serde_json::json!({ "task": "t", "payload": {} }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: Some(user),
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+    let profile = store
+        .create_worker_profile(
+            org,
+            "Launch Token Profile",
+            "mock",
+            "docker",
+            "process",
+            "orbit-worker",
+            "0.1.0",
+            "all",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            false,
+            false,
+            false,
+            false,
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+    let single = orbit_security::issue_worker_token();
+    let single_record = store
+        .create_worker_token(org, None, "single", &single.prefix, &single.hash, &[])
+        .await
+        .unwrap();
+    let persistent = orbit_security::issue_worker_token();
+    let persistent_record = store
+        .create_worker_token(
+            org,
+            None,
+            "persistent",
+            &persistent.prefix,
+            &persistent.hash,
+            &[],
+        )
+        .await
+        .unwrap();
+    let single_launch = store
+        .create_worker_launch(
+            org,
+            profile.id,
+            "single",
+            "docker",
+            "img:1",
+            Some(single_record.id),
+            Some(user),
+            true,
+        )
+        .await
+        .unwrap();
+    store
+        .create_worker_launch(
+            org,
+            profile.id,
+            "persistent",
+            "docker",
+            "img:1",
+            Some(persistent_record.id),
+            Some(user),
+            false,
+        )
+        .await
+        .unwrap();
+    store
+        .set_worker_launch_single_execution(single_launch.id, execution.id)
+        .await
+        .unwrap();
+
+    // Execution still queued: nothing is revoked.
+    assert!(store
+        .revoke_finished_single_execution_tokens()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .find_worker_token_by_hash(&single.hash)
+        .await
+        .unwrap()
+        .is_some());
+
+    store
+        .claim_execution(execution.id, "single-worker")
+        .await
+        .unwrap()
+        .expect("execution is queued");
+    store
+        .mark_execution_running(execution.id, None)
+        .await
+        .unwrap();
+    store
+        .finish_execution(
+            execution.id,
+            ExecutionStatus::Succeeded,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let revoked = store
+        .revoke_finished_single_execution_tokens()
+        .await
+        .unwrap();
+    assert!(revoked.contains(&single_record.id));
+    assert!(!revoked.contains(&persistent_record.id));
+    assert!(store
+        .find_worker_token_by_hash(&single.hash)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .find_worker_token_by_hash(&persistent.hash)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+async fn launch_profile_fixture(store: &Store, org: uuid::Uuid, name: &str) -> WorkerProfile {
+    store
+        .create_worker_profile(
+            org,
+            name,
+            "pi",
+            "docker",
+            "process",
+            "orbit-worker-pi",
+            "0.3.0",
+            "all",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            false,
+            false,
+            false,
+            false,
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap()
+}
+
+async fn new_launch(
+    store: &Store,
+    org: uuid::Uuid,
+    profile: &WorkerProfile,
+    single: bool,
+) -> orbit_store::WorkerLaunch {
+    store
+        .create_worker_launch(
+            org,
+            profile.id,
+            &profile.name,
+            "docker",
+            "img:1",
+            None,
+            None,
+            single,
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn live_launch_lookup_is_exact_beyond_the_newest_hundred() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let target = launch_profile_fixture(&store, org, "Target").await;
+    let other = launch_profile_fixture(&store, org, "Other").await;
+    let live = new_launch(&store, org, &target, false).await;
+    // 150 newer launches of another profile (single-execution, so they may coexist).
+    for _ in 0..150 {
+        new_launch(&store, org, &other, true).await;
+    }
+    assert!(!store
+        .list_worker_launches(org, None)
+        .await
+        .unwrap()
+        .iter()
+        .any(|l| l.id == live.id));
+    let found = store
+        .find_live_launch_for_profile(org, target.id)
+        .await
+        .unwrap()
+        .expect("live launch found");
+    assert_eq!(found.id, live.id);
+    let active = store
+        .active_launches_for_profile(org, other.id)
+        .await
+        .unwrap();
+    assert_eq!(active.len(), 150);
+}
+
+#[tokio::test]
+async fn unique_index_blocks_second_live_long_lived_launch() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let profile = launch_profile_fixture(&store, org, "Unique").await;
+    let first = new_launch(&store, org, &profile, false).await;
+    let dup = store
+        .create_worker_launch(
+            org, profile.id, "Unique", "docker", "img:1", None, None, false,
+        )
+        .await
+        .expect_err("second live long-lived launch must be rejected");
+    assert!(dup.is_unique_violation());
+    // Single-execution launches may coexist with it.
+    new_launch(&store, org, &profile, true).await;
+    new_launch(&store, org, &profile, true).await;
+    // Once the first is stopped a new long-lived launch is allowed again.
+    store
+        .update_worker_launch(org, first.id, "stopped", None, None, None, false, true)
+        .await
+        .unwrap();
+    new_launch(&store, org, &profile, false).await;
+}
+
+#[tokio::test]
+async fn aborted_unclaimed_launch_is_not_live_and_token_is_revoked() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let profile = launch_profile_fixture(&store, org, "Abort").await;
+    let token_hash = format!("hash-abort-{}", uuid::Uuid::now_v7());
+    let token = store
+        .create_worker_token(
+            org,
+            Some(profile.id),
+            "t",
+            "pfx",
+            &token_hash,
+            &["pi".into()],
+        )
+        .await
+        .unwrap();
+    let launch = store
+        .create_worker_launch(
+            org,
+            profile.id,
+            "Abort",
+            "docker",
+            "img:1",
+            Some(token.id),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    // Same sequence the handler runs when claim_execution returns None.
+    store.revoke_worker_token(org, token.id).await.unwrap();
+    let failed = store
+        .update_worker_launch(
+            org,
+            launch.id,
+            "failed",
+            None,
+            None,
+            Some("not queued"),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.status, "failed");
+    assert!(failed.stopped_at.is_some());
+    assert!(store
+        .active_launches_for_profile(org, profile.id)
+        .await
+        .unwrap()
+        .is_empty());
+    // Revoking again reports NotFound: the token is already revoked.
+    assert!(store.revoke_worker_token(org, token.id).await.is_err());
+}
+
+#[tokio::test]
+async fn terminal_launch_cannot_regress_and_error_is_kept() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let profile = launch_profile_fixture(&store, org, "Guard").await;
+    let launch = new_launch(&store, org, &profile, false).await;
+    store
+        .update_worker_launch(
+            org,
+            launch.id,
+            "starting",
+            None,
+            None,
+            Some("warn"),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    // A status-only update must not clear the error.
+    let running = store
+        .update_worker_launch(
+            org,
+            launch.id,
+            "running",
+            Some("rt"),
+            None,
+            None,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(running.status, "running");
+    assert_eq!(running.error.as_deref(), Some("warn"));
+    let stopped = store
+        .update_worker_launch(org, launch.id, "stopped", None, None, None, false, true)
+        .await
+        .unwrap();
+    assert_eq!(stopped.status, "stopped");
+    // A racing poll refresh reporting running must not revive it.
+    let after = store
+        .update_worker_launch(org, launch.id, "running", None, None, None, true, false)
+        .await
+        .unwrap();
+    assert_eq!(after.status, "stopped");
+    assert_eq!(after.stopped_at, stopped.stopped_at);
+    // Idempotent terminal re-write is allowed and keeps the first stop time.
+    let again = store
+        .update_worker_launch(org, launch.id, "stopped", None, None, None, false, true)
+        .await
+        .unwrap();
+    assert_eq!(again.stopped_at, stopped.stopped_at);
+    // Missing launches are still NotFound.
+    assert!(store
+        .update_worker_launch(
+            org,
+            uuid::Uuid::now_v7(),
+            "running",
+            None,
+            None,
+            None,
+            false,
+            false
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn expired_approvals_cannot_be_decided() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, version) = store
+        .create_agent(org, Some(user), &definition("Expiry Agent"))
+        .await
+        .unwrap();
+    let execution = store
+        .create_execution(NewExecution {
+            org_id: org,
+            agent_id: agent.id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: HarnessKind::Mock,
+            trigger_source: TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: serde_json::json!({ "task": "x", "payload": {}, "provenance": { "source": "test", "trusted": true, "receivedAt": chrono::Utc::now() } }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: Some(user),
+            idempotency_key: Some("expiry-1"),
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+
+    let expired = store
+        .create_approval(
+            org,
+            execution.id,
+            serde_json::json!({ "action": "x" }),
+            Some(chrono::Utc::now() - chrono::Duration::seconds(5)),
+        )
+        .await
+        .unwrap();
+    let error = store
+        .decide_approval(org, expired.id, "approved", user, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("approval expired"), "{error}");
+    let stored = store.get_approval(org, expired.id).await.unwrap();
+    assert_eq!(stored.status, "expired");
+    assert!(stored.decided_by.is_none());
+
+    // A live approval is still decidable, and pending ones are counted.
+    let live = store
+        .create_approval(
+            org,
+            execution.id,
+            serde_json::json!({ "action": "y" }),
+            Some(chrono::Utc::now() + chrono::Duration::seconds(300)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .count_pending_approvals(org, execution.id)
+            .await
+            .unwrap(),
+        1
+    );
+    let decided = store
+        .decide_approval(org, live.id, "approved", user, None)
+        .await
+        .unwrap();
+    assert_eq!(decided.status, "approved");
+}
+
+#[tokio::test]
+async fn prune_audit_logs_removes_only_rows_older_than_cutoff() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let append = |action: &'static str| {
+        store.append_audit_log(
+            org,
+            "system",
+            None,
+            None,
+            action,
+            None,
+            None,
+            serde_json::json!({}),
+            None,
+            None,
+        )
+    };
+    append("test.old").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let cutoff = chrono::Utc::now();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    append("test.recent").await.unwrap();
+
+    // A cutoff in the past (retention window not yet elapsed) removes nothing of ours.
+    store
+        .prune_audit_logs(chrono::Utc::now() - chrono::Duration::days(365))
+        .await
+        .unwrap();
+    let (rows, _) = store.list_audit_logs(org, 10, None, None).await.unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let removed = store.prune_audit_logs(cutoff).await.unwrap();
+    assert!(removed >= 1);
+    let (rows, _) = store.list_audit_logs(org, 10, None, None).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].action, "test.recent");
 }

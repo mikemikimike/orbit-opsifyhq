@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/opsifyhq/orbit/actions/workflows/ci.yml/badge.svg)](https://github.com/opsifyhq/orbit/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.94%2B-orange.svg)](https://www.rust-lang.org/)
 [![Next.js](https://img.shields.io/badge/Next.js-16-black.svg)](https://nextjs.org/)
 
 **Self-hosted control plane for persistent AI agents.**
@@ -91,7 +91,7 @@ docker compose -f deploy/compose/compose.yaml up -d
 - Web UI: http://localhost:3000
 - API: http://localhost:8080/api/v1 · docs: http://localhost:8080/docs
 - PostgreSQL: `localhost:5432` (`orbit`/`orbit`, db `orbit`)
-- NATS: `localhost:4222`, monitoring `http://localhost:8222`
+- NATS: `localhost:4222` (loopback only; the monitor port is not published)
 
 The stack seeds demo agents (mock harness). Open an agent → **Run agent** → watch the
 live execution timeline, or use **Work** to create a run through the wizard.
@@ -195,7 +195,7 @@ docs/                     Architecture, ADRs, development and deployment guides
 
 - `docs/architecture/overview.md` — layers, modules, flows
 - `docs/architecture/domain-model.md` — entities and invariants
-- `docs/architecture/harness-contract.md` — adapter contract and implementation status
+- `docs/architecture/runtime-contract.md` — adapter contract and implementation status
 - `docs/architecture/provider-connector-contract.md`
 - `docs/architecture/api.md` — REST/OpenAPI/SSE/auth conventions
 - `docs/architecture/events.md` — event bus, durability, triggers

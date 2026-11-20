@@ -2,6 +2,8 @@
 
 ## For users
 
+- **[User guide](guide/README.md)** — agents, providers, skills, teams, access and policies
+
 - **[Getting started](development/local.md)** — run ORBIT locally in 5 minutes
 - **[Deployment](development/deployment.md)** — Docker Compose and Kubernetes
 - **[Releasing](development/releasing.md)** — version bump, tag, images, chart
@@ -22,10 +24,4 @@
 - **[Testing](development/testing.md)** — test expectations per change type
 - **[Kubernetes launcher](development/kubernetes-launcher.md)** — worker launch RBAC
 - **[Threat analysis](security/threat-analysis.md)** — security model
-- **[Decisions (ADRs)](decisions/)** — architecture decision records
-
-## Planning (in progress)
-
-- [Agent Team queue & multi-repo](planning/agent-team-queue-and-multi-repo.md)
-- [Provider UX & harness decoupling](planning/provider-ux-and-harness-decoupling.md)
-- [Support scripts in skills](planning/support-scripts-in-skills.md)
+- **[Decisions (ADRs)](decisions/README.md)** — architecture decision records

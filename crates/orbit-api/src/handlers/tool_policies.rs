@@ -120,6 +120,26 @@ fn validated(body: &ToolPolicyRequest) -> Result<ToolPolicyRule, ApiError> {
     Ok(rule)
 }
 
+/// A policy attached to an agent changes what that agent may do, so the caller must be
+/// able to manage the agent. Org-wide policies (no agent) only need `settings:write`.
+async fn require_agent_manage(
+    state: &AppState,
+    auth: &AuthContext,
+    access: &crate::access::AccessScope,
+    agent_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    if let Some(agent_id) = agent_id {
+        let agent = state.store.get_agent(auth.org_id, agent_id).await?;
+        access.require_manage(
+            "agent",
+            agent.owner_user_id,
+            agent.owner_team_id,
+            &agent.visibility,
+        )?;
+    }
+    Ok(())
+}
+
 #[utoipa::path(get, path = "/api/v1/tool-policies", tag = "tool-policies", params(("agentId" = Option<Uuid>, Query, description = "Include agent rules and org defaults")), responses((status = 200, body = [ToolPolicyView])))]
 pub async fn list(
     State(state): State<AppState>,
@@ -147,9 +167,8 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<ToolPolicyView>), ApiError> {
     auth.require(Permission::SettingsWrite)?;
     let rule = validated(&body)?;
-    if let Some(agent_id) = body.agent_id {
-        state.store.get_agent(auth.org_id, agent_id).await?;
-    }
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    require_agent_manage(&state, &auth, &access, body.agent_id).await?;
     let matcher = serde_json::to_value(&rule.matcher)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let record = state
@@ -202,10 +221,10 @@ pub async fn update(
         existing.owner_team_id,
         &existing.visibility,
     )?;
+    // Both the agent the policy is moving away from and the one it targets.
+    require_agent_manage(&state, &auth, &access, existing.agent_id).await?;
     let rule = validated(&body)?;
-    if let Some(agent_id) = body.agent_id {
-        state.store.get_agent(auth.org_id, agent_id).await?;
-    }
+    require_agent_manage(&state, &auth, &access, body.agent_id).await?;
     let matcher = serde_json::to_value(&rule.matcher)
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let record = state
@@ -254,6 +273,7 @@ pub async fn delete(
         existing.owner_team_id,
         &existing.visibility,
     )?;
+    require_agent_manage(&state, &auth, &access, existing.agent_id).await?;
     state
         .store
         .delete_tool_policy(auth.org_id, policy_id)

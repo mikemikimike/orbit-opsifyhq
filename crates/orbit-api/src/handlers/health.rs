@@ -25,7 +25,10 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
         "eventBus": if bus.is_ok() { "ok" } else { "unavailable" },
         "eventBusDriver": state.events_driver,
     });
-    let ready = db.is_ok() && bus.is_ok();
+    // PostgreSQL is the source of truth; the bus is an accelerator (AGENTS.md rule 5) and
+    // nothing in the API consumes it, so a bus outage must not remove pods from the
+    // Service. It is reported as degraded but does not gate readiness.
+    let ready = db.is_ok();
     if let Err(err) = &db {
         checks["databaseError"] = json!(err.to_string());
     }
@@ -37,9 +40,14 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+    let overall = if ready { "ready" } else { "degraded" };
     (
         status,
-        Json(json!({ "status": if ready { "ready" } else { "degraded" }, "checks": checks })),
+        Json(json!({
+            "status": overall,
+            "checks": checks,
+            "degraded": if bus.is_ok() { json!([]) } else { json!(["eventBus"]) },
+        })),
     )
         .into_response()
 }
@@ -62,6 +70,7 @@ pub async fn meta(State(state): State<AppState>) -> Json<MetaResponse> {
         auth: oidc_public_config(&state),
         events_driver: state.events_driver.clone(),
         license: state.license_status(),
+        docs_url: crate::docs::DOCS_URL.to_string(),
         features: MetaFeatures {
             harness_execution: true,
             connectors_invocation: true,

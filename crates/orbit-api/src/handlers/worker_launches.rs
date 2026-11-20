@@ -40,6 +40,9 @@ struct LauncherRequest {
     ca_secret_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     single_execution_id: Option<Uuid>,
+    /// Execution timeout; the launcher derives the Job `activeDeadlineSeconds` from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,7 +190,7 @@ async fn fail_worker_executions(state: &AppState, launch: &WorkerLaunch) {
             .error
             .clone()
             .unwrap_or_else(|| "worker container was OOMKilled".into());
-        let _ = state
+        if let Err(err) = state
             .store
             .append_execution_event(
                 launch.org_id,
@@ -203,7 +206,10 @@ async fn fail_worker_executions(state: &AppState, launch: &WorkerLaunch) {
                     "error": message,
                 }),
             )
-            .await;
+            .await
+        {
+            tracing::warn!(execution_id = %execution.id, error = %err, "failed to append execution event");
+        }
         let _ = state
             .store
             .finish_execution(
@@ -216,6 +222,46 @@ async fn fail_worker_executions(state: &AppState, launch: &WorkerLaunch) {
             )
             .await;
     }
+}
+
+/// A launch is exactly as visible as the worker profile it was launched from. Launches
+/// whose profile no longer exists are visible to owners/admins only.
+fn launch_visible(
+    access: &crate::access::AccessScope,
+    profiles: &std::collections::HashMap<Uuid, orbit_store::WorkerProfile>,
+    launch: &WorkerLaunch,
+) -> bool {
+    match profiles.get(&launch.profile_id) {
+        Some(profile) => access.can_view(
+            profile.owner_user_id,
+            profile.owner_team_id,
+            &profile.visibility,
+        ),
+        None => access.is_privileged(),
+    }
+}
+
+async fn load_visible_launch(
+    state: &AppState,
+    auth: &AuthContext,
+    launch_id: Uuid,
+) -> Result<WorkerLaunch, ApiError> {
+    let launch = state
+        .store
+        .get_worker_launch(auth.org_id, launch_id)
+        .await?;
+    let access = crate::access::AccessScope::load(state, auth).await?;
+    let profiles = state
+        .store
+        .list_worker_profiles(auth.org_id, None)
+        .await?
+        .into_iter()
+        .map(|profile| (profile.id, profile))
+        .collect();
+    if !launch_visible(&access, &profiles, &launch) {
+        return Err(ApiError::not_found("worker launch"));
+    }
+    Ok(launch)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -237,6 +283,18 @@ pub async fn list_launches(
     } else {
         state.store.list_active_worker_launches(auth.org_id).await?
     };
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    let profiles = state
+        .store
+        .list_worker_profiles(auth.org_id, None)
+        .await?
+        .into_iter()
+        .map(|profile| (profile.id, profile))
+        .collect();
+    let launches: Vec<WorkerLaunch> = launches
+        .into_iter()
+        .filter(|launch| launch_visible(&access, &profiles, launch))
+        .collect();
     let mut refreshed = Vec::with_capacity(launches.len());
     for launch in launches {
         refreshed.push(refresh(&state, launch).await);
@@ -251,10 +309,7 @@ pub async fn get_launch(
     Path(launch_id): Path<Uuid>,
 ) -> Result<Json<WorkerLaunch>, ApiError> {
     auth.require(Permission::HarnessesRead)?;
-    let launch = state
-        .store
-        .get_worker_launch(auth.org_id, launch_id)
-        .await?;
+    let launch = load_visible_launch(&state, &auth, launch_id).await?;
     Ok(Json(refresh(&state, launch).await))
 }
 
@@ -287,13 +342,8 @@ pub(crate) async fn launch_profile_internal(
     if single_execution_id.is_none() {
         if let Some(existing) = state
             .store
-            .list_worker_launches(auth.org_id, None)
+            .find_live_launch_for_profile(auth.org_id, profile.id)
             .await?
-            .into_iter()
-            .find(|launch| {
-                launch.profile_id == profile.id
-                    && matches!(launch.status.as_str(), "pending" | "starting" | "running")
-            })
         {
             return Ok(existing);
         }
@@ -307,7 +357,7 @@ pub(crate) async fn launch_profile_internal(
         profile.image_tag.clone()
     };
     let image = format!("{}:{}", profile.image, image_tag);
-    let launch = state
+    let launch = match state
         .store
         .create_worker_launch(
             auth.org_id,
@@ -317,15 +367,71 @@ pub(crate) async fn launch_profile_internal(
             &image,
             Some(issued.token_id),
             Some(auth.user_id),
+            single_execution_id.is_some(),
         )
-        .await?;
+        .await
+    {
+        Ok(launch) => launch,
+        Err(error) => {
+            let _ = state
+                .store
+                .revoke_worker_token(auth.org_id, issued.token_id)
+                .await;
+            // Lost the race against a concurrent launch of the same profile: reuse the winner.
+            if error.is_unique_violation() && single_execution_id.is_none() {
+                if let Some(existing) = state
+                    .store
+                    .find_live_launch_for_profile(auth.org_id, profile.id)
+                    .await?
+                {
+                    return Ok(existing);
+                }
+            }
+            return Err(error.into());
+        }
+    };
     let worker_id = format!("worker-{}", &launch.id.to_string()[..8]);
+    let mut timeout_seconds = None;
     if let Some(execution_id) = single_execution_id {
+        // Lets the background reaper revoke this launch's token when the execution ends.
         state
             .store
-            .claim_execution(execution_id, &worker_id)
-            .await?
-            .ok_or_else(|| ApiError::conflict("execution is no longer queued for this launch"))?;
+            .set_worker_launch_single_execution(launch.id, execution_id)
+            .await?;
+        let claimed = state.store.claim_execution(execution_id, &worker_id).await;
+        let claimed = match claimed {
+            Ok(Some(claimed)) => claimed,
+            other => {
+                // Do not leave a phantom pending launch or an active token behind.
+                let _ = state
+                    .store
+                    .revoke_worker_token(auth.org_id, issued.token_id)
+                    .await;
+                let _ = state
+                    .store
+                    .update_worker_launch(
+                        auth.org_id,
+                        launch.id,
+                        "failed",
+                        None,
+                        None,
+                        Some("execution was no longer queued for this launch"),
+                        false,
+                        true,
+                    )
+                    .await;
+                other?;
+                return Err(ApiError::conflict(
+                    "execution is no longer queued for this launch",
+                ));
+            }
+        };
+        timeout_seconds = Some(claimed.timeout_seconds.max(1) as u64);
+        // The launched worker authenticates with this launch's token; bind the claim to it.
+        state
+            .store
+            .bind_execution_worker_token(execution_id, issued.token_id)
+            .await?;
     }
     let request = LauncherRequest {
         launch_id: launch.id,
@@ -345,6 +451,7 @@ pub(crate) async fn launch_profile_internal(
         ca_secret_name: state.ca_secret_name.clone(),
         ca_secret_key: state.ca_secret_key.clone(),
         single_execution_id,
+        timeout_seconds,
     };
     let result: LauncherStatus = match call_launcher(
         state,
@@ -472,10 +579,7 @@ pub async fn launch_logs(
     Path(launch_id): Path<Uuid>,
 ) -> Result<Json<LaunchLogs>, ApiError> {
     auth.require(Permission::HarnessesRead)?;
-    let launch = state
-        .store
-        .get_worker_launch(auth.org_id, launch_id)
-        .await?;
+    let launch = load_visible_launch(&state, &auth, launch_id).await?;
     let logs: LaunchLogs = call_launcher(
         &state,
         reqwest::Method::GET,

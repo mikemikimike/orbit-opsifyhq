@@ -12,7 +12,7 @@ coverage
 .env
 .env.*
 !.env.example
-docs
+docs/planning
 deploy
 runtimes
 screenshots

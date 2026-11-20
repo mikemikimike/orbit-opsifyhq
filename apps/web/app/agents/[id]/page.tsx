@@ -21,7 +21,6 @@ import { toast } from "sonner";
 
 import { RunAgentDialog } from "@/components/agents/run-agent-dialog";
 import { ExecutionListHeader, ExecutionRow } from "@/components/executions/execution-row";
-import { exportResource } from "@/components/export-resource-button";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
@@ -40,8 +39,8 @@ import { PageHeader } from "@/components/ui/page-header";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AgentStatusBadge } from "@/components/ui/status-badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { api, getAccessToken } from "@/lib/api";
-import { request } from "@/lib/http";
+import { api } from "@/lib/api";
+import { request, requestRaw } from "@/lib/http";
 import { copyText } from "@/lib/browser";
 import { agentSpecSchema } from "@orbit/contracts";
 import { queryKeys, unwrap, useAgent, useAgentVersions, useExecutions } from "@/lib/queries";
@@ -82,6 +81,7 @@ export default function AgentDetailPage() {
         lastHeartbeatAt: string;
         lastExecutionId?: string | null;
         lastError?: string | null;
+        consecutiveFailures?: number;
       } | null>(`/api/v1/agents/${agentId}/runtime`).catch(() => null),
     refetchInterval: 10_000,
   });
@@ -197,13 +197,8 @@ export default function AgentDetailPage() {
     // Fetched (not linked) so the request carries the session token and goes
     // through the same origin as every other API call.
     try {
-      const token = getAccessToken();
-      // Always use the same-origin web proxy. `NEXT_PUBLIC_ORBIT_API_URL` may point at
-      // an internal API host that the browser cannot reach.
-      const response = await fetch(`/api/v1/agents/${data.id}/export`, {
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-      });
-      if (!response.ok) throw new Error(`Export failed (HTTP ${response.status})`);
+      // Same-origin proxy: `NEXT_PUBLIC_ORBIT_API_URL` may be browser-unreachable (#94).
+      const response = await requestRaw(`/api/v1/agents/${data.id}/export`, { sameOrigin: true });
       const url = URL.createObjectURL(await response.blob());
       const link = document.createElement("a");
       link.href = url;
@@ -302,9 +297,6 @@ export default function AgentDetailPage() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem onSelect={() => void exportResource("agents", data.id, data.name)}>
-                  <Download /> Export as JSON
-                </DropdownMenuItem>
                 <DropdownMenuItem onSelect={() => void downloadYaml()}>
                   <Download /> Export as YAML
                 </DropdownMenuItem>
@@ -358,7 +350,10 @@ export default function AgentDetailPage() {
           }
         >
           Heartbeat {relativeTime(runtime.data.lastHeartbeatAt)}
-          {runtime.data.lastError ? ` · ${runtime.data.lastError}` : ""}. This runtime creates
+          {runtime.data.lastError ? ` · ${runtime.data.lastError}` : ""}
+          {runtime.data.consecutiveFailures
+            ? ` · ${runtime.data.consecutiveFailures} consecutive failed ${runtime.data.consecutiveFailures === 1 ? "run" : "runs"}, retrying with backoff`
+            : ""}. This runtime creates
           the next execution when the previous one finishes and resumes its session.
         </Callout>
       ) : null}

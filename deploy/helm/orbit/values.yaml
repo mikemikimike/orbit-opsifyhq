@@ -153,6 +153,20 @@ launcher:
       cpu: 500m
       memory: 256Mi
 
+# Outbound policy for provider/output/work-source URLs (see docs/guide/outbound-network-policy.md).
+# Loopback, link-local and cloud-metadata addresses are always blocked unless listed in
+# `allowedHosts`; metadata addresses can never be allowed.
+outbound:
+  # Allow RFC 1918 / CGNAT / IPv6 ULA targets (self-hosted model servers, GitLab).
+  allowPrivate: true
+  # Comma-separated hostnames, IPs or CIDRs exempt from the block, e.g. "ollama.internal,10.0.0.0/8".
+  allowedHosts: ""
+
+# Optional NetworkPolicy restricting ingress to the launcher (port 8090) to the API pods.
+# Off by default because it needs a CNI that enforces NetworkPolicy. Egress is untouched.
+networkPolicy:
+  enabled: false
+
 # Offline enterprise license (Ed25519-signed JWS). See docs/decisions/0010.
 # No installation ID or online activation is required. Provide either an existing Secret
 # or an inline value (not recommended for production).
@@ -166,6 +180,9 @@ auth:
   # dev  = seeded local user (no IdP). Use only for local/test clusters.
   # oidc = bearer tokens validated against your OIDC provider's JWKS.
   mode: dev
+  # Rendering fails when the ingress is enabled with mode=dev + dev.allowAnonymous=true
+  # (an anonymous Owner UI) unless this is set. Only for throwaway local/test clusters.
+  acknowledgeInsecureDev: false
   dev:
     allowAnonymous: true
     token: orbit-dev-token
@@ -223,6 +240,7 @@ postgresql:
   image: postgres:17-alpine
   database: orbit
   user: orbit
+  # Default is for throwaway clusters only; rejected when platform.environment=production.
   password: orbit
   storage: 5Gi
   storageClassName: ""
@@ -287,7 +305,9 @@ externalNats:
 # ─── Platform ────────────────────────────────────────────────
 platform:
   # This default chart targets local/test clusters (bundled DB/NATS, dev auth).
-  # Use values-prod.example.yaml for a production deployment.
+  # Use values-prod.example.yaml for a production deployment. With
+  # environment=production the chart refuses auth.mode=dev and the default bundled
+  # Postgres password.
   environment: development
   seedDemo: true
   # Seed a launchable worker profile when a launcher is configured (requires
@@ -300,6 +320,8 @@ platform:
   # Archive terminal executions/team runs/worker launches older than this many days.
   # History is retained; the default list just stops showing old runs. 0 disables.
   archiveAfterDays: "30"
+  # Delete audit log entries older than this many days. 0 keeps them forever.
+  auditRetentionDays: "0"
 
 # Optional Vault wiring (secret retrieval is Phase 2; values are injected as env so
 # Vault Agent / CSI can be used without chart changes).

@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 /// Platform-enforced autonomy levels. The model never decides these; ORBIT does.
 ///
-/// - 1 Observe: read-only capabilities.
-/// - 2 Recommend: analyse and propose; all writes denied.
+/// - 1 Observe: read-only capabilities; writes and side effects are denied.
+/// - 2 Recommend: analyse and propose; writes and side effects are denied (no approval path).
 /// - 3 Prepare: writes/side effects require explicit approval.
 /// - 4 Autonomous: allowlisted writes/side effects execute without approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -35,8 +35,8 @@ impl AutonomyLevel {
 
     pub fn description(&self) -> &'static str {
         match self.0 {
-            1 => "Read-only access to connected services.",
-            2 => "Analyse and propose actions; no writes are executed.",
+            1 => "Read-only access to connected services; writes are denied.",
+            2 => "Analyse and propose actions; writes are denied (raise to Prepare for approval-gated writes).",
             3 => "Prepare writes and side effects; a human must approve.",
             _ => "Execute allowlisted actions within platform policies.",
         }
@@ -122,6 +122,10 @@ pub struct GrantedCapability {
 ///
 /// `granted` is derived from the agent definition's connector bindings and the
 /// connection's capability catalog. An empty allowlist never grants writes.
+///
+/// Levels 1 (Observe) and 2 (Recommend) **deny** every write or external side
+/// effect outright; there is no approval path, regardless of `approval_mode`.
+/// Approval-gated writes start at level 3 (Prepare).
 pub fn evaluate_capability(
     level: AutonomyLevel,
     approval_mode: crate::ApprovalMode,
@@ -135,6 +139,11 @@ pub fn evaluate_capability(
     }
     match effect {
         CapabilityEffect::Read => PolicyDecision::Allow,
+        CapabilityEffect::Write | CapabilityEffect::ExternalSideEffect
+            if level < AutonomyLevel::PREPARE =>
+        {
+            PolicyDecision::Deny
+        }
         CapabilityEffect::Write | CapabilityEffect::ExternalSideEffect => {
             let requires = match approval_mode {
                 crate::ApprovalMode::Always => true,
@@ -192,8 +201,81 @@ mod tests {
                 CapabilityEffect::Write,
                 &granted
             ),
-            PolicyDecision::RequireApproval
+            PolicyDecision::Deny
         );
+    }
+
+    #[test]
+    fn observe_and_recommend_deny_writes_in_every_approval_mode() {
+        let granted = vec![
+            grant("issues.create", CapabilityEffect::Write),
+            grant("messages.send", CapabilityEffect::ExternalSideEffect),
+            grant("issues.list", CapabilityEffect::Read),
+        ];
+        for level in [AutonomyLevel::OBSERVE, AutonomyLevel::RECOMMEND] {
+            for mode in [
+                ApprovalMode::Auto,
+                ApprovalMode::Writes,
+                ApprovalMode::Always,
+            ] {
+                for (cap, effect) in [
+                    ("issues.create", CapabilityEffect::Write),
+                    ("messages.send", CapabilityEffect::ExternalSideEffect),
+                ] {
+                    assert_eq!(
+                        evaluate_capability(level, mode, cap, effect, &granted),
+                        PolicyDecision::Deny,
+                        "level {level} mode {mode:?} cap {cap}"
+                    );
+                }
+                assert_eq!(
+                    evaluate_capability(
+                        level,
+                        mode,
+                        "issues.list",
+                        CapabilityEffect::Read,
+                        &granted
+                    ),
+                    PolicyDecision::Allow
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recommend_write_is_denied() {
+        let granted = vec![grant("issues.create", CapabilityEffect::Write)];
+        assert_eq!(
+            evaluate_capability(
+                AutonomyLevel::RECOMMEND,
+                ApprovalMode::Auto,
+                "issues.create",
+                CapabilityEffect::Write,
+                &granted
+            ),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn prepare_write_requires_approval() {
+        let granted = vec![grant("issues.create", CapabilityEffect::Write)];
+        for mode in [
+            ApprovalMode::Auto,
+            ApprovalMode::Writes,
+            ApprovalMode::Always,
+        ] {
+            assert_eq!(
+                evaluate_capability(
+                    AutonomyLevel::PREPARE,
+                    mode,
+                    "issues.create",
+                    CapabilityEffect::Write,
+                    &granted
+                ),
+                PolicyDecision::RequireApproval
+            );
+        }
     }
 
     #[test]

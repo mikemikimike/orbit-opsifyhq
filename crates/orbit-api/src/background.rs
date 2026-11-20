@@ -10,56 +10,59 @@ use chrono::Utc;
 use orbit_contracts::{subjects, OrbitEvent};
 use orbit_domain::{AgentStatus, ExecutionStatus, LogLevel, TriggerSource};
 use orbit_store::Trigger;
+use tokio::task::JoinHandle;
 
 use crate::state::AppState;
+use crate::supervisor::supervise;
 
-pub fn spawn(state: AppState) {
+pub fn spawn(state: AppState) -> Vec<JoinHandle<()>> {
+    let mut handles = Vec::new();
     // Offline license: re-read the mounted file so airgapped renewals apply without a
     // restart (Secret volume updates propagate within ~60s).
-    let license_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise("license", &state, |license_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             license_state.license.reload();
         }
-    });
+    }));
 
-    let output_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise("outputs", &state, |output_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             crate::handlers::outputs::deliver_pending(&output_state).await;
         }
-    });
+    }));
 
-    let scheduler_state = state.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(15));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            if let Err(error) = scheduler_tick(&scheduler_state).await {
-                tracing::error!(%error, "scheduler tick failed");
+    handles.push(supervise(
+        "scheduler",
+        &state,
+        |scheduler_state| async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = scheduler_tick(&scheduler_state).await {
+                    tracing::error!(%error, "scheduler tick failed");
+                }
             }
-        }
-    });
+        },
+    ));
 
-    let reaper_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise("reaper", &state, |reaper_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(15));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             reap(&reaper_state).await;
+            revoke_finished_launch_tokens(&reaper_state).await;
         }
-    });
+    }));
 
-    let team_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise("team_runs", &state, |team_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(2));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -75,23 +78,28 @@ pub fn spawn(state: AppState) {
                 }
                 Err(error) => tracing::warn!(%error, "team run polling failed"),
             }
-        }
-    });
-
-    let dispatcher_state = state.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(15));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            if let Err(error) = crate::dispatcher::dispatch_tick(&dispatcher_state).await {
-                tracing::error!(%error, "work source dispatcher tick failed");
+            if let Err(error) = crate::handlers::teams::reconcile_team_outcomes(&team_state).await {
+                tracing::warn!(%error, "team outcome reconciliation failed");
             }
         }
-    });
+    }));
 
-    let tag_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise(
+        "dispatcher",
+        &state,
+        |dispatcher_state| async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = crate::dispatcher::dispatch_tick(&dispatcher_state).await {
+                    tracing::error!(%error, "work source dispatcher tick failed");
+                }
+            }
+        },
+    ));
+
+    handles.push(supervise("worker_tags", &state, |tag_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -100,10 +108,9 @@ pub fn spawn(state: AppState) {
                 tracing::warn!(%error, "worker tag reconciliation failed");
             }
         }
-    });
+    }));
 
-    let runtime_state = state.clone();
-    tokio::spawn(async move {
+    handles.push(supervise("runtime", &state, |runtime_state| async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -112,29 +119,79 @@ pub fn spawn(state: AppState) {
                 tracing::warn!(%error, "agent runtime tick failed");
             }
         }
-    });
+    }));
 
-    let retention_state = state.clone();
+    handles.push(supervise(
+        "retention",
+        &state,
+        |retention_state| async move {
+            // Run shortly after start, then daily.
+            let mut ticker = tokio::time::interval(Duration::from_secs(6 * 3600));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                archive_old_runs(&retention_state).await;
+            }
+        },
+    ));
+
+    handles.push(supervise(
+        "memory_pruner",
+        &state,
+        |pruner_state| async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match pruner_state.store.prune_expired_memory().await {
+                    Ok(n) if n > 0 => tracing::info!(count = n, "pruned expired memory entries"),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "memory pruning failed"),
+                }
+            }
+        },
+    ));
+    spawn_audit_retention(state.clone());
+    handles
+}
+
+/// Parse `ORBIT_AUDIT_RETENTION_DAYS`. Unset, empty, `0` or invalid -> keep audit logs
+/// forever (`None`). Deleting audit history is opt-in so an upgrade never prunes it.
+fn audit_retention_days(raw: Option<&str>) -> Option<u32> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => None,
+        Some(value) => match value.parse::<u32>() {
+            Ok(0) => None,
+            Ok(days) => Some(days),
+            Err(_) => {
+                tracing::warn!(
+                    value,
+                    "invalid ORBIT_AUDIT_RETENTION_DAYS; keeping audit logs"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Delete audit log rows older than `ORBIT_AUDIT_RETENTION_DAYS` (unset or `0` keeps
+/// everything). Runs daily; the delete is idempotent so multiple API replicas are safe.
+fn spawn_audit_retention(state: AppState) {
+    let Some(days) =
+        audit_retention_days(std::env::var("ORBIT_AUDIT_RETENTION_DAYS").ok().as_deref())
+    else {
+        return;
+    };
     tokio::spawn(async move {
-        // Run shortly after start, then daily.
-        let mut ticker = tokio::time::interval(Duration::from_secs(6 * 3600));
+        let mut ticker = tokio::time::interval(Duration::from_secs(24 * 3600));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            archive_old_runs(&retention_state).await;
-        }
-    });
-
-    let pruner_state = state.clone();
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(3600));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            match pruner_state.store.prune_expired_memory().await {
-                Ok(n) if n > 0 => tracing::info!(count = n, "pruned expired memory entries"),
-                Ok(_) => {}
-                Err(error) => tracing::warn!(%error, "memory pruning failed"),
+            let cutoff = Utc::now() - chrono::Duration::days(days as i64);
+            match state.store.prune_audit_logs(cutoff).await {
+                Ok(0) => {}
+                Ok(count) => tracing::info!(count, days, "pruned old audit log entries"),
+                Err(error) => tracing::warn!(%error, "audit log pruning failed"),
             }
         }
     });
@@ -173,7 +230,8 @@ async fn scheduler_tick(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn fire_trigger(state: &AppState, trigger: Trigger) -> anyhow::Result<()> {
+/// Fire one due trigger and record success/failure on it. Public for integration tests.
+pub async fn fire_trigger(state: &AppState, trigger: Trigger) -> anyhow::Result<()> {
     let result = fire_trigger_inner(state, trigger.clone()).await;
     match &result {
         Ok(()) => {
@@ -270,6 +328,70 @@ async fn fire_trigger_inner(state: &AppState, trigger: Trigger) -> anyhow::Resul
         .as_ref()
         .map(|harness| harness.placement.as_str())
         .unwrap_or("auto");
+    // Shared execution preflight (#140), evaluated at fire time for the trigger owner (or,
+    // for spec-derived triggers without an owner, the agent owner). If that user lost
+    // access to the agent, a connection or the provider, the run fails with a recorded
+    // error and counts towards the trigger's consecutive-failure auto-disable. Harness
+    // unavailability and the hourly quota skip this tick instead of failing the trigger.
+    let identity_user = trigger.owner_user_id.or(agent.owner_user_id);
+    let identity = crate::preflight::background_access(
+        state,
+        trigger.org_id,
+        &[trigger.owner_user_id, agent.owner_user_id],
+    )
+    .await;
+    let access = match identity {
+        Ok(access) => access,
+        Err(error) => {
+            crate::preflight::audit_denied_run(
+                state,
+                trigger.org_id,
+                "trigger.fire_denied",
+                "trigger",
+                trigger.id,
+                &error,
+                identity_user,
+            )
+            .await;
+            anyhow::bail!("scheduled run refused: {}", error.message);
+        }
+    };
+    if let Some(access) = &access {
+        let preflight = crate::preflight::Preflight {
+            state,
+            org_id: trigger.org_id,
+            access,
+            agent: &agent,
+            spec: &spec,
+            harness: harness_kind,
+            extra_connection_ids: &[],
+        };
+        if let Err(error) = preflight.authorize_access().await {
+            crate::preflight::audit_denied_run(
+                state,
+                trigger.org_id,
+                "trigger.fire_denied",
+                "trigger",
+                trigger.id,
+                &error,
+                identity_user,
+            )
+            .await;
+            anyhow::bail!("scheduled run refused: {}", error.message);
+        }
+    }
+    if let Err(error) =
+        crate::preflight::require_harness_available(state, trigger.org_id, harness_kind).await
+    {
+        tracing::warn!(trigger_id = %trigger.id, error = %error.message, "scheduled trigger skipped: harness unavailable");
+        return Ok(());
+    }
+    if let Err(error) =
+        crate::preflight::require_hourly_quota(state, trigger.org_id, agent.id, &spec).await
+    {
+        tracing::info!(trigger_id = %trigger.id, error = %error.message, "scheduled trigger skipped: hourly quota reached");
+        return Ok(());
+    }
     let idempotency_key = format!("trigger:{}:{}", trigger.id, fired_at.timestamp_millis());
     let execution = state
         .store
@@ -324,6 +446,32 @@ const HEARTBEAT_STALE_SECONDS: i64 = 90;
 const UNSTARTED_SILENT_SECONDS: i64 = 600;
 /// How long a claimed, never-started run may ignore a cancel request.
 const UNSTARTED_CANCEL_SECONDS: i64 = 60;
+/// Default slack added to `timeout_seconds` before a still-`running` run is ended by the
+/// platform. Override with `ORBIT_EXECUTION_TIMEOUT_GRACE_SECONDS`.
+const DEFAULT_TIMEOUT_GRACE_SECONDS: i64 = 300;
+
+fn timeout_grace_seconds() -> i64 {
+    std::env::var("ORBIT_EXECUTION_TIMEOUT_GRACE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(DEFAULT_TIMEOUT_GRACE_SECONDS)
+}
+
+/// A single-execution launch's worker token has no use once its execution is terminal;
+/// revoke it so a leaked token cannot be replayed.
+async fn revoke_finished_launch_tokens(state: &AppState) {
+    match state.store.revoke_finished_single_execution_tokens().await {
+        Ok(ids) if !ids.is_empty() => {
+            tracing::info!(
+                count = ids.len(),
+                "revoked worker tokens of finished single-execution launches"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "single-execution token revocation failed"),
+    }
+}
 
 async fn reap(state: &AppState) {
     match state
@@ -377,6 +525,31 @@ async fn reap(state: &AppState) {
         }
         Err(error) => tracing::warn!(%error, "unstarted execution reaper failed"),
     }
+
+    match state
+        .store
+        .reap_timed_out_executions(None, timeout_grace_seconds())
+        .await
+    {
+        Ok(rows) => {
+            for execution in rows {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    worker_id = ?execution.worker_id,
+                    "ended execution that outlived its timeout"
+                );
+                let message = format!(
+                    "execution outlived its {}s timeout (plus grace) without being reported finished; marked timed out",
+                    execution.timeout_seconds
+                );
+                let data = execution.error.clone().unwrap_or_else(
+                    || serde_json::json!({ "code": "execution_timeout", "retryable": true }),
+                );
+                report_reaped(state, &execution, &message, &data).await;
+            }
+        }
+        Err(error) => tracing::warn!(%error, "timed-out execution reaper failed"),
+    }
 }
 
 /// Record why the platform ended an execution and tell subscribers.
@@ -386,7 +559,7 @@ async fn report_reaped(
     message: &str,
     data: &serde_json::Value,
 ) {
-    let _ = state
+    if let Err(err) = state
         .store
         .append_execution_event(
             execution.org_id,
@@ -396,7 +569,10 @@ async fn report_reaped(
             message,
             data,
         )
-        .await;
+        .await
+    {
+        tracing::warn!(execution_id = %execution.id, error = %err, "failed to append execution event");
+    }
     let event = OrbitEvent::new(
         subjects::EXECUTION_UPDATED,
         "orbit-api-reaper",
@@ -427,13 +603,12 @@ async fn reconcile_worker_tags(state: &AppState) -> anyhow::Result<()> {
         let desired = format!("{}:{}", profile.image, tag);
         let launches = state
             .store
-            .list_worker_launches(profile.org_id, None)
+            .active_launches_for_profile(profile.org_id, profile.id)
             .await?;
-        for launch in launches.into_iter().filter(|launch| {
-            launch.profile_id == profile.id
-                && matches!(launch.status.as_str(), "pending" | "starting" | "running")
-                && launch.image != desired
-        }) {
+        for launch in launches
+            .into_iter()
+            .filter(|launch| launch.image != desired)
+        {
             let auth = orbit_security::AuthContext {
                 user_id,
                 org_id: profile.org_id,
@@ -504,160 +679,351 @@ async fn reconcile_worker_tags(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+enum RuntimeTickError {
+    /// Retrying cannot help; the runtime is stopped with a clear `last_error`.
+    Permanent(String),
+    /// Possibly recoverable (store hiccup, agent edited later); retried with backoff.
+    Transient(anyhow::Error),
+}
+
+impl From<orbit_store::StoreError> for RuntimeTickError {
+    fn from(error: orbit_store::StoreError) -> Self {
+        Self::Transient(error.into())
+    }
+}
+
+const RUNTIME_MIN_BACKOFF_SECONDS: i64 = 30;
+const RUNTIME_MAX_BACKOFF_SECONDS: i64 = 900;
+/// A runtime stops after this many failed executions in a row.
+#[doc(hidden)]
+pub const RUNTIME_MAX_CONSECUTIVE_FAILURES: i32 = 5;
+
+/// Exponential backoff from the runtime interval (at least 30s), doubling per
+/// consecutive failure and capped at 15 minutes.
+fn runtime_failure_backoff(interval_seconds: i32, failures: i32) -> chrono::Duration {
+    let base = (interval_seconds as i64).max(RUNTIME_MIN_BACKOFF_SECONDS);
+    let doublings = (failures.max(1) - 1).min(16) as u32;
+    chrono::Duration::seconds(
+        base.saturating_mul(1i64 << doublings)
+            .min(RUNTIME_MAX_BACKOFF_SECONDS),
+    )
+}
+
+fn runtime_tick_key(runtime_id: uuid::Uuid, last_execution_id: Option<uuid::Uuid>) -> String {
+    match last_execution_id {
+        Some(id) => format!("runtime:{runtime_id}:after:{id}"),
+        None => format!("runtime:{runtime_id}:first"),
+    }
+}
+
 /// Advance continuous agent runtimes: create the next execution when the previous one
-/// is terminal, and stop runtimes whose agent is no longer active.
-async fn runtime_tick(state: &AppState) -> anyhow::Result<()> {
+/// is terminal, and stop runtimes whose agent is no longer active. Every runtime is
+/// handled independently: a failure is recorded on that runtime (with backoff, or a stop
+/// for permanent errors) and never prevents the others from advancing.
+#[doc(hidden)]
+pub async fn runtime_tick(state: &AppState) -> anyhow::Result<()> {
     for runtime in state.store.list_running_agent_runtimes().await? {
-        let _ = state.store.heartbeat_agent_runtime(runtime.id).await;
-        let agent = match state
-            .store
-            .get_agent(runtime.org_id, runtime.agent_id)
-            .await
-        {
-            Ok(agent) => agent,
-            Err(_) => {
-                let _ = state
+        let (runtime_id, org_id) = (runtime.id, runtime.org_id);
+        let interval = runtime.interval_seconds;
+        let Err(failure) = advance_runtime(state, runtime).await else {
+            continue;
+        };
+        // Never moves `stopping`/`stopped` runtimes: both writes are conditional on
+        // `status = 'running'`.
+        let result = match &failure {
+            RuntimeTickError::Permanent(message) => {
+                tracing::warn!(%runtime_id, %org_id, error = %message, "agent runtime stopped after permanent error");
+                state
                     .store
-                    .update_agent_runtime(
-                        runtime.id,
-                        "stopped",
-                        runtime.last_execution_id,
-                        Some("agent no longer exists"),
-                        chrono::Utc::now(),
+                    .halt_running_agent_runtime(runtime_id, message)
+                    .await
+            }
+            RuntimeTickError::Transient(error) => {
+                let message = error.to_string();
+                tracing::warn!(%runtime_id, %org_id, error = %message, "agent runtime tick failed");
+                state
+                    .store
+                    .advance_agent_runtime(
+                        runtime_id,
+                        Some(&message),
+                        chrono::Utc::now() + runtime_failure_backoff(interval.max(60), 1),
                     )
-                    .await;
-                continue;
+                    .await
             }
         };
-        if agent.status != "active" {
-            let _ = state
-                .store
-                .update_agent_runtime(
-                    runtime.id,
-                    "stopped",
-                    runtime.last_execution_id,
-                    Some("agent is not active"),
-                    chrono::Utc::now(),
-                )
-                .await;
-            continue;
+        if let Err(error) = result {
+            tracing::error!(%runtime_id, %org_id, %error, "could not record runtime failure");
         }
-
-        let last = match runtime.last_execution_id {
-            Some(id) => state.store.get_execution(runtime.org_id, id).await.ok(),
-            None => None,
-        };
-        let last_terminal = last.as_ref().is_none_or(|execution| {
-            matches!(
-                ExecutionStatus::parse(&execution.status),
-                Some(status) if status.is_terminal()
-            )
-        });
-        if runtime.status == "stopping" {
-            if last_terminal {
-                let _ = state
-                    .store
-                    .update_agent_runtime(
-                        runtime.id,
-                        "stopped",
-                        runtime.last_execution_id,
-                        runtime.last_error.as_deref(),
-                        chrono::Utc::now(),
-                    )
-                    .await;
-            }
-            continue;
-        }
-        if !last_terminal {
-            continue;
-        }
-        let Some(runtime) = state
-            .store
-            .claim_agent_runtime_tick(
-                runtime.id,
-                chrono::Utc::now() + chrono::Duration::seconds(5),
-            )
-            .await?
-        else {
-            continue;
-        };
-        if last
-            .as_ref()
-            .is_some_and(|execution| execution.status == "failed")
-        {
-            let _ = state
-                .store
-                .update_agent_runtime(
-                    runtime.id,
-                    "running",
-                    runtime.last_execution_id,
-                    last.as_ref()
-                        .and_then(|execution| execution.error.as_ref())
-                        .map(|error| error.to_string())
-                        .as_deref(),
-                    chrono::Utc::now()
-                        + chrono::Duration::seconds(runtime.interval_seconds.max(30) as i64),
-                )
-                .await;
-            continue;
-        }
-
-        let version = state
-            .store
-            .get_current_version(runtime.org_id, &agent)
-            .await?;
-        let spec: orbit_domain::AgentSpec = serde_json::from_value(version.spec.clone())?;
-        let harness_kind = runtime
-            .harness_kind
-            .parse::<orbit_domain::HarnessKind>()
-            .map_err(|_| anyhow::anyhow!("runtime has an unknown harness"))?;
-        let input = serde_json::json!({
-            "task": runtime.task,
-            "payload": { "runtimeId": runtime.id },
-            "provenance": {
-                "source": "runtime",
-                "trusted": true,
-                "subject": runtime.id,
-                "receivedAt": Utc::now(),
-            },
-        });
-        let execution = state
-            .store
-            .create_execution(orbit_store::executions::NewExecution {
-                org_id: runtime.org_id,
-                agent_id: agent.id,
-                agent_version_id: version.id,
-                agent_name: &agent.name,
-                harness_kind,
-                trigger_source: TriggerSource::Manual,
-                placement: spec
-                    .harness
-                    .as_ref()
-                    .map(|harness| harness.placement.as_str())
-                    .unwrap_or("auto"),
-                trigger_id: None,
-                input,
-                session_ref: last
-                    .as_ref()
-                    .and_then(|execution| execution.session_ref.as_deref()),
-                skills: &[],
-                timeout_seconds: spec.resources.timeout_seconds,
-                requested_by: runtime.created_by,
-                idempotency_key: Some(&format!("runtime:{}:{}", runtime.id, uuid::Uuid::now_v7())),
-                team_run_id: None,
-                team_step_index: None,
-            })
-            .await?;
-        state
-            .store
-            .update_agent_runtime(
-                runtime.id,
-                "running",
-                Some(execution.id),
-                None,
-                chrono::Utc::now() + chrono::Duration::seconds(runtime.interval_seconds as i64),
-            )
-            .await?;
     }
     Ok(())
+}
+
+async fn advance_runtime(
+    state: &AppState,
+    runtime: orbit_store::agent_runtimes::AgentRuntime,
+) -> Result<(), RuntimeTickError> {
+    let _ = state.store.heartbeat_agent_runtime(runtime.id).await;
+    let agent = match state
+        .store
+        .get_agent(runtime.org_id, runtime.agent_id)
+        .await
+    {
+        Ok(agent) => agent,
+        Err(_) => {
+            let _ = state
+                .store
+                .halt_agent_runtime(runtime.id, "agent no longer exists")
+                .await;
+            return Ok(());
+        }
+    };
+    if agent.status != "active" {
+        let _ = state
+            .store
+            .halt_agent_runtime(runtime.id, "agent is not active")
+            .await;
+        return Ok(());
+    }
+
+    let last = match runtime.last_execution_id {
+        Some(id) => state.store.get_execution(runtime.org_id, id).await.ok(),
+        None => None,
+    };
+    let last_terminal = last.as_ref().is_none_or(|execution| {
+        matches!(
+            ExecutionStatus::parse(&execution.status),
+            Some(status) if status.is_terminal()
+        )
+    });
+    if runtime.status == "stopping" {
+        if last_terminal {
+            let _ = state.store.finish_agent_runtime_stop(runtime.id).await;
+        } else if let Some(id) = runtime.last_execution_id {
+            // An execution launched by a tick that raced the Stop is not covered by the
+            // handler's cancel; cancel it here so Stop does not wait for a full run.
+            let _ = state
+                .store
+                .request_execution_cancel(runtime.org_id, id)
+                .await;
+        }
+        return Ok(());
+    }
+    if !last_terminal {
+        return Ok(());
+    }
+    let Some(runtime) = state
+        .store
+        .claim_agent_runtime_tick(
+            runtime.id,
+            chrono::Utc::now() + chrono::Duration::seconds(5),
+        )
+        .await
+        .map_err(|error| RuntimeTickError::Transient(error.into()))?
+    else {
+        return Ok(());
+    };
+    let last_failed = last
+        .as_ref()
+        .filter(|execution| execution.status == "failed");
+    if let Some(failed) = last_failed {
+        // First time this failure is seen: count it and back off. Once accounted for, the
+        // next due tick falls through and creates a new execution.
+        if runtime.failed_execution_id != Some(failed.id) {
+            let failures = runtime.consecutive_failures.saturating_add(1);
+            let reason = failed
+                .error
+                .as_ref()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "execution failed".into());
+            let (stop, message, next_run_at) = if failures >= RUNTIME_MAX_CONSECUTIVE_FAILURES {
+                (
+                    true,
+                    format!("stopped after {failures} consecutive failed executions: {reason}"),
+                    chrono::Utc::now(),
+                )
+            } else {
+                (
+                    false,
+                    reason,
+                    chrono::Utc::now()
+                        + runtime_failure_backoff(runtime.interval_seconds, failures),
+                )
+            };
+            state
+                .store
+                .record_agent_runtime_failure(
+                    runtime.id,
+                    stop,
+                    failed.id,
+                    failures,
+                    &message,
+                    next_run_at,
+                )
+                .await?;
+            return Ok(());
+        }
+    }
+
+    // An unknown harness is a property of the runtime row itself and can never heal:
+    // stop the runtime instead of retrying forever.
+    let harness_kind = runtime
+        .harness_kind
+        .parse::<orbit_domain::HarnessKind>()
+        .map_err(|_| {
+            RuntimeTickError::Permanent(format!(
+                "runtime has an unknown harness '{}'",
+                runtime.harness_kind
+            ))
+        })?;
+    // A missing version or a spec that no longer parses can be fixed by editing the
+    // agent, so these back off and recover on their own.
+    let version = state
+        .store
+        .get_current_version(runtime.org_id, &agent)
+        .await
+        .map_err(|error| RuntimeTickError::Transient(error.into()))?;
+    let spec: orbit_domain::AgentSpec =
+        serde_json::from_value(version.spec.clone()).map_err(|error| {
+            RuntimeTickError::Transient(anyhow::anyhow!("agent spec is invalid: {error}"))
+        })?;
+    // Shared execution preflight (#140) for the runtime creator (falling back to the
+    // agent owner). Lost access stops the runtime with a recorded error; an unavailable
+    // harness or exhausted hourly quota delays the next tick.
+    let access = crate::preflight::background_access(
+        state,
+        runtime.org_id,
+        &[runtime.created_by, agent.owner_user_id],
+    )
+    .await;
+    let denied = match &access {
+        Err(error) => Some(error.clone()),
+        Ok(Some(access)) => crate::preflight::Preflight {
+            state,
+            org_id: runtime.org_id,
+            access,
+            agent: &agent,
+            spec: &spec,
+            harness: harness_kind,
+            extra_connection_ids: &[],
+        }
+        .authorize_access()
+        .await
+        .err(),
+        Ok(None) => None,
+    };
+    if let Some(error) = denied {
+        crate::preflight::audit_denied_run(
+            state,
+            runtime.org_id,
+            "runtime.run_denied",
+            "agent",
+            agent.id,
+            &error,
+            runtime.created_by.or(agent.owner_user_id),
+        )
+        .await;
+        let _ = state
+            .store
+            .halt_agent_runtime(runtime.id, &format!("run refused: {}", error.message))
+            .await;
+        return Ok(());
+    }
+    let delayed = match crate::preflight::require_harness_available(
+        state,
+        runtime.org_id,
+        harness_kind,
+    )
+    .await
+    {
+        Ok(()) => {
+            crate::preflight::require_hourly_quota(state, runtime.org_id, agent.id, &spec).await
+        }
+        Err(error) => Err(error),
+    };
+    if let Err(error) = delayed {
+        let _ = state
+            .store
+            .advance_agent_runtime(
+                runtime.id,
+                Some(&format!("run delayed: {}", error.message)),
+                chrono::Utc::now()
+                    + chrono::Duration::seconds(runtime.interval_seconds.max(30) as i64),
+            )
+            .await;
+        return Ok(());
+    }
+    let input = serde_json::json!({
+        "task": runtime.task,
+        "payload": { "runtimeId": runtime.id },
+        "provenance": {
+            "source": "runtime",
+            "trusted": true,
+            "subject": runtime.id,
+            "receivedAt": Utc::now(),
+        },
+    });
+    // Deterministic per tick: the previous execution id only changes once the runtime row
+    // is updated below, so a retry after a partial failure reuses the same execution.
+    let idempotency_key = runtime_tick_key(runtime.id, runtime.last_execution_id);
+    let execution = state
+        .store
+        .create_execution(orbit_store::executions::NewExecution {
+            org_id: runtime.org_id,
+            agent_id: agent.id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind,
+            trigger_source: TriggerSource::Manual,
+            placement: spec
+                .harness
+                .as_ref()
+                .map(|harness| harness.placement.as_str())
+                .unwrap_or("auto"),
+            trigger_id: None,
+            input,
+            session_ref: last
+                .as_ref()
+                .and_then(|execution| execution.session_ref.as_deref()),
+            skills: &[],
+            timeout_seconds: spec.resources.timeout_seconds,
+            requested_by: runtime.created_by,
+            idempotency_key: Some(&idempotency_key),
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .map_err(|error| RuntimeTickError::Transient(error.into()))?;
+    // Does not touch `status`. If the runtime was stopped while this tick was in flight
+    // the write is refused: cancel the execution so nothing keeps running for it.
+    let recorded = state
+        .store
+        .record_agent_runtime_launch(
+            runtime.id,
+            execution.id,
+            last_failed.is_none(),
+            chrono::Utc::now() + chrono::Duration::seconds(runtime.interval_seconds as i64),
+        )
+        .await?;
+    if recorded.is_none() {
+        let _ = state
+            .store
+            .request_execution_cancel(runtime.org_id, execution.id)
+            .await;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audit_retention_days;
+
+    #[test]
+    fn audit_retention_parsing() {
+        assert_eq!(audit_retention_days(None), None);
+        assert_eq!(audit_retention_days(Some("")), None);
+        assert_eq!(audit_retention_days(Some("90")), Some(90));
+        assert_eq!(audit_retention_days(Some("0")), None);
+        assert_eq!(audit_retention_days(Some("abc")), None);
+    }
 }

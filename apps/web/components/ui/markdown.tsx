@@ -1,4 +1,4 @@
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { cn } from "@/lib/utils";
 
@@ -6,7 +6,16 @@ import { cn } from "@/lib/utils";
  * Agent answers are Markdown. Rendered with the same type scale as the rest of the
  * app; raw HTML in the source is not interpreted, so untrusted output stays inert.
  */
-export function Markdown({ children, className }: { children: string; className?: string }) {
+export function Markdown({
+  children,
+  className,
+  components,
+}: {
+  children: string;
+  className?: string;
+  /** Overrides for individual elements, merged over the defaults (used by the docs reader). */
+  components?: Components;
+}) {
   return (
     <div className={cn("min-w-0 break-words text-sm leading-relaxed", className)}>
       <ReactMarkdown
@@ -45,6 +54,7 @@ export function Markdown({ children, className }: { children: string; className?
             <th className="border-b bg-subtle px-3 py-1.5 text-left font-medium text-muted-foreground" {...props} />
           ),
           td: (props) => <td className="border-b px-3 py-1.5 align-top last:border-b-0" {...props} />,
+          ...components,
         }}
       >
         {children}

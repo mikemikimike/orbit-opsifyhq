@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Optional worker launcher: Docker socket or namespaced Kubernetes workload RBAC.
-FROM rust:1-bookworm AS builder
+FROM rust:1.100-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
@@ -17,8 +17,11 @@ RUN apt-get update \
        | tar -xz --strip-components=1 -C /usr/local/bin docker/docker \
     && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
        -o /usr/local/bin/kubectl \
-    && chmod 0755 /usr/local/bin/kubectl
+    && chmod 0755 /usr/local/bin/kubectl \
+    && groupadd --gid 10001 orbit \
+    && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/orbit --shell /usr/sbin/nologin orbit
 COPY --from=builder /app/target/release/orbit-launcher /usr/local/bin/orbit-launcher
+USER 10001:10001
 EXPOSE 8090
 ENV ORBIT_LAUNCHER_ADDR=0.0.0.0:8090
 ENTRYPOINT ["/usr/local/bin/orbit-launcher"]

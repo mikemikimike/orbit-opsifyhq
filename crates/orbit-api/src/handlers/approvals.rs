@@ -40,31 +40,17 @@ pub async fn list_approvals(
         }
     }
     let access = crate::access::AccessScope::load(&state, &auth).await?;
+    let store_access = access.store_access();
     let approvals = state
         .store
         .list_approvals(
             auth.org_id,
             status,
             query.limit.unwrap_or(50).clamp(1, 200) as i64,
+            Some(&store_access),
         )
         .await?;
-    let mut visible = Vec::with_capacity(approvals.len());
-    for approval in approvals {
-        let Ok(execution) = state
-            .store
-            .get_execution(auth.org_id, approval.approval.execution_id)
-            .await
-        else {
-            continue;
-        };
-        let Ok(agent) = state.store.get_agent(auth.org_id, execution.agent_id).await else {
-            continue;
-        };
-        if access.can_view(agent.owner_user_id, agent.owner_team_id, &agent.visibility) {
-            visible.push(approval);
-        }
-    }
-    Ok(Json(visible))
+    Ok(Json(approvals))
 }
 
 #[utoipa::path(post, path = "/api/v1/approvals/{approval_id}/approve", tag = "approvals", request_body = ApprovalDecisionRequest, responses((status = 200, body = Approval)))]
@@ -105,12 +91,42 @@ async fn decide(
         .get_agent(auth.org_id, execution.agent_id)
         .await?;
     let access = crate::access::AccessScope::load(&state, &auth).await?;
-    access.require_view(
+    // Deciding lets the agent run a gated action, so it needs the same access as running
+    // the agent (use/manage), not just visibility. Invisible agents stay 404.
+    access.require_use(
         "approval",
         agent.owner_user_id,
         agent.owner_team_id,
         &agent.visibility,
     )?;
+    // An expired approval is reported as expired even when four-eyes would also refuse
+    // it; the row is marked expired by the same conditional update.
+    if existing
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= chrono::Utc::now())
+    {
+        let _ = state
+            .store
+            .decide_approval(
+                auth.org_id,
+                approval_id,
+                decision,
+                auth.user_id,
+                comment.as_deref(),
+            )
+            .await;
+        return Err(ApiError::conflict("approval expired"));
+    }
+    // Optional four-eyes policy: whoever requested the execution cannot decide it.
+    if execution.requested_by == Some(auth.user_id)
+        && crate::handlers::settings::load_approvals_settings(&state.store)
+            .await?
+            .approvals_require_different_approver
+    {
+        return Err(ApiError::forbidden(
+            "approvals require a different approver than the user who requested the execution",
+        ));
+    }
     let approval = state
         .store
         .decide_approval(

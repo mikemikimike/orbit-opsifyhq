@@ -48,14 +48,6 @@ impl Store {
             .ok_or_else(|| StoreError::NotFound("organization".into()))
     }
 
-    pub async fn get_organization_by_slug(&self, slug: &str) -> StoreResult<Organization> {
-        sqlx::query_as::<_, Organization>("SELECT * FROM organizations WHERE slug = $1")
-            .bind(slug)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| StoreError::NotFound(format!("organization '{slug}'")))
-    }
-
     /// The first organization is the default tenant in single-tenant self-hosted setups.
     pub async fn first_organization(&self) -> StoreResult<Option<Organization>> {
         Ok(sqlx::query_as::<_, Organization>(
@@ -63,26 +55,6 @@ impl Store {
         )
         .fetch_optional(&self.pool)
         .await?)
-    }
-
-    pub async fn update_organization(
-        &self,
-        org_id: Uuid,
-        name: Option<&str>,
-    ) -> StoreResult<Organization> {
-        sqlx::query_as::<_, Organization>(
-            r#"
-            UPDATE organizations
-            SET name = COALESCE($2, name), updated_at = now()
-            WHERE id = $1
-            RETURNING *
-            "#,
-        )
-        .bind(org_id)
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("organization".into()))
     }
 
     // ---------------------------------------------------------------------- users

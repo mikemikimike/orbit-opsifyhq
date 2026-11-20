@@ -25,16 +25,49 @@ pub struct TeamQueueItem {
 }
 
 impl Store {
+    /// Most recent `limit` items for a team, returned oldest-first.
     pub async fn list_team_queue(
         &self,
         org_id: Uuid,
         team_id: Uuid,
+        limit: i64,
     ) -> StoreResult<Vec<TeamQueueItem>> {
         Ok(sqlx::query_as::<_, TeamQueueItem>(
-            "SELECT * FROM team_queue_items WHERE org_id = $1 AND team_id = $2 ORDER BY created_at ASC",
+            r#"
+            SELECT * FROM (
+                SELECT * FROM team_queue_items
+                WHERE org_id = $1 AND team_id = $2
+                ORDER BY created_at DESC, id DESC
+                LIMIT $3
+            ) recent
+            ORDER BY created_at ASC, id ASC
+            "#,
         )
         .bind(org_id)
         .bind(team_id)
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Oldest pending items first; what the auto-run loop needs.
+    pub async fn list_pending_team_queue(
+        &self,
+        org_id: Uuid,
+        team_id: Uuid,
+        limit: i64,
+    ) -> StoreResult<Vec<TeamQueueItem>> {
+        Ok(sqlx::query_as::<_, TeamQueueItem>(
+            r#"
+            SELECT * FROM team_queue_items
+            WHERE org_id = $1 AND team_id = $2 AND status = 'pending'
+            ORDER BY created_at ASC, id ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(org_id)
+        .bind(team_id)
+        .bind(limit.clamp(1, 1000))
         .fetch_all(&self.pool)
         .await?)
     }
@@ -99,11 +132,18 @@ impl Store {
         .map_err(Into::into)
     }
 
-    pub async fn list_team_queue_external_keys(&self, team_id: Uuid) -> StoreResult<Vec<String>> {
+    /// Most recent external keys for dedupe. Bounded; `try_enqueue_team_item` remains the
+    /// authoritative dedupe (`ON CONFLICT DO NOTHING`).
+    pub async fn list_team_queue_external_keys(
+        &self,
+        team_id: Uuid,
+        limit: i64,
+    ) -> StoreResult<Vec<String>> {
         Ok(sqlx::query_scalar::<_, String>(
-            "SELECT external_key FROM team_queue_items WHERE team_id = $1",
+            "SELECT external_key FROM team_queue_items WHERE team_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2",
         )
         .bind(team_id)
+        .bind(limit.clamp(1, 20_000))
         .fetch_all(&self.pool)
         .await?)
     }
@@ -135,40 +175,145 @@ impl Store {
         .ok_or_else(|| StoreError::NotFound("team queue item".into()))
     }
 
-    pub async fn set_team_queue_run(
+    /// Atomically claim a `pending`/`failed` item for starting a run. Exactly one caller wins.
+    pub async fn claim_team_queue_item(
+        &self,
+        org_id: Uuid,
+        item_id: Uuid,
+    ) -> StoreResult<Option<TeamQueueItem>> {
+        Ok(sqlx::query_as::<_, TeamQueueItem>(
+            r#"
+            UPDATE team_queue_items
+            SET status = 'running', error = NULL, team_run_id = NULL, updated_at = now()
+            WHERE org_id = $1 AND id = $2 AND status IN ('pending', 'failed')
+            RETURNING *
+            "#,
+        )
+        .bind(org_id)
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Attach the run created for a claimed item. False when the claim was lost
+    /// (cancelled, or already attached).
+    pub async fn attach_team_run_to_queue_item(
         &self,
         org_id: Uuid,
         item_id: Uuid,
         team_run_id: Uuid,
-        status: &str,
-    ) -> StoreResult<()> {
-        sqlx::query(
-            "UPDATE team_queue_items SET team_run_id = $3, status = $4, updated_at = now() WHERE org_id = $1 AND id = $2",
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE team_queue_items
+            SET team_run_id = $3, updated_at = now()
+            WHERE org_id = $1 AND id = $2 AND status = 'running' AND team_run_id IS NULL
+            "#,
         )
         .bind(org_id)
         .bind(item_id)
         .bind(team_run_id)
-        .bind(status)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
-    pub async fn set_team_queue_status_by_run(
+    /// A claimed item whose run could not be started: detach and make it retryable.
+    pub async fn fail_claimed_team_queue_item(
+        &self,
+        org_id: Uuid,
+        item_id: Uuid,
+        error: &str,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE team_queue_items
+            SET status = 'failed', error = $3, team_run_id = NULL, updated_at = now()
+            WHERE org_id = $1 AND id = $2 AND status = 'running'
+            "#,
+        )
+        .bind(org_id)
+        .bind(item_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Items claimed (`running`) that never got a run attached, e.g. the process died
+    /// between the claim and run creation. Returns them to `pending`.
+    pub async fn release_stale_team_queue_claims(&self, older_than_secs: i64) -> StoreResult<u64> {
+        let result = sqlx::query(
+            r#"
+            UPDATE team_queue_items
+            SET status = 'pending', error = 'start interrupted; re-queued', updated_at = now()
+            WHERE status = 'running' AND team_run_id IS NULL
+              AND updated_at < now() - make_interval(secs => $1::double precision)
+            "#,
+        )
+        .bind(older_than_secs as f64)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Close a `running` item once its run's outcome has been applied.
+    pub async fn close_team_queue_item_by_run(
         &self,
         team_run_id: Uuid,
         status: &str,
         error: Option<&str>,
-    ) -> StoreResult<()> {
-        sqlx::query(
-            "UPDATE team_queue_items SET status = $2, error = $3, updated_at = now() WHERE team_run_id = $1",
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "UPDATE team_queue_items SET status = $2, error = $3, updated_at = now() WHERE team_run_id = $1 AND status = 'running'",
         )
         .bind(team_run_id)
         .bind(status)
         .bind(error)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// A run failed and attempts remain: back to `pending`, consuming an attempt.
+    pub async fn release_team_queue_item_for_retry(
+        &self,
+        team_run_id: Uuid,
+        error: Option<&str>,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE team_queue_items
+            SET status = 'pending', error = $2, attempts = attempts + 1,
+                team_run_id = NULL, updated_at = now()
+            WHERE team_run_id = $1 AND status = 'running'
+            "#,
+        )
+        .bind(team_run_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Terminal runs whose queue item is still `running`: the outcome was never
+    /// (fully) applied and must be retried.
+    pub async fn list_team_runs_pending_outcome(
+        &self,
+        limit: i64,
+    ) -> StoreResult<Vec<crate::TeamRun>> {
+        Ok(sqlx::query_as::<_, crate::TeamRun>(
+            r#"
+            SELECT r.* FROM team_runs r
+            JOIN team_queue_items q ON q.team_run_id = r.id
+            WHERE q.status = 'running' AND r.status IN ('succeeded', 'failed', 'cancelled')
+            ORDER BY r.updated_at ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn set_team_queue_status(
@@ -193,19 +338,38 @@ impl Store {
         Ok(())
     }
 
-    /// Return a failed item to pending for another attempt.
+    /// Delete an item that is still pending (used to undo an enqueue whose source claim failed).
+    pub async fn delete_pending_team_queue_item(
+        &self,
+        org_id: Uuid,
+        item_id: Uuid,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "DELETE FROM team_queue_items WHERE org_id = $1 AND id = $2 AND status = 'pending'",
+        )
+        .bind(org_id)
+        .bind(item_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Manual retry of a `failed`/`cancelled` item, consuming an attempt.
+    /// `None` when the item is not retryable (wrong status or attempts exhausted).
     pub async fn retry_team_queue_item(
         &self,
         org_id: Uuid,
         item_id: Uuid,
         error: Option<&str>,
-    ) -> StoreResult<TeamQueueItem> {
-        sqlx::query_as::<_, TeamQueueItem>(
+    ) -> StoreResult<Option<TeamQueueItem>> {
+        Ok(sqlx::query_as::<_, TeamQueueItem>(
             r#"
             UPDATE team_queue_items
             SET status = 'pending', error = $3, attempts = attempts + 1,
                 team_run_id = NULL, updated_at = now()
             WHERE org_id = $1 AND id = $2
+              AND status IN ('failed', 'cancelled')
+              AND attempts < max_attempts
             RETURNING *
             "#,
         )
@@ -213,43 +377,43 @@ impl Store {
         .bind(item_id)
         .bind(error)
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("team queue item".into()))
+        .await?)
     }
 
-    /// Manual requeue: pending again without consuming an attempt.
+    /// Manual requeue: pending again without consuming an attempt. Never revives
+    /// `succeeded` or `running` items.
     pub async fn requeue_team_queue_item(
         &self,
         org_id: Uuid,
         item_id: Uuid,
-    ) -> StoreResult<TeamQueueItem> {
-        sqlx::query_as::<_, TeamQueueItem>(
+    ) -> StoreResult<Option<TeamQueueItem>> {
+        Ok(sqlx::query_as::<_, TeamQueueItem>(
             r#"
             UPDATE team_queue_items
             SET status = 'pending', error = NULL, team_run_id = NULL, updated_at = now()
-            WHERE org_id = $1 AND id = $2
+            WHERE org_id = $1 AND id = $2 AND status IN ('pending', 'failed', 'cancelled')
             RETURNING *
             "#,
         )
         .bind(org_id)
         .bind(item_id)
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("team queue item".into()))
+        .await?)
     }
 
-    /// Cancel a queued/running item and detach any in-flight run link.
+    /// Cancel a pending/running/failed item and detach any in-flight run link.
+    /// `None` when it is already terminal (`succeeded`/`cancelled`).
     pub async fn cancel_team_queue_item(
         &self,
         org_id: Uuid,
         item_id: Uuid,
         error: Option<&str>,
-    ) -> StoreResult<TeamQueueItem> {
-        sqlx::query_as::<_, TeamQueueItem>(
+    ) -> StoreResult<Option<TeamQueueItem>> {
+        Ok(sqlx::query_as::<_, TeamQueueItem>(
             r#"
             UPDATE team_queue_items
             SET status = 'cancelled', error = $3, team_run_id = NULL, updated_at = now()
-            WHERE org_id = $1 AND id = $2
+            WHERE org_id = $1 AND id = $2 AND status IN ('pending', 'running', 'failed')
             RETURNING *
             "#,
         )
@@ -257,7 +421,6 @@ impl Store {
         .bind(item_id)
         .bind(error)
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("team queue item".into()))
+        .await?)
     }
 }

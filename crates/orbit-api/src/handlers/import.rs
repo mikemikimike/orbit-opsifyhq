@@ -143,6 +143,14 @@ pub async fn import_markdown(
             if !report.is_valid() {
                 return Err(ApiError::validation(report.issues));
             }
+            let access = crate::access::AccessScope::load(&state, &auth).await?;
+            crate::preflight::require_spec_references_use(
+                &state,
+                auth.org_id,
+                &access,
+                &definition.spec,
+            )
+            .await?;
             let (agent, _) = state
                 .store
                 .create_agent(auth.org_id, Some(auth.user_id), &definition)

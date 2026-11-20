@@ -22,9 +22,35 @@ pub struct AccessScope {
 
 impl AccessScope {
     pub async fn load(state: &AppState, auth: &AuthContext) -> Result<Self, ApiError> {
+        Self::build(state, auth.org_id, auth.user_id, auth.role).await
+    }
+
+    /// Access scope for a stored user identity, for code paths that run without an HTTP
+    /// caller (scheduler, runtime ticks, team step advancement). Disabled users get
+    /// `403`. Custom-role users are treated like viewers for resource scoping, matching
+    /// how request authentication resolves them.
+    pub async fn load_for_user(
+        state: &AppState,
+        org_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Self, ApiError> {
+        let user = state.store.get_user(org_id, user_id).await?;
+        if user.status != "active" {
+            return Err(ApiError::forbidden("user is disabled"));
+        }
+        let role = user.role.parse::<UserRole>().unwrap_or(UserRole::Viewer);
+        Self::build(state, org_id, user_id, role).await
+    }
+
+    async fn build(
+        state: &AppState,
+        org_id: Uuid,
+        user_id: Uuid,
+        role: UserRole,
+    ) -> Result<Self, ApiError> {
         let teams = state
             .store
-            .list_user_team_roles(auth.org_id, auth.user_id)
+            .list_user_team_roles(org_id, user_id)
             .await?
             .into_iter()
             .collect();
@@ -37,14 +63,14 @@ impl AccessScope {
             .and_then(|value| value.get("enabled").and_then(|enabled| enabled.as_bool()))
             .unwrap_or(true);
         Ok(Self {
-            user_id: auth.user_id,
-            role: auth.role,
+            user_id,
+            role,
             teams,
             team_isolation,
         })
     }
 
-    fn is_privileged(&self) -> bool {
+    pub fn is_privileged(&self) -> bool {
         matches!(self.role, UserRole::Owner | UserRole::Admin)
     }
 

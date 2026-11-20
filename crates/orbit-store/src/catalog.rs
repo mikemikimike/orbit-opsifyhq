@@ -79,27 +79,6 @@ impl Store {
         .await?)
     }
 
-    pub async fn set_harness_enabled(
-        &self,
-        org_id: Uuid,
-        kind: &str,
-        enabled: bool,
-    ) -> StoreResult<HarnessRecord> {
-        sqlx::query_as::<_, HarnessRecord>(
-            r#"
-            UPDATE harnesses SET enabled = $3, updated_at = now()
-            WHERE (org_id IS NULL OR org_id = $1) AND kind = $2
-            RETURNING *
-            "#,
-        )
-        .bind(org_id)
-        .bind(kind)
-        .bind(enabled)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("harness".into()))
-    }
-
     // ------------------------------------------------------------------- providers
 
     pub async fn create_provider(
@@ -306,21 +285,6 @@ impl Store {
         .await?)
     }
 
-    pub async fn get_connector(
-        &self,
-        org_id: Uuid,
-        connector_id: Uuid,
-    ) -> StoreResult<ConnectorRecord> {
-        sqlx::query_as::<_, ConnectorRecord>(
-            "SELECT * FROM connectors WHERE (org_id IS NULL OR org_id = $1) AND id = $2",
-        )
-        .bind(org_id)
-        .bind(connector_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("connector".into()))
-    }
-
     // ----------------------------------------------------------------- connections
 
     #[allow(clippy::too_many_arguments)]
@@ -451,28 +415,6 @@ impl Store {
         )
         .bind(org_id)
         .bind(connection_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("connection".into()))
-    }
-
-    pub async fn set_connection_status(
-        &self,
-        org_id: Uuid,
-        connection_id: Uuid,
-        status: &str,
-    ) -> StoreResult<Connection> {
-        sqlx::query_as::<_, Connection>(
-            r#"
-            UPDATE connections
-            SET status = $3, updated_at = now(), last_checked_at = now()
-            WHERE org_id = $1 AND id = $2
-            RETURNING *
-            "#,
-        )
-        .bind(org_id)
-        .bind(connection_id)
-        .bind(status)
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| StoreError::NotFound("connection".into()))

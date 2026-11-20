@@ -44,11 +44,13 @@ fn resolve_dev(state: &AppState, token: Option<&str>) -> Result<AuthContext, Api
         .dev_identity
         .as_ref()
         .ok_or_else(|| ApiError::internal("dev identity was not initialized"))?;
-    let dev_token = token == Some(state.auth.dev.dev_token.as_str());
+    let dev_token = token.is_some_and(|t| constant_time_eq(t, &state.auth.dev.dev_token));
     let anonymous = state.auth.dev.allow_anonymous;
-    // In dev mode a presented token that is not the dev token is still accepted when
-    // anonymous access is enabled, so the web app works without token plumbing.
-    if !dev_token && !anonymous && token.is_none() {
+    // With anonymous access disabled only the exact dev token authenticates (a missing
+    // or wrong token is rejected). With anonymous access enabled any request, including
+    // one carrying a non-dev token, is accepted so the web app works without token
+    // plumbing.
+    if !dev_token && !anonymous {
         return Err(ApiError::unauthorized("authentication required"));
     }
     Ok(AuthContext {
@@ -65,6 +67,12 @@ fn resolve_dev(state: &AppState, token: Option<&str>) -> Result<AuthContext, Api
         scopes: vec![],
         token_id: None,
     })
+}
+
+/// Constant-time string equality (length is not hidden; the dev token length is not secret).
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn resolve_api_token(state: &AppState, token: &str) -> Result<AuthContext, ApiError> {
@@ -139,18 +147,23 @@ async fn resolve_oidc(state: &AppState, token: Option<&str>) -> Result<AuthConte
         .await?
     {
         Some(user) => {
-            // Sync only when the IdP actually returned role values; a token without the
-            // claim must not silently downgrade an existing user.
-            if oidc.sync_roles && !identity.groups.is_empty() && user.role != target_role.as_str() {
+            // Only a matched group mapping may change an existing user's role; unmapped
+            // groups or a missing claim keep manually assigned (and custom) roles.
+            if let Some(new_role) = synced_role(
+                &user.role,
+                mapped_role,
+                oidc.sync_roles,
+                !identity.groups.is_empty(),
+            ) {
                 tracing::info!(
                     user_id = %user.id,
                     from = %user.role,
-                    to = %target_role.as_str(),
+                    to = %new_role.as_str(),
                     "syncing OIDC role from group mapping"
                 );
                 state
                     .store
-                    .set_user_role(user.org_id, user.id, target_role)
+                    .set_user_role(user.org_id, user.id, new_role)
                     .await?
             } else {
                 user
@@ -298,5 +311,65 @@ pub fn oidc_public_config(state: &AppState) -> serde_json::Value {
             "devUser": state.auth.dev.email,
             "anonymousAllowed": state.auth.dev.allow_anonymous,
         }),
+    }
+}
+
+/// Role an existing user should be changed to on OIDC login, if any. Only a matched group
+/// mapping may change the stored role; unmapped groups, an absent claim or sync being off
+/// leave it (including admin-assigned and custom roles) untouched.
+fn synced_role(
+    current: &str,
+    mapped: Option<UserRole>,
+    sync_roles: bool,
+    has_groups: bool,
+) -> Option<UserRole> {
+    let mapped = mapped?;
+    (sync_roles && has_groups && current != mapped.as_str()).then_some(mapped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unmapped_groups_keep_existing_role() {
+        assert_eq!(synced_role("operator", None, true, true), None);
+        assert_eq!(synced_role("custom-role", None, true, true), None);
+    }
+
+    #[test]
+    fn mapped_group_changes_role_up_and_down() {
+        assert_eq!(
+            synced_role("viewer", Some(UserRole::Admin), true, true),
+            Some(UserRole::Admin)
+        );
+        assert_eq!(
+            synced_role("admin", Some(UserRole::Viewer), true, true),
+            Some(UserRole::Viewer)
+        );
+        assert_eq!(
+            synced_role("custom-role", Some(UserRole::Operator), true, true),
+            Some(UserRole::Operator)
+        );
+    }
+
+    #[test]
+    fn matching_role_is_not_rewritten() {
+        assert_eq!(
+            synced_role("admin", Some(UserRole::Admin), true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn no_groups_or_sync_off_changes_nothing() {
+        assert_eq!(
+            synced_role("viewer", Some(UserRole::Admin), true, false),
+            None
+        );
+        assert_eq!(
+            synced_role("viewer", Some(UserRole::Admin), false, true),
+            None
+        );
     }
 }

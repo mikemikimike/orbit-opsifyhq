@@ -1,6 +1,12 @@
 name: orbit
 
 # Local development stack. Production/Kubernetes uses the Helm chart, not this file.
+# Postgres and NATS are bound to 127.0.0.1 so their dev credentials are never reachable
+# from other hosts. The launcher (Docker socket, dev token) and the NATS monitor are not
+# published at all; the API reaches the launcher over the Compose network. The API and
+# web stay on all interfaces because worker containers started by the launcher reach the
+# API through host.docker.internal (the bridge IP on Linux); they run dev auth, so don't
+# expose this stack on an untrusted network.
 #   docker compose -f deploy/compose/compose.yaml up --build
 
 services:
@@ -11,7 +17,7 @@ services:
       POSTGRES_PASSWORD: orbit
       POSTGRES_DB: orbit
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - orbit-db:/var/lib/postgresql/data
     healthcheck:
@@ -25,8 +31,7 @@ services:
     image: nats:2.11-alpine
     command: ["-js", "-sd", "/data", "-m", "8222"]
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - "127.0.0.1:4222:4222"
     volumes:
       - orbit-nats:/data
     restart: unless-stopped
@@ -53,7 +58,7 @@ services:
       ORBIT_LAUNCHER_TOKEN: ${ORBIT_LAUNCHER_TOKEN:-orbit-dev-launcher-token}
       ORBIT_LOG_FORMAT: ${ORBIT_LOG_FORMAT:-text}
     ports:
-      - "8080:8080"
+      - "8080:8080"  # all interfaces: launcher-started worker containers reach the API via host.docker.internal (bridge IP on Linux)
     depends_on:
       db:
         condition: service_healthy
@@ -86,6 +91,9 @@ services:
     restart: unless-stopped
 
   launcher:
+    # Not published on the host: it controls the Docker socket. The default token below
+    # is a documented dev value that is only reachable on the Compose network; set
+    # ORBIT_LAUNCHER_TOKEN outside local development.
     build:
       context: ../..
       dockerfile: deploy/docker/launcher.Dockerfile
@@ -99,11 +107,14 @@ services:
       ORBIT_PI_AGENT_HOST_DIR: ${ORBIT_PI_AGENT_HOST_DIR:-}
       ORBIT_LAUNCHER_IMAGE_ALIASES: ${ORBIT_LAUNCHER_IMAGE_ALIASES:-}
       ORBIT_LOG_FORMAT: ${ORBIT_LOG_FORMAT:-text}
+    # The image runs as UID 10001; it needs the group that owns the Docker socket.
+    # Docker Desktop exposes the socket to group 0; on Linux set DOCKER_GID to
+    # `stat -c %g /var/run/docker.sock`.
+    group_add:
+      - "${DOCKER_GID:-0}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ../../.orbit-auth-export.json:/auth/auth-export.json:ro
-    ports:
-      - "8090:8090"
     restart: unless-stopped
 
   web:

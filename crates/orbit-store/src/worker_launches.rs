@@ -17,12 +17,14 @@ impl Store {
         image: &str,
         worker_token_id: Option<Uuid>,
         created_by: Option<Uuid>,
+        single_execution: bool,
     ) -> StoreResult<WorkerLaunch> {
         sqlx::query_as::<_, WorkerLaunch>(
             r#"
             INSERT INTO worker_launches
-                (id, org_id, profile_id, name, target, image, worker_token_id, created_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (id, org_id, profile_id, name, target, image, worker_token_id, created_by,
+                 single_execution)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             RETURNING *
             "#,
         )
@@ -34,9 +36,43 @@ impl Store {
         .bind(image)
         .bind(worker_token_id)
         .bind(created_by)
+        .bind(single_execution)
         .fetch_one(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// Mark a launch as existing for exactly one execution.
+    pub async fn set_worker_launch_single_execution(
+        &self,
+        launch_id: Uuid,
+        execution_id: Uuid,
+    ) -> StoreResult<()> {
+        sqlx::query("UPDATE worker_launches SET single_execution_id = $2 WHERE id = $1")
+            .bind(launch_id)
+            .bind(execution_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Revoke the worker tokens of single-execution launches whose execution is terminal.
+    /// Returns the revoked token ids.
+    pub async fn revoke_finished_single_execution_tokens(&self) -> StoreResult<Vec<Uuid>> {
+        Ok(sqlx::query_scalar::<_, Uuid>(
+            r#"
+            UPDATE worker_tokens t
+            SET revoked_at = now()
+            FROM worker_launches l
+            JOIN executions e ON e.id = l.single_execution_id
+            WHERE l.worker_token_id = t.id
+              AND t.revoked_at IS NULL
+              AND e.status IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'rejected')
+            RETURNING t.id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn get_worker_launch(
@@ -52,6 +88,52 @@ impl Store {
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| StoreError::NotFound("worker launch".into()))
+    }
+
+    /// The live (pending/starting/running, not archived) long-lived launch of a profile.
+    /// Exact lookup: not subject to any list cap. Single-execution launches are excluded.
+    pub async fn find_live_launch_for_profile(
+        &self,
+        org_id: Uuid,
+        profile_id: Uuid,
+    ) -> StoreResult<Option<WorkerLaunch>> {
+        Ok(sqlx::query_as::<_, WorkerLaunch>(
+            r#"
+            SELECT * FROM worker_launches
+            WHERE org_id = $1 AND profile_id = $2
+              AND single_execution = false
+              AND archived_at IS NULL
+              AND status IN ('pending', 'starting', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(org_id)
+        .bind(profile_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    /// Every live (pending/starting/running, not archived) launch of a profile, including
+    /// single-execution launches. Uncapped.
+    pub async fn active_launches_for_profile(
+        &self,
+        org_id: Uuid,
+        profile_id: Uuid,
+    ) -> StoreResult<Vec<WorkerLaunch>> {
+        Ok(sqlx::query_as::<_, WorkerLaunch>(
+            r#"
+            SELECT * FROM worker_launches
+            WHERE org_id = $1 AND profile_id = $2
+              AND archived_at IS NULL
+              AND status IN ('pending', 'starting', 'running')
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(org_id)
+        .bind(profile_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn list_worker_launches(
@@ -89,6 +171,10 @@ impl Store {
         Ok(result.rows_affected())
     }
 
+    /// Update a launch's status. A launch that is already `stopped`/`failed` is never moved
+    /// back to a live status (a poll refresh can race a stop); in that case the current row
+    /// is returned unchanged. `error` is only overwritten when a new value is provided, and
+    /// `stopped_at` keeps its first value.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_worker_launch(
         &self,
@@ -103,17 +189,18 @@ impl Store {
     ) -> StoreResult<WorkerLaunch> {
         let started_at = started.then(Utc::now);
         let stopped_at = stopped.then(Utc::now);
-        sqlx::query_as::<_, WorkerLaunch>(
+        let updated = sqlx::query_as::<_, WorkerLaunch>(
             r#"
             UPDATE worker_launches
             SET status = $3,
                 runtime_id = COALESCE($4, runtime_id),
                 worker_id = COALESCE($5, worker_id),
-                error = $6,
+                error = COALESCE($6, error),
                 started_at = COALESCE($7, started_at),
-                stopped_at = COALESCE($8, stopped_at),
+                stopped_at = COALESCE(stopped_at, $8),
                 updated_at = now()
             WHERE org_id = $1 AND id = $2
+              AND (status NOT IN ('stopped', 'failed') OR $3 IN ('stopped', 'failed'))
             RETURNING *
             "#,
         )
@@ -126,8 +213,12 @@ impl Store {
         .bind(started_at)
         .bind(stopped_at)
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| StoreError::NotFound("worker launch".into()))
+        .await?;
+        match updated {
+            Some(launch) => Ok(launch),
+            // Guarded out (already terminal) or missing: return the current row / NotFound.
+            None => self.get_worker_launch(org_id, launch_id).await,
+        }
     }
 }
 

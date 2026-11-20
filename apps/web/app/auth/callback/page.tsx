@@ -6,6 +6,7 @@ import { Loader2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { completeOidcLogin } from "@/lib/oidc";
+import { safeNextPath } from "@/lib/safe-redirect";
 
 export default function OidcCallbackPage() {
   const router = useRouter();
@@ -13,7 +14,7 @@ export default function OidcCallbackPage() {
 
   useEffect(() => {
     void completeOidcLogin()
-      .then((next) => router.replace(next))
+      .then((next) => router.replace(safeNextPath(next)))
       .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, [router]);
 

@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::process_env::child_environment;
 use orbit_contracts::{
     CreateInstanceRequest, ExecutionOutcome, ExecutionRequest, HarnessAdapter, HarnessCapabilities,
     HarnessConfig, HarnessDescriptor, HarnessError, HarnessErrorKind, HarnessEvent,
@@ -24,7 +25,7 @@ use orbit_domain::{
 /// events to ORBIT harness events, captures the session id and applies a platform tool
 /// allowlist: autonomy levels 1–2 are read-only (no shell/edit/write).
 ///
-/// Tested against Pi **1.5.0** (see `tests/pi_e2e.rs`).
+/// Tested against Pi **1.5.2** (see `tests/pi_e2e.rs`).
 #[derive(Debug, Clone, Default)]
 pub struct PiHarnessAdapter;
 
@@ -39,7 +40,7 @@ pub struct PiSettings {
     /// Additional `--skill` directories/files. Skills are mounted/baked by the worker.
     pub skills: Vec<String>,
     pub extra_args: Vec<String>,
-    /// Optional persistent session directory (enables resume across executions).
+    /// Optional session directory, relative to (and confined to) the execution workspace.
     pub session_dir: Option<String>,
     pub debug_logs: Option<bool>,
     /// Execution-scoped MCP bridge injected by the worker's tool broker.
@@ -190,20 +191,36 @@ fn write_policy_extension(workspace: &Path) -> std::io::Result<PathBuf> {
     let path = dir.join("orbit-policy.ts");
     std::fs::write(
         &path,
-        r#"export default function (pi: any) {
+        r#"import { createHash } from "node:crypto";
+
+// Stable hash of tool name + canonical JSON (sorted keys); must match the broker's
+// `arguments_hash`. The broker rejects a call whose hash differs from its arguments.
+function canon(value: any): string {
+  if (Array.isArray(value)) return "[" + value.map(canon).join(",") + "]";
+  if (value && typeof value === "object") {
+    return "{" + Object.keys(value).filter((k) => value[k] !== undefined).sort()
+      .map((k) => JSON.stringify(k) + ":" + canon(value[k])).join(",") + "}";
+  }
+  return JSON.stringify(value ?? null);
+}
+
+export default function (pi: any) {
   pi.on("tool_call", async (event: any) => {
     const base = process.env.ORBIT_BROKER_URL;
     const token = process.env.ORBIT_BROKER_TOKEN;
     if (!base || !token) return { block: true, reason: "ORBIT policy broker is unavailable" };
-    const readOnly = ["read", "grep", "find", "ls", "codemode"].includes(event.toolName);
+    // The effect is derived by the broker from the tool name; it is never declared here.
+    const input = event.input ?? {};
+    const argumentsHash = createHash("sha256")
+      .update(event.toolName + "\u001f" + canon(input)).digest("hex");
     try {
       const response = await fetch(`${base.replace(/\/$/, "")}/policy`, {
         method: "POST",
         headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-        body: JSON.stringify({ tool: event.toolName, effect: readOnly ? "read" : "write", arguments: event.input }),
+        body: JSON.stringify({ tool: event.toolName, arguments: input, argumentsHash }),
       });
-      if (response.ok) return;
       const body = await response.json().catch(() => ({}));
+      if (response.ok) return;
       return { block: true, reason: body.reason ?? body.error ?? `ORBIT policy denied ${event.toolName}` };
     } catch (error) {
       return { block: true, reason: `ORBIT policy check failed: ${error}` };
@@ -221,7 +238,7 @@ impl PiHarnessAdapter {
             kind: HarnessKind::Pi,
             name: "Pi".into(),
             description:
-                "Pi coding-agent harness (headless JSON mode) with sessions, skills and platform-enforced read-only tools at low autonomy. Tested against Pi 1.5.0."
+                "Pi coding-agent harness (headless JSON mode) with sessions, skills and platform-enforced read-only tools at low autonomy. Tested against Pi 1.5.2."
                     .into(),
             capabilities: HarnessCapabilities {
                 supports_sessions: true,
@@ -232,7 +249,7 @@ impl PiHarnessAdapter {
                 supports_tool_events: true,
                 supports_usage_reporting: true,
                 harness_managed_providers: true,
-                supports_platform_providers: false,
+                supports_platform_providers: true,
                 execution_modes: vec![ExecutionMode::OnDemand],
                 max_timeout_seconds: 86_400,
                 max_memory_mb: 16_384,
@@ -247,7 +264,7 @@ impl PiHarnessAdapter {
                     "thinking": { "type": "string", "enum": ["off","minimal","low","medium","high","xhigh","max"] },
                     "skills": { "type": "array", "items": { "type": "string" }, "description": "Skill directories or files passed with --skill" },
                     "extraArgs": { "type": "array", "items": { "type": "string" } },
-                    "sessionDir": { "type": "string", "description": "Persistent directory for session files (resume)" },
+                    "sessionDir": { "type": "string", "description": "Session file directory, relative to the execution workspace (no absolute paths or '..')" },
                     "debugLogs": { "type": "boolean" }
                 }
             }),
@@ -258,7 +275,10 @@ impl PiHarnessAdapter {
     pub async fn probe(&self, settings: &PiSettings) -> Result<String, HarnessError> {
         let candidate = settings.binary();
         let mut command = Command::new(candidate);
-        command.arg("--version");
+        command
+            .arg("--version")
+            .env_clear()
+            .envs(child_environment(std::env::vars_os(), std::iter::empty()));
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         let output = tokio::time::timeout(Duration::from_secs(8), command.output())
@@ -323,12 +343,17 @@ fn write_pi_mcp_config(workspace: &Path, bridge: &PiMcpBridge) -> std::io::Resul
         return Ok(());
     }
     std::fs::create_dir_all(workspace.join(".pi"))?;
+    let environment = bridge
+        .environment
+        .keys()
+        .map(|name| (name.clone(), format!("${{{name}}}")))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let config = json!({
         "mcpServers": {
             "orbit": {
                 "command": bridge.command[0],
                 "args": bridge.command.iter().skip(1).cloned().collect::<Vec<_>>(),
-                "env": bridge.environment,
+                "env": environment,
                 "exposure": "direct",
                 "description": "ORBIT policy-enforcing GitHub tools"
             }
@@ -498,16 +523,23 @@ impl PiHarnessAdapter {
                 format!("could not create workspace {}: {e}", workspace.display()),
             )
         })?;
+        // `sessionDir` is agent-author input: it is relative to the execution workspace
+        // and confined to it (no absolute paths, `..` or symlink escapes).
         let session_dir = match &settings.session_dir {
-            Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-            _ => workspace.join(".pi-sessions"),
+            Some(dir) if !dir.trim().is_empty() => {
+                crate::paths::resolve_confined_dir(&workspace, dir).await?
+            }
+            _ => {
+                let default = workspace.join(".pi-sessions");
+                tokio::fs::create_dir_all(&default).await.map_err(|e| {
+                    HarnessError::new(
+                        HarnessErrorKind::Internal,
+                        format!("could not create Pi session dir: {e}"),
+                    )
+                })?;
+                default
+            }
         };
-        tokio::fs::create_dir_all(&session_dir).await.map_err(|e| {
-            HarnessError::new(
-                HarnessErrorKind::Internal,
-                format!("could not create Pi session dir: {e}"),
-            )
-        })?;
 
         if let Some(bridge) = &settings.orbit_mcp {
             write_pi_mcp_config(&workspace, bridge).map_err(|e| {
@@ -576,11 +608,23 @@ impl PiHarnessAdapter {
         let mut command = Command::new(settings.binary());
         command.args(&args);
         command.current_dir(&workspace);
+        let mut explicit_env = request
+            .extra_env
+            .iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect::<Vec<_>>();
         // Worker-profile connection mappings, resolved by the control plane.
-        command.envs(&request.extra_env);
         if let Some(bridge) = &settings.orbit_mcp {
-            command.envs(&bridge.environment);
+            explicit_env.extend(
+                bridge
+                    .environment
+                    .iter()
+                    .map(|(name, value)| (name.into(), value.into())),
+            );
         }
+        command
+            .env_clear()
+            .envs(child_environment(std::env::vars_os(), explicit_env));
         command.env("PWD", &workspace);
         // Pi must not perform model-catalog/version network calls in headless or
         // airgapped execution. Provider requests still go to the configured endpoint.
@@ -791,6 +835,11 @@ impl HarnessAdapter for PiHarnessAdapter {
                 if settings.extra_args.len() > 32 {
                     report.push("extraArgs", "at most 32 arguments");
                 }
+                if let Some(dir) = &settings.session_dir {
+                    if let Err(message) = crate::paths::validate_relative_subpath(dir) {
+                        report.push("sessionDir", message);
+                    }
+                }
                 if let Some(thinking) = &settings.thinking {
                     if !["off", "minimal", "low", "medium", "high", "xhigh", "max"]
                         .contains(&thinking.as_str())
@@ -894,6 +943,30 @@ impl HarnessAdapter for PiHarnessAdapter {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn validate_config_rejects_escaping_session_dir() {
+        let adapter = PiHarnessAdapter;
+        for bad in ["/var/lib/other", "../other-execution/.pi", "x/../../y"] {
+            let report = adapter
+                .validate_config(&HarnessConfig {
+                    kind: HarnessKind::Pi,
+                    settings: serde_json::json!({ "sessionDir": bad }),
+                })
+                .await;
+            assert!(
+                report.issues.iter().any(|i| i.path == "sessionDir"),
+                "{bad} accepted"
+            );
+        }
+        let ok = adapter
+            .validate_config(&HarnessConfig {
+                kind: HarnessKind::Pi,
+                settings: serde_json::json!({ "sessionDir": ".sessions/a" }),
+            })
+            .await;
+        assert!(ok.issues.iter().all(|i| i.path != "sessionDir"));
+    }
+
     #[test]
     fn cli_restricts_low_autonomy_to_read_only_tools() {
         let settings = PiSettings::default();
@@ -982,5 +1055,34 @@ mod platform_model_tests {
         assert_eq!(provider["models"][0]["id"], "internal-model");
         assert_eq!(provider["apiKey"], "$OPENAI_API_KEY");
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod mcp_config_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_config_references_environment_values_without_persisting_them() {
+        let workspace = std::env::temp_dir().join(format!("orbit-pi-mcp-{}", uuid::Uuid::now_v7()));
+        let bridge = PiMcpBridge {
+            command: vec!["orbit-worker".into(), "mcp-broker".into()],
+            environment: std::collections::BTreeMap::from([
+                ("ORBIT_BROKER_URL".into(), "http://127.0.0.1:1234".into()),
+                ("ORBIT_BROKER_TOKEN".into(), "broker-secret-value".into()),
+            ]),
+        };
+
+        write_pi_mcp_config(&workspace, &bridge).unwrap();
+
+        let path = workspace.join(".pi/mcp.json");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let config: Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(
+            config["mcpServers"]["orbit"]["env"]["ORBIT_BROKER_TOKEN"],
+            "${ORBIT_BROKER_TOKEN}"
+        );
+        assert!(!contents.contains("broker-secret-value"));
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }

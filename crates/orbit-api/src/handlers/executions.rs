@@ -42,6 +42,27 @@ async fn require_execution_view(
     Ok(execution)
 }
 
+/// Controlling an execution (cancel) needs use rights on its agent, not just view.
+async fn require_execution_use(
+    state: &AppState,
+    auth: &AuthContext,
+    execution_id: Uuid,
+) -> Result<ExecutionRecord, ApiError> {
+    let execution = state.store.get_execution(auth.org_id, execution_id).await?;
+    let agent = state
+        .store
+        .get_agent(auth.org_id, execution.agent_id)
+        .await?;
+    let access = crate::access::AccessScope::load(state, auth).await?;
+    access.require_use(
+        "execution",
+        agent.owner_user_id,
+        agent.owner_team_id,
+        &agent.visibility,
+    )?;
+    Ok(execution)
+}
+
 #[utoipa::path(get, path = "/api/v1/executions", tag = "executions", params(ExecutionListQuery), responses((status = 200, body = ExecutionPage)))]
 pub async fn list_executions(
     State(state): State<AppState>,
@@ -55,7 +76,8 @@ pub async fn list_executions(
         }
     }
     let access = crate::access::AccessScope::load(&state, &auth).await?;
-    let (items, next_cursor, _total) = state
+    let store_access = access.store_access();
+    let (items, next_cursor, total) = state
         .store
         .list_executions(
             auth.org_id,
@@ -64,21 +86,11 @@ pub async fn list_executions(
             query.status.as_deref(),
             query.agent_id,
             query.archived,
+            Some(&store_access),
         )
         .await?;
-    let mut visible = Vec::with_capacity(items.len());
-    for execution in items {
-        let agent = state
-            .store
-            .get_agent(auth.org_id, execution.agent_id)
-            .await?;
-        if access.can_view(agent.owner_user_id, agent.owner_team_id, &agent.visibility) {
-            visible.push(execution);
-        }
-    }
-    let total = visible.len() as i64;
     Ok(Json(ExecutionPage {
-        items: visible,
+        items,
         next_cursor,
         total,
     }))
@@ -142,6 +154,7 @@ pub async fn list_agent_executions(
             query.status.as_deref(),
             Some(agent_id),
             query.archived,
+            None,
         )
         .await?;
     Ok(Json(ExecutionPage {
@@ -183,21 +196,6 @@ pub async fn execute_agent(
     )?;
     let version = state.store.get_current_version(auth.org_id, &agent).await?;
     let spec = parse_spec(&version)?;
-    let access = crate::access::AccessScope::load(&state, &auth).await?;
-    for binding in &spec.connectors {
-        if let Some(connection_id) = binding.connection_id {
-            let connection = state
-                .store
-                .get_connection(auth.org_id, connection_id)
-                .await?;
-            access.require_use(
-                "connection",
-                connection.owner_user_id,
-                connection.owner_team_id,
-                &connection.visibility,
-            )?;
-        }
-    }
     let task = if body.task.trim().is_empty() {
         spec.run_defaults
             .task
@@ -254,23 +252,19 @@ pub async fn execute_agent(
             })?,
         },
     };
-    if let Some(record) = state
-        .store
-        .get_harness_by_kind(auth.org_id, harness_kind.as_str())
-        .await?
-    {
-        if !record.enabled || record.implementation_status != "available" {
-            return Err(ApiError::validation(vec![
-                orbit_domain::ValidationIssue::new(
-                    "harness",
-                    format!(
-                        "harness '{}' is {} and cannot run executions",
-                        harness_kind, record.implementation_status
-                    ),
-                ),
-            ]));
-        }
-    }
+    // Shared preflight (#140): agent + connection/provider use and harness availability.
+    // The per-hour quota is checked below, after the idempotent replay.
+    let preflight = crate::preflight::Preflight {
+        state: &state,
+        org_id: auth.org_id,
+        access: &access,
+        agent: &agent,
+        spec: &spec,
+        harness: harness_kind,
+        extra_connection_ids: &[],
+    };
+    preflight.authorize_access().await?;
+    preflight.check_harness().await?;
     let placement = spec
         .harness
         .as_ref()
@@ -306,18 +300,7 @@ pub async fn execute_agent(
             spec.resources.max_concurrent_executions
         )));
     }
-    if let Some(max_per_hour) = spec.autonomy.max_executions_per_hour {
-        let since = chrono::Utc::now() - chrono::Duration::hours(1);
-        let count = state
-            .store
-            .count_executions_since(auth.org_id, agent_id, since)
-            .await?;
-        if count >= max_per_hour as i64 {
-            return Err(ApiError::rate_limited(format!(
-                "agent execution quota reached ({max_per_hour}/hour)"
-            )));
-        }
-    }
+    preflight.check_quota().await?;
 
     let input = serde_json::json!({
         "task": task,
@@ -374,7 +357,7 @@ pub async fn execute_agent(
     }
 
     // Make the queued state observable even before a worker claims the execution.
-    let _ = state
+    if let Err(err) = state
         .store
         .append_execution_event(
             auth.org_id,
@@ -390,7 +373,10 @@ pub async fn execute_agent(
                 "placement": placement,
             }),
         )
-        .await;
+        .await
+    {
+        tracing::warn!(execution_id = %execution.id, error = %err, "failed to append execution event");
+    }
 
     state.metrics.inc_executions();
     audit::record(
@@ -417,7 +403,7 @@ pub async fn cancel_execution(
     Path(execution_id): Path<Uuid>,
 ) -> Result<Json<ExecutionRecord>, ApiError> {
     auth.require(Permission::ExecutionsCancel)?;
-    require_execution_view(&state, &auth, execution_id).await?;
+    require_execution_use(&state, &auth, execution_id).await?;
     let execution = state
         .store
         .request_execution_cancel(auth.org_id, execution_id)
@@ -464,10 +450,15 @@ pub async fn stream_execution_events(
 
     let org_id = auth.org_id;
     let store = state.store.clone();
+    let shutdown = state.shutdown.clone();
     let stream = async_stream::stream! {
         let mut last = after_seq;
         let mut snapshot_sent = false;
         loop {
+            if shutdown.is_cancelled() {
+                yield Ok(Event::default().event("shutdown").data("{}"));
+                break;
+            }
             let execution = match store.get_execution(org_id, execution_id).await {
                 Ok(execution) => execution,
                 Err(err) => {
@@ -516,7 +507,10 @@ pub async fn stream_execution_events(
                     .data(serde_json::to_string(&execution).unwrap_or_default()));
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(700)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(700)) => {}
+                _ = shutdown.cancelled() => {}
+            }
         }
     };
 
@@ -545,22 +539,30 @@ pub async fn rerun_execution(
         .store
         .get_agent(auth.org_id, original.agent_id)
         .await?;
-    if agent.status == "archived" {
-        return Err(ApiError::bad_request("archived agents cannot be executed"));
-    }
     let access = crate::access::AccessScope::load(&state, &auth).await?;
-    access.require_use(
-        "agent",
-        agent.owner_user_id,
-        agent.owner_team_id,
-        &agent.visibility,
-    )?;
     let version = state
         .store
         .get_agent_version_by_id(auth.org_id, original.agent_version_id)
         .await?;
     let spec: orbit_domain::AgentSpec = serde_json::from_value(version.spec)
         .map_err(|error| ApiError::internal(format!("stored agent spec is invalid: {error}")))?;
+    let harness_kind = original
+        .harness_kind
+        .parse::<orbit_domain::HarnessKind>()
+        .map_err(|_| ApiError::internal("stored execution has an unknown harness"))?;
+    // Same preflight as a fresh execution (#140): the rerun replays the original version's
+    // spec, so its connections/provider must still be usable by the caller.
+    crate::preflight::Preflight {
+        state: &state,
+        org_id: auth.org_id,
+        access: &access,
+        agent: &agent,
+        spec: &spec,
+        harness: harness_kind,
+        extra_connection_ids: &[],
+    }
+    .run()
+    .await?;
     let active = state
         .store
         .count_active_executions_for_agent(auth.org_id, original.agent_id)
@@ -578,10 +580,6 @@ pub async fn rerun_execution(
             .count_all_executions_since(auth.org_id, since)
             .await?,
     )?;
-    let harness_kind = original
-        .harness_kind
-        .parse::<orbit_domain::HarnessKind>()
-        .map_err(|_| ApiError::internal("stored execution has an unknown harness"))?;
     let mut input = original.input.clone();
     if let Some(object) = input.as_object_mut() {
         object.insert("rerunOf".into(), serde_json::json!(original.id));
@@ -623,7 +621,7 @@ pub async fn rerun_execution(
     if let Err(err) = state.bus.publish(event).await {
         tracing::warn!(error = %err, "rerun event publish failed; worker polling will pick up the execution");
     }
-    let _ = state
+    if let Err(err) = state
         .store
         .append_execution_event(
             auth.org_id,
@@ -636,7 +634,10 @@ pub async fn rerun_execution(
             ),
             &serde_json::json!({ "rerunOf": original.id, "harness": execution.harness_kind }),
         )
-        .await;
+        .await
+    {
+        tracing::warn!(execution_id = %execution.id, error = %err, "failed to append execution event");
+    }
     audit::record(
         &state,
         &auth,

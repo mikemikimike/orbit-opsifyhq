@@ -24,6 +24,6 @@ Config fields: `namespaces` allowlist, `defaultNamespace`, `allowedResources`
 
 ## RBAC example
 
-See [`deploy/examples/kubernetes-reader-rbac.yaml`](../deploy/examples/kubernetes-reader-rbac.yaml).
+See `deploy/examples/kubernetes-reader-rbac.yaml` in the repository.
 
 Do not grant Secrets, pods/exec, port-forward, create/delete or cluster-wide access.

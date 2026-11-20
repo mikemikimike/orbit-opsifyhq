@@ -128,7 +128,7 @@ and harnesses in `worker_heartbeats`; `GET /api/v1/workers` exposes them.
 
 Production adapters must run in a container/Job with: non-root user, read-only root
 filesystem where possible, CPU/memory limits, `no_new_privileges`, a per-execution
-writable workspace, allowlisted outbound network, secret injection via env or tmpfs
+writable workspace, outbound network restriction (target state; the per-agent `network` policy is not yet enforced, use a Kubernetes NetworkPolicy), secret injection via env or tmpfs
 files, and forced teardown on timeout/cancel.
 
 ## Implementation status
@@ -154,7 +154,7 @@ files, and forced teardown on timeout/cancel.
     cancellation/timeout and trusted `--append-system-prompt`
   - platform-enforced read-only tool allowlist (`read,grep,find,ls`) at autonomy L1/L2
   - **platform providers supported**: endpoint and leased credential injected as
-    `OPENAI_API_KEY` / `OPENAI_BASE_URL`, with `--provider openai` when a platform model
+    `OPENAI_API_KEY` / `OPENAI_BASE_URL`, with `--provider orbit-platform` when a platform model
     is selected (`supports_platform_providers=true`)
   - writes the execution-scoped `.pi/mcp.json` broker bridge and accepts `--skill` paths
   - ships as its own worker image (`deploy/docker/worker-pi.Dockerfile`)
@@ -187,8 +187,12 @@ harness tool call ──► worker broker /policy or /tools/call
 - The worker receives the effective rules in `WorkerExecutionContext.tool_policies` and
   starts the broker when rules exist even if the agent has no connector binding.
 - `POST /policy` on the loopback broker (bearer: execution-scoped broker token) is the
-  adapter hook for native tools: request `{ tool, capability?, effect?, connection?,
-  arguments }`, response is the decision with `ruleId`, `ruleName`, `reason`, `impact`.
+  adapter hook for native tools: request `{ tool, arguments, argumentsHash? }` (legacy
+  `capability`/`effect`/`connection` are ignored; the effect is derived from the tool name,
+  unknown tools count as `write`, and autonomy plus approval mode are applied through
+  `evaluate_capability`). The response is the decision with `ruleId`, `ruleName`, `reason`,
+  `impact` and `argumentsHash`, which the approval is bound to; a presented hash that does
+  not match the arguments is denied. See `docs/guide/tool-policies.md`.
   `require_approval` creates a durable approval and blocks until it is decided or its own
   15-minute window expires (the execution timeout is paused meanwhile); expiry and
   rejection deny the call. An action a person rejected is denied without a new approval

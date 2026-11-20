@@ -369,7 +369,6 @@ export function AgentForm({
       ? []
       : parsed.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message }));
     if (JSON.stringify(next) !== JSON.stringify(issues)) setIssues(next);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [definition]);
 
   async function handleSubmit() {
@@ -1294,7 +1293,7 @@ export function AgentForm({
             <Field
               label="Approval mode"
               htmlFor="agent-approval"
-              hint="Approvals appear in the Approvals queue before the action runs."
+              hint="Approvals appear in the Approvals queue before the action runs. Levels 1 and 2 deny writes outright; raise to level 3 for approval-gated writes."
             >
               <Select
                 id="agent-approval"

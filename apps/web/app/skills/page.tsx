@@ -40,7 +40,7 @@ import { EmptyState } from "@/components/ui/empty-state";
 import { Field } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { PageHeader } from "@/components/ui/page-header";
-import { ImportOpenCodeButton } from "@/components/import-opencode-button";
+import { ImportPortableButton } from "@/components/import-portable-dialog";
 import { exportResource } from "@/components/export-resource-button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
@@ -219,7 +219,7 @@ export default function SkillsPage() {
         description="Reusable SKILL.md packages that are copied into an agent's workspace when it runs. Attach them to an agent in its settings, or to a team."
         actions={
           <div className="flex flex-wrap gap-2">
-            <ImportOpenCodeButton kind="skill" />
+            <ImportPortableButton label="Import" />
             <Button onClick={openCreate}>
               <Plus /> New skill
             </Button>
@@ -323,8 +323,11 @@ export default function SkillsPage() {
                           </Button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="end">
+                          <DropdownMenuItem onSelect={() => void exportResource("skills", skill.id, skill.name, "markdown")}>
+                            <Download /> Export SKILL.md
+                          </DropdownMenuItem>
                           <DropdownMenuItem onSelect={() => void exportResource("skills", skill.id, skill.name)}>
-                            <Download /> Export as JSON
+                            <Download /> Export with files (YAML)
                           </DropdownMenuItem>
                           <DropdownMenuItem destructive onSelect={() => void deleteSkill(skill)}>
                             <Trash2 /> Delete skill

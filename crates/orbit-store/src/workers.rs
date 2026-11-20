@@ -16,48 +16,61 @@ pub struct WorkerHeartbeat {
 }
 
 impl Store {
+    /// Record a heartbeat. The row is owned by the first token that reports a worker id;
+    /// another token (or org) cannot overwrite it. Returns `false` when the worker id
+    /// belongs to someone else. Pre-binding rows (NULL owner) are adopted.
     pub async fn upsert_worker_heartbeat(
         &self,
+        org_id: Uuid,
+        token_id: Uuid,
         worker_id: &str,
         harnesses: &[String],
         target: &str,
         hostname: Option<&str>,
-    ) -> StoreResult<()> {
-        sqlx::query(
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
             r#"
-            INSERT INTO worker_heartbeats (worker_id, harnesses, target, hostname, last_heartbeat_at)
-            VALUES ($1, $2, $3, $4, now())
+            INSERT INTO worker_heartbeats
+                (worker_id, harnesses, target, hostname, last_heartbeat_at, org_id, token_id)
+            VALUES ($1, $2, $3, $4, now(), $5, $6)
             ON CONFLICT (worker_id) DO UPDATE SET
                 harnesses = EXCLUDED.harnesses,
                 target = EXCLUDED.target,
                 hostname = COALESCE(EXCLUDED.hostname, worker_heartbeats.hostname),
-                last_heartbeat_at = now()
+                last_heartbeat_at = now(),
+                org_id = EXCLUDED.org_id,
+                token_id = EXCLUDED.token_id
+            WHERE worker_heartbeats.token_id IS NULL
+               OR worker_heartbeats.token_id = EXCLUDED.token_id
             "#,
         )
         .bind(worker_id)
         .bind(harnesses)
         .bind(target)
         .bind(hostname)
+        .bind(org_id)
+        .bind(token_id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
-    pub async fn delete_worker_heartbeat(&self, worker_id: &str) -> StoreResult<()> {
-        sqlx::query("DELETE FROM worker_heartbeats WHERE worker_id = $1")
-            .bind(worker_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn worker_heartbeat_age_seconds(&self, worker_id: &str) -> StoreResult<Option<i64>> {
-        Ok(sqlx::query_scalar(
-            "SELECT EXTRACT(EPOCH FROM (now() - last_heartbeat_at))::bigint FROM worker_heartbeats WHERE worker_id = $1",
+    /// Delete a worker record, only if the calling token owns it.
+    pub async fn delete_worker_heartbeat(
+        &self,
+        org_id: Uuid,
+        token_id: Uuid,
+        worker_id: &str,
+    ) -> StoreResult<bool> {
+        let result = sqlx::query(
+            "DELETE FROM worker_heartbeats WHERE worker_id = $1 AND org_id = $2 AND token_id = $3",
         )
         .bind(worker_id)
-        .fetch_optional(&self.pool)
-        .await?)
+        .bind(org_id)
+        .bind(token_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// Mark executions whose worker heartbeat expired as failed and expire their pending
@@ -188,10 +201,70 @@ impl Store {
         .await?)
     }
 
-    pub async fn list_worker_heartbeats(&self) -> StoreResult<Vec<WorkerHeartbeat>> {
-        Ok(sqlx::query_as::<_, WorkerHeartbeat>(
-            "SELECT * FROM worker_heartbeats ORDER BY last_heartbeat_at DESC",
+    /// End runs stuck `running` past their deadline, regardless of worker heartbeat.
+    ///
+    /// Liveness is otherwise tracked per worker: a healthy worker whose runner task died,
+    /// or whose `/complete` call never got through, keeps heartbeating while the run stays
+    /// `running` and holds the agent's concurrency slot. A run is ended as `timed_out`
+    /// once `started_at + timeout_seconds + grace_seconds` has passed. Time spent waiting
+    /// on approvals is added to the deadline because the worker pauses the run's clock
+    /// for it. The conditional `status = 'running'` makes this safe to run from several
+    /// API replicas and loses cleanly to a worker that reports in at the same moment.
+    pub async fn reap_timed_out_executions(
+        &self,
+        org_id: Option<Uuid>,
+        grace_seconds: i64,
+    ) -> StoreResult<Vec<ExecutionRecord>> {
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query_as::<_, ExecutionRecord>(
+            r#"
+            UPDATE executions e
+            SET status = 'timed_out',
+                error = jsonb_build_object(
+                    'code', 'execution_timeout',
+                    'message', 'execution exceeded its timeout and was not reported finished by its worker',
+                    'retryable', true
+                ),
+                finished_at = now(),
+                updated_at = now()
+            WHERE e.status = 'running'
+              AND e.started_at IS NOT NULL
+              AND ($2::uuid IS NULL OR e.org_id = $2)
+              AND e.started_at
+                  + make_interval(secs =>
+                        e.timeout_seconds::float8
+                        + $1
+                        + COALESCE((
+                            SELECT sum(EXTRACT(EPOCH FROM (COALESCE(a.decided_at, now()) - a.created_at)))
+                            FROM approvals a WHERE a.execution_id = e.id
+                          ), 0)::float8
+                    ) < now()
+            RETURNING e.*
+            "#,
         )
+        .bind(grace_seconds as f64)
+        .bind(org_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if !rows.is_empty() {
+            let ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+            sqlx::query(
+                "UPDATE approvals SET status = 'expired', decided_at = now() WHERE execution_id = ANY($1) AND status = 'pending'",
+            )
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    pub async fn list_worker_heartbeats(&self, org_id: Uuid) -> StoreResult<Vec<WorkerHeartbeat>> {
+        Ok(sqlx::query_as::<_, WorkerHeartbeat>(
+            "SELECT * FROM worker_heartbeats WHERE org_id = $1 ORDER BY last_heartbeat_at DESC",
+        )
+        .bind(org_id)
         .fetch_all(&self.pool)
         .await?)
     }

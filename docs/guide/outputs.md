@@ -45,11 +45,34 @@ curl -X POST "$API/api/v1/outputs/$OUTPUT_ID/test" \
   -H "Authorization: Bearer $ORBIT_TOKEN"
 ```
 
+Webhook URLs are checked against the outbound network policy (loopback, link-local and
+cloud-metadata targets are refused; see [Providers](providers.md#outbound-network-policy)).
+
 ## Delivery
 
-- A background outbox loop enqueues terminal executions and retries failed deliveries with
-  backoff (5 attempts, then `dead`).
-- Deliveries are unique per `(output, execution)`.
+Delivery is **at-least-once** and driven by a background outbox loop on every API replica.
+
+- **Enqueue**: each output keeps a high-water mark and only delivers runs that finished
+  after it was created (or last re-enabled), so a new output never back-fills history and an
+  API outage of any length still delivers every finished run once. Deliveries are unique per
+  `(output, execution)` / `(output, team run)`.
+- **Claim**: rows are claimed atomically (`FOR UPDATE SKIP LOCKED`) with a 120 s lease, so
+  replicas and overlapping ticks never send the same delivery concurrently. A sender that
+  crashes mid-send leaves the row `sending`; it is reclaimed after the lease expires and
+  counts as an attempt.
+- **Idempotency**: every delivery sends its id as `Idempotency-Key` and
+  `X-Orbit-Delivery-Id` headers (and `deliveryId` in `webhook` bodies). Because a crash
+  after the receiver processed the request but before ORBIT recorded it causes a resend,
+  receivers should de-duplicate on this id. Slack/Mattermost ignore the headers.
+- **Failures**:
+
+| Result | Action |
+|---|---|
+| 2xx | `succeeded` |
+| 5xx, 408, 429, network error/timeout | retry with backoff (30 s x attempt); `dead` after 5 attempts |
+| other 4xx / 3xx, missing webhook secret | `failed` immediately, never retried |
+| output disabled or deleted, run deleted | `skipped` (no request sent) |
+
 - List outputs: `GET /api/v1/outputs`; update/delete via `PATCH/DELETE /api/v1/outputs/{id}`.
 
 Not yet implemented: HMAC signing for generic webhooks, SSRF/private-network blocking,

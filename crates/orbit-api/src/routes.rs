@@ -16,6 +16,8 @@ pub fn build_router(state: AppState) -> Router {
     let cors = build_cors(&state);
 
     let protected = Router::new()
+        .route("/api/v1/docs", get(handlers::docs::index))
+        .route("/api/v1/docs/{*path}", get(handlers::docs::get_doc))
         .route("/api/v1/me", get(handlers::account::me))
         .route(
             "/api/v1/organizations/current",
@@ -272,6 +274,10 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::settings::get_harness).put(handlers::settings::update_harness),
         )
         .route(
+            "/api/v1/settings/approvals",
+            get(handlers::settings::get_approvals).put(handlers::settings::update_approvals),
+        )
+        .route(
             "/api/v1/settings/access",
             get(handlers::settings::get_access).put(handlers::settings::update_access),
         )
@@ -283,6 +289,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/import/opencode",
             post(handlers::import::import_markdown),
+        )
+        .route(
+            "/api/v1/import",
+            post(handlers::import_portable::import_portable),
         )
         .route(
             "/api/v1/export/{resource}/{resource_id}",
@@ -420,6 +430,9 @@ pub fn build_router(state: AppState) -> Router {
         .merge(public)
         .merge(worker)
         .merge(protected)
+        .fallback(crate::error::not_found_fallback)
+        // Inside `instrument` so the request id is available to the envelope.
+        .layer(middleware::from_fn(crate::error::envelope_rejections))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::request_id::instrument,

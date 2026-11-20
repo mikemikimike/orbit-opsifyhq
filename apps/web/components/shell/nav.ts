@@ -6,6 +6,7 @@ import {
   Cable,
   Cpu,
   Gauge,
+  LifeBuoy,
   Megaphone,
   Server,
   Settings,
@@ -78,6 +79,7 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { href: "/teams", label: "Access teams", icon: UsersRound, keywords: "members rbac permissions sharing" },
       { href: "/settings", label: "Settings", icon: Settings, keywords: "tokens oidc sso audit license identity" },
+      { href: "/documentation", label: "Documentation", icon: LifeBuoy, keywords: "docs handbook help guide manual" },
     ],
   },
 ];

@@ -8,7 +8,9 @@ import { KeyRound } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { getAccessToken, setAccessToken } from "@/lib/api";
+import { isSessionError } from "@/lib/http";
 import { beginOidcLogin } from "@/lib/oidc";
+import { safeNextPath } from "@/lib/safe-redirect";
 import { useMe, useMeta } from "@/lib/queries";
 
 export default function LoginPage() {
@@ -24,16 +26,17 @@ export default function LoginPage() {
     if (!getAccessToken()) return;
     if (me.isSuccess) {
       router.replace("/");
-    } else if (me.isError) {
+    } else if (isSessionError(me.error)) {
       // Expired or foreign token: clear it instead of treating it as a session.
+      // Transient errors (5xx, network) keep it so a blip does not force a new sign-in.
       setAccessToken(null);
     }
-  }, [me.isSuccess, me.isError, router]);
+  }, [me.isSuccess, me.error, router]);
 
   function startSignIn() {
     setError(null);
     setStarting(true);
-    void beginOidcLogin(new URLSearchParams(window.location.search).get("next") ?? "/").catch(
+    void beginOidcLogin(safeNextPath(new URLSearchParams(window.location.search).get("next"))).catch(
       (reason) => {
         setStarting(false);
         setError(reason instanceof Error ? reason.message : String(reason));

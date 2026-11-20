@@ -93,8 +93,8 @@ impl Store {
         Ok((rows, next))
     }
 
-    /// Audit logs are high-volume; retain indefinitely in Phase 0 but expose a helper
-    /// for future retention policies.
+    /// Delete audit log rows created before `before`; returns the number removed.
+    /// Driven by `ORBIT_AUDIT_RETENTION_DAYS` in the API background loop.
     pub async fn prune_audit_logs(&self, before: DateTime<Utc>) -> StoreResult<u64> {
         let result = sqlx::query("DELETE FROM audit_logs WHERE created_at < $1")
             .bind(before)

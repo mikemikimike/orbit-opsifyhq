@@ -14,7 +14,7 @@ use crate::dto::{
     UpdateAgentRequest,
 };
 use crate::error::ApiError;
-use crate::handlers::{limit, load_agent_detail, parse_spec};
+use crate::handlers::{limit, load_agent_detail};
 use crate::state::AppState;
 
 async fn require_agent_manage(
@@ -87,6 +87,10 @@ pub async fn create_agent(
     if !report.is_valid() {
         return Err(ApiError::validation(report.issues));
     }
+    // The author must be able to use every connection/provider the spec binds (#140).
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    crate::preflight::require_spec_references_use(&state, auth.org_id, &access, &definition.spec)
+        .await?;
 
     let (agent, _version) = state
         .store
@@ -138,6 +142,14 @@ pub async fn update_agent(
         if !report.is_valid() {
             return Err(ApiError::validation(report.issues));
         }
+        let access = crate::access::AccessScope::load(&state, &auth).await?;
+        crate::preflight::require_spec_references_use(
+            &state,
+            auth.org_id,
+            &access,
+            &definition.spec,
+        )
+        .await?;
         let agent = state.store.get_agent(auth.org_id, agent_id).await?;
         let current = state.store.get_current_version(auth.org_id, &agent).await?;
         let candidate_spec = serde_json::to_value(&definition.spec)
@@ -334,24 +346,16 @@ pub async fn export_agent(
         agent.owner_team_id,
         &agent.visibility,
     )?;
-    let version = state.store.get_current_version(auth.org_id, &agent).await?;
-    let yaml = if version.definition_yaml.trim().is_empty() {
-        let spec = parse_spec(&version)?;
-        AgentDefinition {
-            api_version: orbit_domain::AGENT_API_VERSION.to_string(),
-            kind: orbit_domain::AGENT_KIND.to_string(),
-            metadata: orbit_domain::AgentMetadata {
-                name: agent.name.clone(),
-                description: agent.description.clone(),
-                labels: Default::default(),
-            },
-            spec,
-        }
-        .to_yaml()
-        .map_err(ApiError::internal)?
-    } else {
-        version.definition_yaml
-    };
+    // Same secret-free, name-referenced document as `/export/agents/{id}?format=yaml`.
+    let yaml = crate::handlers::export::build_document(
+        &state,
+        auth.org_id,
+        orbit_contracts::portable::PortableKind::Agent,
+        agent_id,
+    )
+    .await?
+    .to_yaml()
+    .map_err(ApiError::internal)?;
     Ok((
         [
             (header::CONTENT_TYPE, "application/yaml; charset=utf-8"),

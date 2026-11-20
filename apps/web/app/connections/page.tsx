@@ -44,6 +44,7 @@ import { PageHeader } from "@/components/ui/page-header";
 import { Section } from "@/components/ui/section";
 import { Select } from "@/components/ui/select";
 import { exportResource } from "@/components/export-resource-button";
+import { ImportPortableButton } from "@/components/import-portable-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Status, type StatusMeta } from "@/components/ui/status";
 import { Textarea } from "@/components/ui/textarea";
@@ -341,9 +342,12 @@ export default function ConnectionsPage() {
         title="Connectors"
         description="Connections are accounts you have authorised for external services. Agents use them only for the capabilities you allow, and ORBIT enforces that."
         actions={
-          <Button onClick={() => openCreate()}>
-            <Plus /> New connection
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <ImportPortableButton />
+            <Button onClick={() => openCreate()}>
+              <Plus /> New connection
+            </Button>
+          </div>
         }
       />
 
@@ -457,7 +461,7 @@ export default function ConnectionsPage() {
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
                         <DropdownMenuItem onSelect={() => void exportResource("connections", connection.id, connection.name)}>
-                          <Download /> Export as JSON
+                          <Download /> Export as YAML
                         </DropdownMenuItem>
                         <DropdownMenuSeparator />
                         <DropdownMenuItem destructive onSelect={() => void removeConnection(connection)}>

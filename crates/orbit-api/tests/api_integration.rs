@@ -6,7 +6,7 @@ use base64::Engine;
 use http_body_util::BodyExt;
 use orbit_api::{build_router, AppState, DevIdentity};
 use orbit_domain::UserRole;
-use orbit_events::MemoryEventBus;
+use orbit_events::{EventBusError, MemoryEventBus};
 use orbit_harness::HarnessRegistry;
 use orbit_security::{AuthConfig, AuthMode, DevAuthConfig, SecretCipher};
 use orbit_store::Store;
@@ -14,8 +14,40 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+/// Event bus whose health can be flipped to simulate a NATS outage.
+struct SwitchableBus {
+    inner: MemoryEventBus,
+    healthy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl orbit_events::EventBus for SwitchableBus {
+    fn driver(&self) -> &'static str {
+        "memory"
+    }
+    async fn publish(&self, event: orbit_contracts::OrbitEvent) -> Result<(), EventBusError> {
+        self.inner.publish(event).await
+    }
+    async fn subscribe(
+        &self,
+        filter: orbit_contracts::SubjectFilter,
+    ) -> Result<orbit_events::EventStream, EventBusError> {
+        self.inner.subscribe(filter).await
+    }
+    async fn health(&self) -> Result<(), EventBusError> {
+        if self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(EventBusError::Unavailable("simulated outage".into()))
+        }
+    }
+}
+
 struct TestApp {
+    bus_healthy: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: tokio_util::sync::CancellationToken,
     router: axum::Router,
+    state: AppState,
     store: Store,
     org_id: Uuid,
     agent_id: Uuid,
@@ -71,7 +103,12 @@ async fn test_app(allow_anonymous: bool) -> Option<TestApp> {
         allow_api_tokens: true,
     };
 
-    let bus = Arc::new(MemoryEventBus::new(128));
+    let bus_healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let bus = Arc::new(SwitchableBus {
+        inner: MemoryEventBus::new(128),
+        healthy: bus_healthy.clone(),
+    });
     let state = AppState {
         store: store.clone(),
         bus,
@@ -98,6 +135,7 @@ async fn test_app(allow_anonymous: bool) -> Option<TestApp> {
         ca_secret_name: None,
         ca_secret_key: "ca-bundle.crt".into(),
         archive_after_days: None,
+        shutdown: shutdown.clone(),
         license: orbit_security::LicenseHandle::load(orbit_security::LicenseSource {
             token: None,
             file: None,
@@ -112,7 +150,10 @@ async fn test_app(allow_anonymous: bool) -> Option<TestApp> {
 
     let created = create_demo_agent(&store, org.id, user.id).await;
     Some(TestApp {
-        router: build_router(state),
+        bus_healthy,
+        shutdown,
+        router: build_router(state.clone()),
+        state,
         store,
         org_id: org.id,
         agent_id: created,
@@ -194,6 +235,81 @@ async fn public_endpoints_and_meta() {
 }
 
 #[tokio::test]
+async fn readyz_depends_on_database_only() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(&app.router, get("/readyz")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["checks"]["eventBus"], "ok");
+
+    // Bus outage: still ready, but reported as unavailable/degraded.
+    app.bus_healthy
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = send(&app.router, get("/readyz")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ready");
+    assert_eq!(body["checks"]["database"], "ok");
+    assert_eq!(body["checks"]["eventBus"], "unavailable");
+    assert!(body["checks"]["eventBusError"]
+        .as_str()
+        .unwrap()
+        .contains("simulated outage"));
+    assert_eq!(body["degraded"], json!(["eventBus"]));
+}
+
+#[tokio::test]
+async fn execution_sse_stream_ends_on_shutdown() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, body) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/agents/{}/executions", app.agent_id),
+            json!({ "task": "long running" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let execution_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+    app.store
+        .claim_execution(execution_id, "test-worker")
+        .await
+        .unwrap();
+    app.store
+        .mark_execution_running(execution_id, Some("session-sse"))
+        .await
+        .unwrap();
+
+    let uri = format!("/api/v1/executions/{execution_id}/events/stream");
+    let response = app
+        .router
+        .clone()
+        .oneshot(get(&uri))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body();
+
+    // The execution never finishes, so the stream only ends because of the token.
+    let shutdown = app.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        shutdown.cancel();
+    });
+    let started = std::time::Instant::now();
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), body.collect())
+        .await
+        .expect("SSE stream must end shortly after shutdown")
+        .unwrap()
+        .to_bytes();
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1400));
+    assert!(String::from_utf8_lossy(&bytes).contains("event: shutdown"));
+}
+
+#[tokio::test]
 async fn unauthenticated_requests_are_rejected_when_anonymous_disabled() {
     let Some(app) = test_app(false).await else {
         return;
@@ -209,6 +325,50 @@ async fn unauthenticated_requests_are_rejected_when_anonymous_disabled() {
         .body(Body::empty())
         .unwrap();
     let (status, _) = send(&app.router, authed).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn dev_auth_without_anonymous_requires_exact_dev_token() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let with_token = |token: &str| {
+        Request::builder()
+            .uri("/api/v1/agents")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (status, _) = send(&app.router, get("/api/v1/agents")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for wrong in [
+        "wrong-token",
+        "test-toke",
+        "test-token-x",
+        "orbit_sk_unknown",
+    ] {
+        let (status, body) = send(&app.router, with_token(wrong)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "token {wrong}");
+        assert_eq!(body["error"]["code"], "unauthorized");
+    }
+    let (status, _) = send(&app.router, with_token("test-token")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn dev_auth_with_anonymous_accepts_missing_and_non_dev_tokens() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let (status, _) = send(&app.router, get("/api/v1/agents")).await;
+    assert_eq!(status, StatusCode::OK);
+    let req = Request::builder()
+        .uri("/api/v1/agents")
+        .header("authorization", "Bearer something-else")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(&app.router, req).await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -351,6 +511,11 @@ async fn execution_creation_is_idempotent_and_streams_events() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // The envelope middleware must leave streams alone.
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8_lossy(&body);
     assert!(text.contains("event: snapshot"), "{text}");
@@ -363,6 +528,8 @@ async fn approvals_can_be_listed_and_decided() {
     let Some(app) = test_app(true).await else {
         return;
     };
+    let _serial = APPROVAL_SETTINGS_LOCK.lock().await;
+    reset_approval_policy(&app).await;
     let (status, execution) = send(
         &app.router,
         post(
@@ -1304,4 +1471,1081 @@ async fn same_agent_queues_on_different_harnesses() {
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(second["harnessKind"], "pi");
+}
+
+/// `runtime_tick` advances every runtime in the shared test database, so tests that tick
+/// (or interleave with a tick) run one at a time.
+static RUNTIME_TICK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Approval policy is a platform-wide setting; tests that change it must not overlap.
+static APPROVAL_SETTINGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn reset_approval_policy(app: &TestApp) {
+    app.store
+        .set_platform_setting(
+            "approvals",
+            &json!({ "approvalsRequireDifferentApprover": false }),
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+async fn raw_pool() -> sqlx::PgPool {
+    sqlx::PgPool::connect(&std::env::var("ORBIT_TEST_DATABASE_URL").unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn poisoned_runtimes_do_not_block_healthy_ones() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let pool = raw_pool().await;
+
+    // Oldest runtime: unknown harness (permanent error).
+    let bad_harness = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let rt_harness = app
+        .store
+        .create_agent_runtime(app.org_id, bad_harness, "t", "bogus", 60, None)
+        .await
+        .unwrap();
+    // Second: current spec that no longer deserialises (transient, backs off).
+    let bad_spec = create_demo_agent(&app.store, app.org_id, user.id).await;
+    sqlx::query("UPDATE agent_versions SET spec = '{\"bogus\": true}'::jsonb WHERE agent_id = $1")
+        .bind(bad_spec)
+        .execute(&pool)
+        .await
+        .unwrap();
+    app.store
+        .create_agent_runtime(app.org_id, bad_spec, "t", "mock", 10, None)
+        .await
+        .unwrap();
+    // Healthy runtime created last.
+    let healthy = create_demo_agent(&app.store, app.org_id, user.id).await;
+    app.store
+        .create_agent_runtime(app.org_id, healthy, "t", "mock", 60, None)
+        .await
+        .unwrap();
+
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+
+    let ok = app
+        .store
+        .get_agent_runtime(app.org_id, healthy)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        ok.last_execution_id.is_some(),
+        "healthy runtime must advance"
+    );
+    assert!(ok.last_error.is_none());
+
+    let spec = app
+        .store
+        .get_agent_runtime(app.org_id, bad_spec)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(spec.status, "running");
+    assert!(spec.last_error.as_deref().unwrap().contains("invalid"));
+    assert!(spec.next_run_at > chrono::Utc::now() + chrono::Duration::seconds(30));
+    assert!(spec.last_execution_id.is_none());
+
+    let (status, error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM agent_runtimes WHERE id = $1")
+            .bind(rt_harness.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "stopped");
+    assert!(error.unwrap().contains("unknown harness"));
+}
+
+#[tokio::test]
+async fn runtime_tick_retry_reuses_execution() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let runtime = app
+        .store
+        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
+        .await
+        .unwrap();
+    let pool = raw_pool().await;
+
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let first = app
+        .store
+        .get_agent_runtime(app.org_id, agent_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_execution_id
+        .unwrap();
+
+    // Simulate a crash between create_execution and update_agent_runtime: the execution
+    // exists but the runtime row still points at nothing and is due again.
+    sqlx::query("UPDATE agent_runtimes SET last_execution_id = NULL, next_run_at = now() - interval '1 second' WHERE id = $1")
+        .bind(runtime.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+
+    let retried = app
+        .store
+        .get_agent_runtime(app.org_id, agent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retried.last_execution_id,
+        Some(first),
+        "retry reuses the execution"
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM executions WHERE org_id = $1 AND agent_id = $2")
+            .bind(app.org_id)
+            .bind(agent_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "no duplicate execution");
+}
+
+async fn runtime_row(
+    app: &TestApp,
+    agent_id: uuid::Uuid,
+) -> orbit_store::agent_runtimes::AgentRuntime {
+    sqlx::query_as("SELECT * FROM agent_runtimes WHERE org_id = $1 AND agent_id = $2")
+        .bind(app.org_id)
+        .bind(agent_id)
+        .fetch_one(&raw_pool().await)
+        .await
+        .unwrap()
+}
+
+async fn fail_execution(pool: &sqlx::PgPool, execution_id: uuid::Uuid) {
+    sqlx::query("UPDATE executions SET status = 'failed', error = '\"boom\"'::jsonb, finished_at = now() WHERE id = $1")
+        .bind(execution_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn make_runtime_due(pool: &sqlx::PgPool, runtime_id: uuid::Uuid) {
+    sqlx::query(
+        "UPDATE agent_runtimes SET next_run_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(runtime_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn runtime_stops_after_consecutive_failures() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let runtime = app
+        .store
+        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
+        .await
+        .unwrap();
+    let pool = raw_pool().await;
+    let limit = orbit_api::background::RUNTIME_MAX_CONSECUTIVE_FAILURES;
+
+    for round in 1..=limit {
+        make_runtime_due(&pool, runtime.id).await;
+        orbit_api::background::runtime_tick(&app.state)
+            .await
+            .unwrap();
+        let id = runtime_row(&app, agent_id).await.last_execution_id.unwrap();
+        fail_execution(&pool, id).await;
+        make_runtime_due(&pool, runtime.id).await;
+        orbit_api::background::runtime_tick(&app.state)
+            .await
+            .unwrap();
+        let row = runtime_row(&app, agent_id).await;
+        assert_eq!(row.consecutive_failures, round);
+        if round < limit {
+            assert_eq!(row.status, "running");
+        }
+    }
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.status, "stopped");
+    assert!(row.last_error.as_deref().unwrap().contains(&format!(
+        "stopped after {limit} consecutive failed executions"
+    )));
+}
+
+async fn new_execution(app: &TestApp, agent_id: Uuid) -> Uuid {
+    let (status, execution) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/agents/{agent_id}/executions"),
+            json!({ "task": "approval policy test" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{execution}");
+    Uuid::parse_str(execution["id"].as_str().unwrap()).unwrap()
+}
+
+async fn new_approval(app: &TestApp, execution_id: Uuid) -> Uuid {
+    app.store
+        .create_approval(
+            app.org_id,
+            execution_id,
+            json!({ "action": "deploy" }),
+            None,
+        )
+        .await
+        .unwrap()
+        .id
+}
+
+#[tokio::test]
+async fn approval_decisions_require_use_and_optional_four_eyes() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let _serial = APPROVAL_SETTINGS_LOCK.lock().await;
+    reset_approval_policy(&app).await;
+    app.store
+        .create_custom_role(
+            app.org_id,
+            "Approver",
+            &[
+                "agents:read".into(),
+                "executions:read".into(),
+                "approvals:decide".into(),
+            ],
+        )
+        .await
+        .unwrap();
+    let carol = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "appr-carol@test.local",
+            "Carol",
+            UserRole::Viewer,
+        )
+        .await
+        .unwrap();
+    app.store
+        .set_user_role_name(app.org_id, carol.id, "Approver")
+        .await
+        .unwrap();
+    let carol_token = token_for(&app.store, app.org_id, carol.id, "carol").await;
+    let team = app
+        .store
+        .create_access_team(
+            app.org_id,
+            "Approvers",
+            &format!("appr-{}", Uuid::now_v7()),
+            None,
+        )
+        .await
+        .unwrap();
+    // Someone other than Carol owns the agent, so only her team role grants access.
+    let dave = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "appr-dave@test.local",
+            "Dave",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    app.store
+        .assign_resource_owner(app.org_id, "agents", app.agent_id, dave.id)
+        .await
+        .unwrap();
+    app.store
+        .set_resource_visibility(app.org_id, "agents", app.agent_id, "team", Some(team.id))
+        .await
+        .unwrap();
+    app.store
+        .upsert_team_member(team.id, carol.id, "viewer")
+        .await
+        .unwrap();
+
+    let execution_id = new_execution(&app, app.agent_id).await;
+    let approval_id = new_approval(&app, execution_id).await;
+
+    // Team viewer: can see the agent but cannot use it -> 403.
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/approvals/{approval_id}/approve"),
+            &carol_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Not in the team at all -> the agent is invisible -> 404.
+    app.store
+        .remove_team_member(team.id, carol.id)
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/approvals/{approval_id}/approve"),
+            &carol_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Team member: allowed (four-eyes off by default; requester is the dev owner).
+    app.store
+        .upsert_team_member(team.id, carol.id, "member")
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/approvals/{approval_id}/approve"),
+            &carol_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Default setting is off.
+    let (status, body) = send(&app.router, get("/api/v1/settings/approvals")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["approvalsRequireDifferentApprover"], false);
+
+    // Four-eyes off: the requester (dev owner) may approve their own execution.
+    let own = new_approval(&app, execution_id).await;
+    let (status, body) = send(
+        &app.router,
+        post(&format!("/api/v1/approvals/{own}/approve"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Four-eyes on: the requester is refused, another user is not.
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/settings/approvals")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "approvalsRequireDifferentApprover": true }).to_string(),
+        ))
+        .unwrap();
+    let (status, body) = send(&app.router, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["approvalsRequireDifferentApprover"], true);
+
+    let gated = new_approval(&app, execution_id).await;
+    for decision in ["approve", "reject"] {
+        let (status, body) = send(
+            &app.router,
+            post(&format!("/api/v1/approvals/{gated}/{decision}"), json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("different approver"));
+    }
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            &format!("/api/v1/approvals/{gated}/approve"),
+            &carol_token,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "approved");
+}
+
+#[tokio::test]
+async fn expired_approval_cannot_be_decided_via_api() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let _serial = APPROVAL_SETTINGS_LOCK.lock().await;
+    reset_approval_policy(&app).await;
+    let execution_id = new_execution(&app, app.agent_id).await;
+    let approval = app
+        .store
+        .create_approval(
+            app.org_id,
+            execution_id,
+            json!({ "action": "late" }),
+            Some(chrono::Utc::now() - chrono::Duration::seconds(30)),
+        )
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        post(
+            &format!("/api/v1/approvals/{}/approve", approval.id),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("approval expired"));
+    assert_eq!(
+        app.store
+            .get_approval(app.org_id, approval.id)
+            .await
+            .unwrap()
+            .status,
+        "expired"
+    );
+}
+
+fn worker_request(method: &str, path: &str, token: &str, body: Option<Value>) -> Request<Body> {
+    let builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {token}"));
+    match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn worker_approvals_are_bound_to_the_execution_and_clamped() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let issued = orbit_security::issue_worker_token();
+    let token_record = app
+        .store
+        .create_worker_token(
+            app.org_id,
+            None,
+            "approvals-test",
+            &issued.prefix,
+            &issued.hash,
+            &[],
+        )
+        .await
+        .unwrap();
+    let execution_a = new_execution(&app, app.agent_id).await;
+    let zed = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "worker-zed@test.local",
+            "Zed",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let other_agent = create_demo_agent(&app.store, app.org_id, zed.id).await;
+    let execution_b = new_execution(&app, other_agent).await;
+    for execution_id in [execution_a, execution_b] {
+        app.store
+            .claim_execution(execution_id, "approvals-test-worker")
+            .await
+            .unwrap()
+            .expect("execution is queued");
+        app.store
+            .bind_execution_worker_token(execution_id, token_record.id)
+            .await
+            .unwrap();
+    }
+
+    // u64::MAX must neither panic nor produce an absurd deadline.
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/approvals",
+            &issued.token,
+            Some(json!({
+                "executionId": execution_a,
+                "action": { "capability": "x" },
+                "waitSeconds": u64::MAX
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let expires: chrono::DateTime<chrono::Utc> =
+        body["expiresAt"].as_str().unwrap().parse().unwrap();
+    assert!(
+        expires <= chrono::Utc::now() + chrono::Duration::hours(24) + chrono::Duration::minutes(1)
+    );
+    let approval_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    // Decide it so the wait returns immediately for the matching execution.
+    app.store
+        .decide_approval(app.org_id, approval_id, "approved", zed.id, None)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "GET",
+            &format!(
+                "/api/v1/worker/approvals/{approval_id}/wait?executionId={execution_a}&seconds=1"
+            ),
+            &issued.token,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Another execution in the same org cannot read this approval's status.
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "GET",
+            &format!(
+                "/api/v1/worker/approvals/{approval_id}/wait?executionId={execution_b}&seconds=1"
+            ),
+            &issued.token,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Per-execution cap on pending approvals.
+    for _ in 0..49 {
+        app.store
+            .create_approval(app.org_id, execution_b, json!({ "n": 1 }), None)
+            .await
+            .unwrap();
+    }
+    let (status, _) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/approvals",
+            &issued.token,
+            Some(json!({ "executionId": execution_b, "action": {} })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(
+        &app.router,
+        worker_request(
+            "POST",
+            "/api/v1/worker/approvals",
+            &issued.token,
+            Some(json!({ "executionId": execution_b, "action": {} })),
+        ),
+    )
+    .await;
+    // 49 + 1 created above = 50 pending -> the next request is refused.
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+}
+
+#[tokio::test]
+async fn env_mapping_secret_refs_must_be_usable_in_the_callers_org() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    let mapping = |reference: &str| {
+        json!({
+            "name": format!("map-{}", Uuid::now_v7()),
+            "mappings": [{ "envVar": "TOKEN", "secretRef": reference }]
+        })
+    };
+
+    // A real secret that belongs to another organization.
+    let other = app
+        .store
+        .create_organization(
+            &format!("other-{}", Uuid::now_v7()),
+            "Other",
+            orbit_domain::OrganizationMode::Personal,
+        )
+        .await
+        .unwrap();
+    let foreign = format!("connection/{}", Uuid::now_v7());
+    app.store
+        .put_secret(
+            Some(other.id),
+            &foreign,
+            &orbit_security::SecretValue::new("foreign-super-secret"),
+            "t",
+        )
+        .await
+        .unwrap();
+    let (status, body) = send(&app.router, post("/api/v1/env-mappings", mapping(&foreign))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(!body.to_string().contains("foreign-super-secret"));
+
+    // Unknown reference.
+    let (status, _) = send(
+        &app.router,
+        post("/api/v1/env-mappings", mapping("connection/does-not-exist")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Own-org secret that no connection/provider owns.
+    let orphan = format!("connection/{}", Uuid::now_v7());
+    app.store
+        .put_secret(
+            Some(app.org_id),
+            &orphan,
+            &orbit_security::SecretValue::new("orphan"),
+            "t",
+        )
+        .await
+        .unwrap();
+    let (status, _) = send(&app.router, post("/api/v1/env-mappings", mapping(&orphan))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Unknown connection id.
+    let (status, _) = send(
+        &app.router,
+        post(
+            "/api/v1/env-mappings",
+            json!({
+                "name": "bad-conn",
+                "mappings": [{ "envVar": "TOKEN", "connectionId": Uuid::now_v7() }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A usable connection's credential in the caller's org is accepted (create + update).
+    let (status, created) = send(
+        &app.router,
+        post(
+            "/api/v1/connections",
+            json!({
+                "connectorSlug": "telegram",
+                "name": "Mapped bot",
+                "credential": "123456:bot-secret",
+                "scopes": ["messages.list"]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let connection = app
+        .store
+        .get_connection(
+            app.org_id,
+            Uuid::parse_str(created["id"].as_str().unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let reference = connection.credential_ref.unwrap();
+    let (status, body) = send(
+        &app.router,
+        post("/api/v1/env-mappings", mapping(&reference)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().unwrap();
+    let patch = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/v1/env-mappings/{id}"))
+        .header("content-type", "application/json")
+        .body(Body::from(mapping(&foreign).to_string()))
+        .unwrap();
+    let (status, _) = send(&app.router, patch).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn env_mapping_secret_refs_respect_resource_access() {
+    let Some(app) = test_app(true).await else {
+        return;
+    };
+    app.store
+        .create_custom_role(
+            app.org_id,
+            "Mapper",
+            &["settings:read".into(), "settings:write".into()],
+        )
+        .await
+        .unwrap();
+    let erin = app
+        .store
+        .ensure_user(app.org_id, "map-erin@test.local", "Erin", UserRole::Viewer)
+        .await
+        .unwrap();
+    app.store
+        .set_user_role_name(app.org_id, erin.id, "Mapper")
+        .await
+        .unwrap();
+    let erin_token = token_for(&app.store, app.org_id, erin.id, "erin").await;
+    let frank = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "map-frank@test.local",
+            "Frank",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let connector = app
+        .store
+        .get_connector_by_slug(app.org_id, "webhook")
+        .await
+        .unwrap()
+        .expect("webhook connector");
+    let reference = format!("connection/{}", Uuid::now_v7());
+    app.store
+        .put_secret(
+            Some(app.org_id),
+            &reference,
+            &orbit_security::SecretValue::new("franks-token"),
+            "t",
+        )
+        .await
+        .unwrap();
+    let connection = app
+        .store
+        .create_connection(
+            app.org_id,
+            connector.id,
+            "Frank private",
+            &json!({ "url": "http://127.0.0.1:9/frank" }),
+            &[],
+            Some(&reference),
+            Some(frank.id),
+        )
+        .await
+        .unwrap();
+    make_private(
+        &app.store,
+        app.org_id,
+        "connections",
+        connection.id,
+        frank.id,
+    )
+    .await;
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/env-mappings",
+            &erin_token,
+            json!({
+                "name": "erin-map",
+                "mappings": [{ "envVar": "TOKEN", "secretRef": reference }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(!body.to_string().contains("franks-token"));
+
+    let (status, body) = send(
+        &app.router,
+        auth_post(
+            "/api/v1/env-mappings",
+            &erin_token,
+            json!({
+                "name": "erin-map-conn",
+                "mappings": [{ "envVar": "TOKEN", "connectionId": connection.id }]
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+async fn runtime_with_first_execution(
+    app: &TestApp,
+) -> (
+    orbit_store::agent_runtimes::AgentRuntime,
+    uuid::Uuid,
+    uuid::Uuid,
+) {
+    let user = app
+        .store
+        .ensure_user(app.org_id, "api@test.local", "API Test", UserRole::Owner)
+        .await
+        .unwrap();
+    let agent_id = create_demo_agent(&app.store, app.org_id, user.id).await;
+    let runtime = app
+        .store
+        .create_agent_runtime(app.org_id, agent_id, "t", "mock", 60, None)
+        .await
+        .unwrap();
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let first = runtime_row(app, agent_id).await.last_execution_id.unwrap();
+    (runtime, agent_id, first)
+}
+
+async fn execution_count(pool: &sqlx::PgPool, agent_id: uuid::Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM executions WHERE agent_id = $1")
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn stop_during_inflight_tick_is_not_overwritten_by_launch() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let pool = raw_pool().await;
+    let (runtime, agent_id, exec) = runtime_with_first_execution(&app).await;
+
+    // Rewind to "tick claimed, execution created, runtime row not yet updated".
+    sqlx::query("UPDATE agent_runtimes SET last_execution_id = NULL, next_run_at = now() - interval '1 second' WHERE id = $1")
+        .bind(runtime.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let claimed = app
+        .store
+        .claim_agent_runtime_tick(
+            runtime.id,
+            chrono::Utc::now() + chrono::Duration::seconds(5),
+        )
+        .await
+        .unwrap()
+        .expect("claimed");
+
+    // Operator presses Stop while the tick is in flight.
+    let stopping = app
+        .store
+        .request_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopping.status, "stopping");
+
+    // The tick's final write must not revive the runtime, but must record the execution.
+    let recorded = app
+        .store
+        .record_agent_runtime_launch(
+            runtime.id,
+            exec,
+            true,
+            chrono::Utc::now() + chrono::Duration::seconds(60),
+        )
+        .await
+        .unwrap()
+        .expect("launch is recorded for a stopping runtime");
+    assert_eq!(recorded.status, "stopping");
+    assert_eq!(recorded.last_execution_id, Some(exec));
+    assert_eq!(
+        recorded.next_run_at, claimed.next_run_at,
+        "schedule untouched"
+    );
+
+    // The stopping branch cancels the raced execution, then finishes the stop.
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    assert_eq!(runtime_row(&app, agent_id).await.status, "stopping");
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.status, "stopped");
+    assert!(row.stopped_at.is_some());
+    let status: String = sqlx::query_scalar("SELECT status FROM executions WHERE id = $1")
+        .bind(exec)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "cancelled");
+
+    // No further executions, ever.
+    make_runtime_due(&pool, runtime.id).await;
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    assert_eq!(runtime_row(&app, agent_id).await.status, "stopped");
+    assert_eq!(execution_count(&pool, agent_id).await, 1);
+}
+
+#[tokio::test]
+async fn stop_during_inflight_tick_is_not_overwritten_by_backoff() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let pool = raw_pool().await;
+    let (runtime, agent_id, first) = runtime_with_first_execution(&app).await;
+    fail_execution(&pool, first).await;
+    make_runtime_due(&pool, runtime.id).await;
+    let claimed = app
+        .store
+        .claim_agent_runtime_tick(
+            runtime.id,
+            chrono::Utc::now() + chrono::Duration::seconds(5),
+        )
+        .await
+        .unwrap()
+        .expect("claimed");
+
+    app.store
+        .request_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Failure accounting, plain backoff and the stop-at-limit write are all refused.
+    let later = chrono::Utc::now() + chrono::Duration::seconds(300);
+    assert!(app
+        .store
+        .record_agent_runtime_failure(runtime.id, false, first, 1, "boom", later)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .record_agent_runtime_failure(runtime.id, true, first, 5, "boom", later)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .advance_agent_runtime(runtime.id, Some("transient"), later)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .halt_running_agent_runtime(runtime.id, "permanent")
+        .await
+        .unwrap()
+        .is_none());
+
+    let row = runtime_row(&app, agent_id).await;
+    assert_eq!(row.status, "stopping");
+    assert_eq!(row.consecutive_failures, 0);
+    assert_eq!(row.next_run_at, claimed.next_run_at);
+
+    // The last execution is terminal, so the next tick completes the stop.
+    orbit_api::background::runtime_tick(&app.state)
+        .await
+        .unwrap();
+    assert_eq!(runtime_row(&app, agent_id).await.status, "stopped");
+    assert_eq!(execution_count(&pool, agent_id).await, 1);
+}
+
+#[tokio::test]
+async fn runtime_status_transitions_are_guarded() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let _serial = RUNTIME_TICK_LOCK.lock().await;
+    let (runtime, agent_id, exec) = runtime_with_first_execution(&app).await;
+    let soon = chrono::Utc::now() + chrono::Duration::seconds(60);
+
+    // stopping -> stopped only from stopping.
+    assert!(app
+        .store
+        .finish_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(runtime_row(&app, agent_id).await.status, "running");
+
+    app.store
+        .request_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Stop is idempotent while stopping.
+    assert_eq!(
+        app.store
+            .request_agent_runtime_stop(runtime.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "stopping"
+    );
+    app.store
+        .finish_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Once stopped nothing moves it: no restart, no schedule, no launch, no second stop.
+    assert!(app
+        .store
+        .record_agent_runtime_launch(runtime.id, exec, true, soon)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .advance_agent_runtime(runtime.id, None, soon)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .halt_agent_runtime(runtime.id, "x")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(app
+        .store
+        .request_agent_runtime_stop(runtime.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(runtime_row(&app, agent_id).await.status, "stopped");
 }

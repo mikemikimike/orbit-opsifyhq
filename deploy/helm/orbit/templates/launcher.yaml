@@ -28,6 +28,12 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "watch", "create", "delete"]
+  # Per-launch worker env Secret (worker token + profile env), created next to the
+  # workload, owner-referenced to it via patch, and deleted on relaunch. Deliberately no
+  # get/list/watch: the launcher cannot read any Secret in the namespace.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -105,6 +111,26 @@ spec:
           ports:
             - name: http
               containerPort: 8090
+          # /healthz is unauthenticated and does not touch Docker or Kubernetes.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            failureThreshold: 15
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           volumeMounts:
             - name: tmp
               mountPath: /tmp

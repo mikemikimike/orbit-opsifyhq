@@ -83,7 +83,10 @@ pub async fn list(
     auth.require(Permission::HarnessesRead)?;
     let _team = state.store.get_agent_team(auth.org_id, team_id).await?;
     Ok(Json(
-        state.store.list_team_queue(auth.org_id, team_id).await?,
+        state
+            .store
+            .list_team_queue(auth.org_id, team_id, 500)
+            .await?,
     ))
 }
 
@@ -117,7 +120,12 @@ pub async fn run_item(
     Ok((StatusCode::CREATED, Json(detail)))
 }
 
-/// Create a TeamRun for a queue item and mark the item running.
+/// Claim a queue item, then create and start its TeamRun.
+///
+/// The claim (`pending|failed -> running`) is a single conditional UPDATE, so concurrent
+/// callers (double click, manual run vs auto-run, two replicas) cannot both start a run.
+/// Anything that fails after the claim cancels the run it created (and its queued
+/// execution) and puts the item back into `failed`, which is retryable.
 pub(crate) async fn start_queue_item(
     state: &AppState,
     auth: &AuthContext,
@@ -125,6 +133,15 @@ pub(crate) async fn start_queue_item(
     item: &TeamQueueItem,
 ) -> Result<crate::handlers::teams::TeamRunDetail, ApiError> {
     let definition = crate::handlers::teams::parse_definition(team)?;
+    let Some(item) = state
+        .store
+        .claim_team_queue_item(auth.org_id, item.id)
+        .await?
+    else {
+        return Err(ApiError::conflict(
+            "queue item is not startable (already running, succeeded or cancelled)",
+        ));
+    };
     let task = item
         .payload
         .get("task")
@@ -160,11 +177,59 @@ pub(crate) async fn start_queue_item(
         "queueItemId": item.id,
         "externalKey": item.external_key,
     });
-    let run = state
+    // Shared execution preflight (#140) before any run row is created.
+    let access = crate::access::AccessScope::load(state, auth).await?;
+    let step_agent_ids: Vec<Uuid> = definition.steps.iter().map(|step| step.agent_id).collect();
+    crate::preflight::authorize_team_run(
+        state,
+        auth.org_id,
+        &access,
+        team,
+        &step_agent_ids,
+        &crate::handlers::teams::team_connection_ids(&definition),
+    )
+    .await?;
+    let run = match state
         .store
         .create_team_run(auth.org_id, team.id, &input, Some(auth.user_id))
-        .await?;
-    let step = crate::handlers::teams::start_step(state, &run, &definition, 0, None).await?;
+        .await
+    {
+        Ok(run) => run,
+        Err(error) => {
+            let error = ApiError::from(error);
+            release_failed_claim(state, auth, &item, None, &error.message).await;
+            return Err(error);
+        }
+    };
+    match start_claimed_run(state, auth, &item, &run, &definition).await {
+        Ok(step) => Ok(crate::handlers::teams::TeamRunDetail {
+            run,
+            steps: vec![step],
+        }),
+        Err(error) => {
+            release_failed_claim(state, auth, &item, Some(&run), &error.message).await;
+            Err(error)
+        }
+    }
+}
+
+async fn start_claimed_run(
+    state: &AppState,
+    auth: &AuthContext,
+    item: &TeamQueueItem,
+    run: &orbit_store::TeamRun,
+    definition: &crate::handlers::teams::TeamDefinition,
+) -> Result<orbit_store::TeamStep, ApiError> {
+    if !state
+        .store
+        .attach_team_run_to_queue_item(auth.org_id, item.id, run.id)
+        .await?
+    {
+        return Err(ApiError::conflict(
+            "queue item was cancelled or claimed elsewhere while starting",
+        ));
+    }
+    let step = crate::handlers::teams::start_step(state, run, definition, 0, None).await?;
     if definition.auto_launch {
         if let (Some(profile_id), Some(execution_id)) =
             (definition.worker_profile_id, step.execution_id)
@@ -178,14 +243,48 @@ pub(crate) async fn start_queue_item(
             .await?;
         }
     }
-    state
+    Ok(step)
+}
+
+/// Undo a failed start: cancel the run and its not-yet-running execution so nothing
+/// executes for an item that is reported as failed, then mark the item retryable.
+async fn release_failed_claim(
+    state: &AppState,
+    auth: &AuthContext,
+    item: &TeamQueueItem,
+    run: Option<&orbit_store::TeamRun>,
+    message: &str,
+) {
+    if let Some(run) = run {
+        let key = format!("team:{}:0", run.id);
+        if let Ok(Some(execution)) = state
+            .store
+            .get_execution_by_idempotency_key(run.org_id, &key)
+            .await
+        {
+            if let Err(error) = state
+                .store
+                .request_execution_cancel(run.org_id, execution.id)
+                .await
+            {
+                tracing::warn!(%error, execution_id = %execution.id, "failed to cancel execution of aborted team run");
+            }
+        }
+        if let Err(error) = state
+            .store
+            .finish_team_run(run.id, "cancelled", None, Some(message))
+            .await
+        {
+            tracing::warn!(%error, run_id = %run.id, "failed to cancel aborted team run");
+        }
+    }
+    if let Err(error) = state
         .store
-        .set_team_queue_run(auth.org_id, item.id, run.id, "running")
-        .await?;
-    Ok(crate::handlers::teams::TeamRunDetail {
-        run,
-        steps: vec![step],
-    })
+        .fail_claimed_team_queue_item(auth.org_id, item.id, message)
+        .await
+    {
+        tracing::warn!(%error, queue_item = %item.id, "failed to release queue item claim");
+    }
 }
 
 async fn fetch_item(
@@ -216,12 +315,16 @@ pub async fn retry(
     if item.status == "running" {
         return Err(ApiError::conflict("running items must be cancelled first"));
     }
-    Ok(Json(
-        state
-            .store
-            .retry_team_queue_item(auth.org_id, item_id, None)
-            .await?,
-    ))
+    state
+        .store
+        .retry_team_queue_item(auth.org_id, item_id, None)
+        .await?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "item cannot be retried (only failed or cancelled items with attempts left; use requeue to reset)",
+            )
+        })
 }
 
 #[utoipa::path(post, path = "/api/v1/agent-teams/{team_id}/queue/{item_id}/requeue", tag = "agent-teams", responses((status = 200, body = orbit_store::team_queue::TeamQueueItem)))]
@@ -235,12 +338,14 @@ pub async fn requeue(
     if item.status == "running" {
         return Err(ApiError::conflict("running items must be cancelled first"));
     }
-    Ok(Json(
-        state
-            .store
-            .requeue_team_queue_item(auth.org_id, item_id)
-            .await?,
-    ))
+    state
+        .store
+        .requeue_team_queue_item(auth.org_id, item_id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::conflict("only pending, failed or cancelled items can be requeued")
+        })
 }
 
 #[utoipa::path(post, path = "/api/v1/agent-teams/{team_id}/queue/{item_id}/cancel", tag = "agent-teams", responses((status = 200, body = orbit_store::team_queue::TeamQueueItem)))]
@@ -255,11 +360,12 @@ pub async fn cancel(
     let updated = state
         .store
         .cancel_team_queue_item(auth.org_id, item_id, Some("cancelled by operator"))
-        .await?;
+        .await?
+        .ok_or_else(|| ApiError::conflict("item is already succeeded or cancelled"))?;
     if let Some(run_id) = run_id {
         let _ = state
             .store
-            .update_team_run(run_id, "cancelled", None, Some("queue item cancelled"))
+            .finish_team_run(run_id, "cancelled", None, Some("queue item cancelled"))
             .await;
     }
     Ok(Json(updated))
