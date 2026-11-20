@@ -485,7 +485,11 @@ pub async fn run_execution(
 
     // Shared with the broker: it pauses the run's clock while a person decides on an
     // approval, so that wait does not eat into the execution timeout.
-    let pause = orbit_contracts::PauseClock::default();
+    // Total approval time is capped (ORBIT_MAX_APPROVAL_WAIT_SECONDS); past it the run
+    // ends as timed out.
+    let pause = orbit_contracts::PauseClock::with_budget(Duration::from_secs(
+        orbit_contracts::max_approval_wait_seconds(),
+    ));
 
     // Policy-enforcing tool broker: only for harnesses that can consume MCP today
     // (OpenCode). It is execution-scoped and dropped at the end of this function.

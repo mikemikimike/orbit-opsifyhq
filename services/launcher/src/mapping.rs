@@ -295,12 +295,20 @@ pub fn map_docker(state: &str, oom_killed: bool, exit_code: i64, error: &str) ->
     }
 }
 
-/// `activeDeadlineSeconds` for a single-execution Job: the execution timeout plus a grace
-/// window for scheduling, image pull and teardown. Falls back to `default_seconds`.
-pub fn job_deadline_seconds(timeout_seconds: Option<u64>, default_seconds: u64) -> u64 {
+/// `activeDeadlineSeconds` for a single-execution Job: the execution timeout, plus the
+/// approval budget (the run's own clock pauses while a person decides, so the wall-clock
+/// kill deadline must not), plus a grace window for scheduling, image pull and teardown.
+/// Falls back to `default_seconds` when the request has no timeout.
+pub fn job_deadline_seconds(
+    timeout_seconds: Option<u64>,
+    approval_budget_seconds: u64,
+    default_seconds: u64,
+) -> u64 {
     const GRACE: u64 = 300;
     match timeout_seconds {
-        Some(t) if t > 0 => t.saturating_add(GRACE),
+        Some(t) if t > 0 => t
+            .saturating_add(approval_budget_seconds)
+            .saturating_add(GRACE),
         _ => default_seconds.max(1),
     }
 }
@@ -503,8 +511,17 @@ mod tests {
 
     #[test]
     fn job_deadline_derives_from_timeout() {
-        assert_eq!(job_deadline_seconds(Some(600), 7200), 900);
-        assert_eq!(job_deadline_seconds(None, 7200), 7200);
-        assert_eq!(job_deadline_seconds(Some(0), 7200), 7200);
+        assert_eq!(job_deadline_seconds(Some(600), 0, 7200), 900);
+        assert_eq!(job_deadline_seconds(None, 3600, 7200), 7200);
+        assert_eq!(job_deadline_seconds(Some(0), 3600, 7200), 7200);
+    }
+
+    #[test]
+    fn job_deadline_includes_the_approval_budget() {
+        // timeout 120 s + budget 3600 s + grace 300 s: an approval answered after 8
+        // minutes no longer hits DeadlineExceeded.
+        assert_eq!(job_deadline_seconds(Some(120), 3600, 7200), 4020);
+        assert!(job_deadline_seconds(Some(120), 3600, 7200) > 120 + 8 * 60);
+        assert_eq!(job_deadline_seconds(Some(u64::MAX), 3600, 7200), u64::MAX);
     }
 }

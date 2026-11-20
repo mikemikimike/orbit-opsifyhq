@@ -355,6 +355,12 @@ serviceAccount:
 
 podAnnotations: {}
 
+# Most time (seconds), in total, a run may spend paused waiting for human approvals.
+# Job activeDeadlineSeconds and the Docker dispatch backstop are timeout + this budget +
+# grace; once it is used up, further approvals are denied and the run ends as timed_out.
+# Sets ORBIT_MAX_APPROVAL_WAIT_SECONDS on the launcher and workers.
+maxApprovalWaitSeconds: 3600
+
 # Extra environment variables for all backend workloads (list of env objects).
 extraEnv: []
 
