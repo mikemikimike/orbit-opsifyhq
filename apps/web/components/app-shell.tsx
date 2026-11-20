@@ -3,7 +3,7 @@
 import { useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
 
-import { CloudOff, RefreshCw } from "lucide-react";
+import { CloudOff, Loader2, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ui/empty-state";
@@ -55,6 +55,22 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       : null;
 
   const title = publicPath ? "Sign in · ORBIT" : `${pageLabel(pathname)} · ORBIT`;
+  const hasToken = Boolean(getAccessToken());
+
+  // Don't render the signed-in chrome while OIDC auth is still being resolved. Without
+  // this the navigation flashes for a frame before the effect redirects to the IdP.
+  if (!publicPath && (meta.isPending || (authMode.mode === "oidc" && (!hasToken || me.isPending)))) {
+    return (
+      <div
+        data-ink
+        className="flex min-h-dvh items-center justify-center bg-background"
+        role="status"
+        aria-label="Checking sign-in"
+      >
+        <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
 
   if (publicPath) {
     // Signed-out screens get no navigation: nothing behind it is reachable yet.
