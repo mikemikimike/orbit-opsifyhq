@@ -137,9 +137,10 @@ export function useLicense() {
   });
 }
 
-export function useMe() {
+export function useMe(enabled = true) {
   return useQuery<MeResponse>({
     queryKey: queryKeys.me,
+    enabled,
     queryFn: async () => unwrap(await api.GET("/api/v1/me")),
     staleTime: 60_000,
     // 401/403 will not heal by retrying. Transient failures (5xx, network) back off

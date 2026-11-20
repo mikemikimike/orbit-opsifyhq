@@ -27,7 +27,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const meta = useMeta();
   const publicPath = isPublicPath(pathname);
 
-  const me = useMe();
+  // Public pages (login/callback) have no token yet. Querying /me there caches a 401,
+  // which the shell then reuses after the callback redirect and clears the fresh token.
+  const me = useMe(!publicPath);
   useEffect(() => {
     const auth = (meta.data?.auth ?? {}) as { mode?: string };
     if (auth.mode !== "oidc" || publicPath) return;
