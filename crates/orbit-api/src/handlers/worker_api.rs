@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use orbit_contracts::{
-    subjects, ModelEndpoint, ModelSelection, OrbitEvent, ProviderCompat, ProviderKind, SecretLease,
+    subjects, ModelEndpoint, ModelProtocol, ModelSelection, OrbitEvent, ProviderCompat,
+    ProviderKind, SecretLease,
 };
 use orbit_domain::{
     AgentSpec, CapabilityEffect, ExecutionEventKind, ExecutionStatus, GrantedCapability, LogLevel,
@@ -1112,20 +1113,33 @@ async fn resolve_model(
     require_principal_can_use(access, &provider)?;
     let kind = ProviderKind::parse(&provider.kind)
         .ok_or_else(|| ApiError::internal("provider has an unknown kind"))?;
-    if kind != ProviderKind::OpenAiCompatible {
-        return Err(ApiError::conflict(format!(
-            "provider '{name}' is harness-managed and cannot be used with platform model management"
-        )));
-    }
+    let protocol = match kind {
+        ProviderKind::OpenAiCompatible => ModelProtocol::OpenAiCompatible,
+        ProviderKind::Anthropic => ModelProtocol::AnthropicMessages,
+        ProviderKind::HarnessManaged => {
+            return Err(ApiError::conflict(format!(
+                "provider '{name}' is harness-managed and cannot be used with platform model management"
+            )))
+        }
+    };
     if !provider.enabled {
         return Err(ApiError::conflict(format!("provider '{name}' is disabled")));
     }
-    let base_url = provider
+    let base_url = match provider
         .config
         .get("baseUrl")
         .and_then(|value| value.as_str())
-        .ok_or_else(|| ApiError::conflict(format!("provider '{name}' is missing baseUrl")))?
-        .to_string();
+    {
+        Some(value) => value.to_string(),
+        None if protocol == ModelProtocol::AnthropicMessages => {
+            "https://api.anthropic.com/v1".to_string()
+        }
+        None => {
+            return Err(ApiError::conflict(format!(
+                "provider '{name}' is missing baseUrl"
+            )))
+        }
+    };
     let model_id = model
         .or_else(|| {
             provider
@@ -1193,6 +1207,7 @@ async fn resolve_model(
         endpoint: Some(ModelEndpoint {
             base_url,
             model: model_id,
+            protocol,
             headers,
             request_params,
             compat,

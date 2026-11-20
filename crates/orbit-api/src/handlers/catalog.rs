@@ -338,7 +338,7 @@ pub async fn probe_provider(
             .map(|value| value.expose().to_string()),
         None => None,
     };
-    let result = probe_endpoint(&provider.config, credential.as_deref()).await;
+    let result = probe_endpoint(kind, &provider.config, credential.as_deref()).await;
 
     // Persist discovered models so agent/worker selectors can use them without a manual
     // catalog edit. Keep any existing settings/catalog merge semantics.
@@ -387,15 +387,20 @@ pub async fn probe_unsaved(
     }
     // Never persist or log the credential used for this probe.
     Ok(Json(
-        probe_endpoint(&config, body.credential.as_deref()).await,
+        probe_endpoint(kind, &config, body.credential.as_deref()).await,
     ))
 }
 
 async fn probe_endpoint(
+    kind: ProviderKind,
     config: &serde_json::Value,
     credential: Option<&str>,
 ) -> ProviderProbeResponse {
-    let base_url = config.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("");
+    let base_url = match config.get("baseUrl").and_then(|v| v.as_str()) {
+        Some(value) if !value.is_empty() => value,
+        _ if kind == ProviderKind::Anthropic => "https://api.anthropic.com/v1",
+        _ => "",
+    };
     if base_url.is_empty() {
         return ProviderProbeResponse {
             ok: false,
@@ -430,7 +435,13 @@ async fn probe_endpoint(
     let client = orbit_security::guarded_client(std::time::Duration::from_secs(10));
     let mut request = client.get(&url);
     if let Some(credential) = credential {
-        request = request.bearer_auth(credential);
+        request = if kind == ProviderKind::Anthropic {
+            request
+                .header("x-api-key", credential)
+                .header("anthropic-version", "2023-06-01")
+        } else {
+            request.bearer_auth(credential)
+        };
     }
     for (name, value) in config
         .get("headers")

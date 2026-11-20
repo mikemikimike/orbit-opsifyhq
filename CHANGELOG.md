@@ -8,6 +8,22 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ## [Unreleased]
 
+### Security
+
+- Binding `model.provider` now requires **use** on that provider in both `platform` and
+  `harness` management modes (agent create, update, import and every execute preflight,
+  incl. team subagents). The worker context also re-checks the run principal (requester,
+  else agent owner) and refuses to return a provider credential it cannot use (#193).
+
+## [0.23.0] - 2026-11-20
+
+### Changed
+
+- Execution detail pages can approve or reject a pending tool call inline, with the exact
+  action details, instead of navigating to Approvals first.
+- Approvals are one click: the card's Approve/Reject buttons decide immediately and show a
+  per-button loading state. The redundant confirmation dialog was removed.
+
 ### Fixed
 
 - Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval
@@ -18,10 +34,6 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ### Security
 
-- Binding `model.provider` now requires **use** on that provider in both `platform` and
-  `harness` management modes (agent create, update, import and every execute preflight,
-  incl. team subagents). The worker context also re-checks the run principal (requester,
-  else agent owner) and refuses to return a provider credential it cannot use (#193).
 - Creating a trigger now requires **use** on the target agent and use of every connection
   and provider its current spec references, closing an IDOR that let an Operator attach a
   trigger to a private agent (#135).

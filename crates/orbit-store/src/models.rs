@@ -590,6 +590,9 @@ pub struct EnvMapping {
     pub name: String,
     pub description: String,
     pub mappings: serde_json::Value,
+    pub owner_user_id: Option<Uuid>,
+    pub owner_team_id: Option<Uuid>,
+    pub visibility: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

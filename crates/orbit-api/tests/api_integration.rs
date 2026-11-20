@@ -3413,3 +3413,70 @@ async fn worker_context_withholds_credential_from_unauthorized_principal() {
         "sk-victim-secret"
     );
 }
+
+#[tokio::test]
+async fn env_mapping_edit_requires_manage_access() {
+    let Some(app) = test_app(false).await else {
+        return;
+    };
+    let alice = app
+        .store
+        .ensure_user(app.org_id, "env-alice@test.local", "Alice", UserRole::Owner)
+        .await
+        .unwrap();
+    let bob = app
+        .store
+        .ensure_user(app.org_id, "env-bob@test.local", "Bob", UserRole::Operator)
+        .await
+        .unwrap();
+    let alice_token = token_for(&app.store, app.org_id, alice.id, "env-alice").await;
+    let bob_token = token_for(&app.store, app.org_id, bob.id, "env-bob").await;
+    let mapping = app
+        .store
+        .create_env_mapping(
+            app.org_id,
+            "private env",
+            "",
+            &json!([{ "envVar": "TOKEN", "secretKey": "missing" }]),
+        )
+        .await
+        .unwrap();
+    make_private(&app.store, app.org_id, "env_mappings", mapping.id, alice.id).await;
+
+    let (status, body) = send(&app.router, auth_get("/api/v1/env-mappings", &bob_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["id"] != mapping.id.to_string()));
+
+    let (status, _) = send(
+        &app.router,
+        auth_patch(
+            &format!("/api/v1/env-mappings/{}", mapping.id),
+            &bob_token,
+            json!({ "name": "hijacked", "mappings": [] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send(
+        &app.router,
+        auth_delete(&format!("/api/v1/env-mappings/{}", mapping.id), &bob_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = send(
+        &app.router,
+        auth_patch(
+            &format!("/api/v1/env-mappings/{}", mapping.id),
+            &alice_token,
+            json!({ "name": "private env renamed", "mappings": [] }),
+        ),
+    )
+    .await;
+    // The owner passes the access check; validation still rejects the empty mapping.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
