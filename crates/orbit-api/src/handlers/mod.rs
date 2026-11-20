@@ -11,6 +11,7 @@ pub mod executions;
 pub mod export;
 pub mod health;
 pub mod import;
+pub mod import_portable;
 pub mod license;
 pub mod outputs;
 pub mod roles;

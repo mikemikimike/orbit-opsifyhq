@@ -1625,6 +1625,7 @@ dependencies = [
  "orbit-domain",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror",
  "tokio",
  "tokio-util",

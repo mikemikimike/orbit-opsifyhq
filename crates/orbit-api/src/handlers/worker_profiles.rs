@@ -106,7 +106,7 @@ fn resolve_agent_scope(requested: Option<&str>, agent_ids: &[Uuid]) -> Result<St
     }
 }
 
-fn validate_native_tool_permissions(value: &serde_json::Value) -> Result<(), ApiError> {
+pub(crate) fn validate_native_tool_permissions(value: &serde_json::Value) -> Result<(), ApiError> {
     let Some(map) = value.as_object() else {
         if value.is_null() {
             return Ok(());
@@ -131,7 +131,9 @@ fn validate_native_tool_permissions(value: &serde_json::Value) -> Result<(), Api
     Ok(())
 }
 
-fn resolve_worker_resources(value: &serde_json::Value) -> Result<serde_json::Value, ApiError> {
+pub(crate) fn resolve_worker_resources(
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
     let resources: orbit_domain::WorkerResources =
         if value.is_null() || value.as_object().is_some_and(|object| object.is_empty()) {
             orbit_domain::WorkerResources::defaults()

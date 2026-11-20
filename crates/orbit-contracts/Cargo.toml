@@ -20,3 +20,4 @@ http.workspace = true
 futures.workspace = true
 tracing.workspace = true
 utoipa.workspace = true
+serde_yaml.workspace = true

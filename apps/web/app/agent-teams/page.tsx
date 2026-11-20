@@ -20,6 +20,7 @@ import {
 import { toast } from "sonner";
 
 import { exportResource } from "@/components/export-resource-button";
+import { ImportPortableButton } from "@/components/import-portable-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Disclosure } from "@/components/ui/disclosure";
 import { ResourceAccessFields } from "@/components/resource-access-fields";
@@ -453,9 +454,12 @@ export default function AgentTeamsPage() {
         title="Agent teams"
         description="A primary agent and its helpers, working toward one goal. Define the team here, start runs, and follow each step as it executes."
         actions={
-          <Button onClick={openCreate}>
-            <Plus /> New agent team
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <ImportPortableButton />
+            <Button onClick={openCreate}>
+              <Plus /> New agent team
+            </Button>
+          </div>
         }
       />
 
@@ -529,7 +533,7 @@ export default function AgentTeamsPage() {
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
                             <DropdownMenuItem onSelect={() => void exportResource("agent_teams", team.id, team.name)}>
-                              <Download /> Export as JSON
+                              <Download /> Export as YAML
                             </DropdownMenuItem>
                             <DropdownMenuSeparator />
                             <DropdownMenuItem destructive onSelect={() => void deleteTeam(team)}>

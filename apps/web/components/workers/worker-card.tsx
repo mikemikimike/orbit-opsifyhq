@@ -170,7 +170,7 @@ export function WorkerCard({
                 <Copy /> Copy profile ID
               </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => void exportResource("worker_profiles", profile.id, profile.name)}>
-                <Download /> Export as JSON
+                <Download /> Export as YAML
               </DropdownMenuItem>
               <DropdownMenuItem onSelect={onToggle}>
                 {profile.enabled ? (

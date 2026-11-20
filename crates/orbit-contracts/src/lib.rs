@@ -6,6 +6,7 @@
 pub mod connector;
 pub mod events;
 pub mod harness;
+pub mod portable;
 pub mod provider;
 
 pub use connector::*;

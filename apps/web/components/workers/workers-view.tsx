@@ -6,6 +6,7 @@ import { Plus } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { ImportPortableButton } from "@/components/import-portable-dialog";
 import { Callout } from "@/components/ui/callout";
 import { PageHeader } from "@/components/ui/page-header";
 import { useMeta, useWorkerLaunches, useWorkerProfiles, useWorkers } from "@/lib/queries";
@@ -122,9 +123,12 @@ export function WorkersView() {
         description="Workers run agent executions. A profile fixes the image, target, agents, skills and harness auth; launch it from here or bootstrap it yourself with Docker, Compose or Kubernetes."
         meta={summary.length ? summary : undefined}
         actions={
-          <Button onClick={() => openEditor({ profile: null })}>
-            <Plus /> New profile
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <ImportPortableButton />
+            <Button onClick={() => openEditor({ profile: null })}>
+              <Plus /> New profile
+            </Button>
+          </div>
         }
       />
 

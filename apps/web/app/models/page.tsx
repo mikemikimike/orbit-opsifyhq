@@ -46,6 +46,7 @@ import { PageHeader } from "@/components/ui/page-header";
 import { Section } from "@/components/ui/section";
 import { Select } from "@/components/ui/select";
 import { exportResource } from "@/components/export-resource-button";
+import { ImportPortableButton } from "@/components/import-portable-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Status, type StatusMeta } from "@/components/ui/status";
 import { api } from "@/lib/api";
@@ -396,9 +397,12 @@ export default function ModelsPage() {
         title="Model providers"
         description="Where agents get their models: any OpenAI-compatible endpoint, or a provider managed by a harness. Credentials are encrypted and never shown again."
         actions={
-          <Button onClick={openCreate}>
-            <Plus /> Add provider
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <ImportPortableButton />
+            <Button onClick={openCreate}>
+              <Plus /> Add provider
+            </Button>
+          </div>
         }
       />
 
@@ -527,7 +531,7 @@ export default function ModelsPage() {
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
                         <DropdownMenuItem onSelect={() => void exportResource("providers", provider.id, provider.name)}>
-                          <Download /> Export as JSON
+                          <Download /> Export as YAML
                         </DropdownMenuItem>
                         <DropdownMenuItem destructive onSelect={() => void deleteProvider(provider)}>
                           <Trash2 /> Delete provider
