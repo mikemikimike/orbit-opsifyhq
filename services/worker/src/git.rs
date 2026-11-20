@@ -10,6 +10,18 @@ use tokio::process::Command;
 
 use crate::client::{WorkerClient, WorkerConnection};
 
+const ORBIT_GENERATED_PATHS: &[&str] = &[
+    "AGENTS.md",
+    "opencode.json",
+    ".opencode/agents",
+    ".opencode/plugins/orbit-policy.ts",
+    ".opencode/skills",
+    ".pi/mcp.json",
+    ".pi/extensions/orbit-policy.ts",
+    ".pi/skills",
+    ".pi-sessions",
+];
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RepoSpec {
@@ -78,6 +90,51 @@ async fn write_askpass() -> anyhow::Result<std::path::PathBuf> {
         tokio::fs::set_permissions(&path, permissions).await?;
     }
     Ok(path)
+}
+
+async fn stage_workspace_changes(workspace: &Path) -> anyhow::Result<()> {
+    let head = Command::new("git")
+        .current_dir(workspace)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .await?;
+    let unstage = if head.status.success() {
+        let mut command = Command::new("git");
+        command
+            .current_dir(workspace)
+            .args(["reset", "--quiet", "HEAD", "--"])
+            .args(ORBIT_GENERATED_PATHS);
+        command.output().await?
+    } else {
+        let mut command = Command::new("git");
+        command
+            .current_dir(workspace)
+            .args(["rm", "--cached", "--ignore-unmatch", "-r", "--"])
+            .args(ORBIT_GENERATED_PATHS);
+        command.output().await?
+    };
+    if !unstage.status.success() {
+        anyhow::bail!(
+            "could not unstage ORBIT-generated files: {}",
+            String::from_utf8_lossy(&unstage.stderr).trim()
+        );
+    }
+
+    let mut command = Command::new("git");
+    command
+        .current_dir(workspace)
+        .args(["add", "-A", "--", "."]);
+    for path in ORBIT_GENERATED_PATHS {
+        command.arg(format!(":(exclude){path}"));
+    }
+    let add = command.output().await?;
+    if !add.status.success() {
+        anyhow::bail!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 fn apply_git_auth(command: &mut Command, askpass: &Path, username: &str) {
@@ -335,16 +392,8 @@ pub async fn commit(
         .as_ref()
         .map(|secret| secret.value.clone())
         .ok_or_else(|| anyhow::anyhow!("connection has no token"))?;
+    stage_workspace_changes(workspace).await?;
     let askpass = write_askpass().await?;
-    let add = Command::new("git")
-        .current_dir(workspace)
-        .args(["add", "-A"])
-        .output()
-        .await?;
-    if !add.status.success() {
-        let _ = tokio::fs::remove_file(&askpass).await;
-        anyhow::bail!("git add failed: {}", String::from_utf8_lossy(&add.stderr));
-    }
     let mut command = Command::new("git");
     command.current_dir(workspace).args([
         "-c",
@@ -412,4 +461,98 @@ pub async fn push(
         );
     }
     Ok(serde_json::json!({ "status": "pushed", "branch": branch }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as StdCommand;
+
+    fn git(workspace: &Path, args: &[&str]) -> std::process::Output {
+        let output = StdCommand::new("git")
+            .current_dir(workspace)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    #[tokio::test]
+    async fn staging_omits_orbit_generated_files_and_keeps_source_changes() {
+        let workspace =
+            std::env::temp_dir().join(format!("orbit-git-stage-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        git(&workspace, &["init"]);
+        std::fs::write(workspace.join("AGENTS.md"), "repository guidance\n").unwrap();
+        std::fs::write(workspace.join("README.md"), "baseline\n").unwrap();
+        git(&workspace, &["add", "-A"]);
+        git(
+            &workspace,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline",
+            ],
+        );
+
+        std::fs::write(workspace.join("AGENTS.md"), "runtime instructions\n").unwrap();
+        std::fs::write(workspace.join("opencode.json"), "provider config\n").unwrap();
+        for path in [
+            ".opencode/agents/reviewer.md",
+            ".opencode/plugins/orbit-policy.ts",
+            ".opencode/skills/review/SKILL.md",
+            ".pi/mcp.json",
+            ".pi/extensions/orbit-policy.ts",
+            ".pi/skills/review/SKILL.md",
+            ".pi-sessions/session.json",
+        ] {
+            let path = workspace.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "runtime generated secret\n").unwrap();
+        }
+        let source = workspace.join("src/change.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub fn change() {}\n").unwrap();
+        git(&workspace, &["add", "-A"]);
+
+        stage_workspace_changes(&workspace).await.unwrap();
+
+        let staged = git(&workspace, &["diff", "--cached", "--name-only"]);
+        let paths = String::from_utf8(staged.stdout).unwrap();
+        assert_eq!(paths.lines().collect::<Vec<_>>(), ["src/change.rs"]);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn staging_omits_orbit_generated_files_in_an_unborn_repository() {
+        let workspace =
+            std::env::temp_dir().join(format!("orbit-git-stage-unborn-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        git(&workspace, &["init"]);
+
+        std::fs::write(workspace.join("AGENTS.md"), "runtime instructions\n").unwrap();
+        std::fs::write(workspace.join("opencode.json"), "provider config\n").unwrap();
+        let source = workspace.join("src/change.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub fn change() {}\n").unwrap();
+        git(&workspace, &["add", "-A"]);
+
+        stage_workspace_changes(&workspace).await.unwrap();
+
+        let staged = git(&workspace, &["diff", "--cached", "--name-only"]);
+        let paths = String::from_utf8(staged.stdout).unwrap();
+        assert_eq!(paths.lines().collect::<Vec<_>>(), ["src/change.rs"]);
+        assert!(workspace.join("opencode.json").exists());
+        let _ = std::fs::remove_dir_all(workspace);
+    }
 }

@@ -339,12 +339,17 @@ fn write_pi_mcp_config(workspace: &Path, bridge: &PiMcpBridge) -> std::io::Resul
         return Ok(());
     }
     std::fs::create_dir_all(workspace.join(".pi"))?;
+    let environment = bridge
+        .environment
+        .keys()
+        .map(|name| (name.clone(), format!("${{{name}}}")))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let config = json!({
         "mcpServers": {
             "orbit": {
                 "command": bridge.command[0],
                 "args": bridge.command.iter().skip(1).cloned().collect::<Vec<_>>(),
-                "env": bridge.environment,
+                "env": environment,
                 "exposure": "direct",
                 "description": "ORBIT policy-enforcing GitHub tools"
             }
@@ -1034,5 +1039,34 @@ mod platform_model_tests {
         assert_eq!(provider["models"][0]["id"], "internal-model");
         assert_eq!(provider["apiKey"], "$OPENAI_API_KEY");
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod mcp_config_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_config_references_environment_values_without_persisting_them() {
+        let workspace = std::env::temp_dir().join(format!("orbit-pi-mcp-{}", uuid::Uuid::now_v7()));
+        let bridge = PiMcpBridge {
+            command: vec!["orbit-worker".into(), "mcp-broker".into()],
+            environment: std::collections::BTreeMap::from([
+                ("ORBIT_BROKER_URL".into(), "http://127.0.0.1:1234".into()),
+                ("ORBIT_BROKER_TOKEN".into(), "broker-secret-value".into()),
+            ]),
+        };
+
+        write_pi_mcp_config(&workspace, &bridge).unwrap();
+
+        let path = workspace.join(".pi/mcp.json");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let config: Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(
+            config["mcpServers"]["orbit"]["env"]["ORBIT_BROKER_TOKEN"],
+            "${ORBIT_BROKER_TOKEN}"
+        );
+        assert!(!contents.contains("broker-secret-value"));
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }
