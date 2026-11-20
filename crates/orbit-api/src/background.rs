@@ -560,13 +560,12 @@ async fn reconcile_worker_tags(state: &AppState) -> anyhow::Result<()> {
         let desired = format!("{}:{}", profile.image, tag);
         let launches = state
             .store
-            .list_worker_launches(profile.org_id, None)
+            .active_launches_for_profile(profile.org_id, profile.id)
             .await?;
-        for launch in launches.into_iter().filter(|launch| {
-            launch.profile_id == profile.id
-                && matches!(launch.status.as_str(), "pending" | "starting" | "running")
-                && launch.image != desired
-        }) {
+        for launch in launches
+            .into_iter()
+            .filter(|launch| launch.image != desired)
+        {
             let auth = orbit_security::AuthContext {
                 user_id,
                 org_id: profile.org_id,

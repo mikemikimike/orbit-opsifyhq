@@ -342,13 +342,8 @@ pub(crate) async fn launch_profile_internal(
     if single_execution_id.is_none() {
         if let Some(existing) = state
             .store
-            .list_worker_launches(auth.org_id, None)
+            .find_live_launch_for_profile(auth.org_id, profile.id)
             .await?
-            .into_iter()
-            .find(|launch| {
-                launch.profile_id == profile.id
-                    && matches!(launch.status.as_str(), "pending" | "starting" | "running")
-            })
         {
             return Ok(existing);
         }
@@ -362,7 +357,7 @@ pub(crate) async fn launch_profile_internal(
         profile.image_tag.clone()
     };
     let image = format!("{}:{}", profile.image, image_tag);
-    let launch = state
+    let launch = match state
         .store
         .create_worker_launch(
             auth.org_id,
@@ -372,8 +367,29 @@ pub(crate) async fn launch_profile_internal(
             &image,
             Some(issued.token_id),
             Some(auth.user_id),
+            single_execution_id.is_some(),
         )
-        .await?;
+        .await
+    {
+        Ok(launch) => launch,
+        Err(error) => {
+            let _ = state
+                .store
+                .revoke_worker_token(auth.org_id, issued.token_id)
+                .await;
+            // Lost the race against a concurrent launch of the same profile: reuse the winner.
+            if error.is_unique_violation() && single_execution_id.is_none() {
+                if let Some(existing) = state
+                    .store
+                    .find_live_launch_for_profile(auth.org_id, profile.id)
+                    .await?
+                {
+                    return Ok(existing);
+                }
+            }
+            return Err(error.into());
+        }
+    };
     let worker_id = format!("worker-{}", &launch.id.to_string()[..8]);
     let mut timeout_seconds = None;
     if let Some(execution_id) = single_execution_id {
@@ -382,11 +398,34 @@ pub(crate) async fn launch_profile_internal(
             .store
             .set_worker_launch_single_execution(launch.id, execution_id)
             .await?;
-        let claimed = state
-            .store
-            .claim_execution(execution_id, &worker_id)
-            .await?
-            .ok_or_else(|| ApiError::conflict("execution is no longer queued for this launch"))?;
+        let claimed = state.store.claim_execution(execution_id, &worker_id).await;
+        let claimed = match claimed {
+            Ok(Some(claimed)) => claimed,
+            other => {
+                // Do not leave a phantom pending launch or an active token behind.
+                let _ = state
+                    .store
+                    .revoke_worker_token(auth.org_id, issued.token_id)
+                    .await;
+                let _ = state
+                    .store
+                    .update_worker_launch(
+                        auth.org_id,
+                        launch.id,
+                        "failed",
+                        None,
+                        None,
+                        Some("execution was no longer queued for this launch"),
+                        false,
+                        true,
+                    )
+                    .await;
+                other?;
+                return Err(ApiError::conflict(
+                    "execution is no longer queued for this launch",
+                ));
+            }
+        };
         timeout_seconds = Some(claimed.timeout_seconds.max(1) as u64);
         // The launched worker authenticates with this launch's token; bind the claim to it.
         state
