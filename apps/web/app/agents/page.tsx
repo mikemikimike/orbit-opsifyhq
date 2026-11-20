@@ -7,6 +7,8 @@ import { Bot, Plus, Search, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { BulkAccessDialog } from "@/components/bulk-access-dialog";
 import { Callout } from "@/components/ui/callout";
 import { Card } from "@/components/ui/card";
 import { useConfirm } from "@/components/ui/confirm";
@@ -43,6 +45,8 @@ export default function AgentsPage() {
   // freshly created agent is a draft and must be visible where its author looks.
   const [filter, setFilter] = useState<Filter>("current");
   const [search, setSearch] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkOpen, setBulkOpen] = useState(false);
   const agents = useAllAgents();
   const queryClient = useQueryClient();
   const confirm = useConfirm();
@@ -138,6 +142,40 @@ export default function AgentsPage() {
         />
       </div>
 
+      {selected.size ? (
+        <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-subtle px-3 py-2.5">
+          <Checkbox
+            aria-label="Select all shown agents"
+            checked={visible.every((agent) => selected.has(agent.id))}
+            onChange={(event) =>
+              setSelected(
+                event.target.checked
+                  ? new Set([...selected, ...visible.map((agent) => agent.id)])
+                  : new Set([...selected].filter((id) => !visible.some((agent) => agent.id === id))),
+              )
+            }
+          />
+          <span className="text-[13px] font-medium">{selected.size} selected</span>
+          <Button size="sm" variant="outline" onClick={() => setBulkOpen(true)}>
+            Change access
+          </Button>
+          <Button size="sm" variant="ghost" onClick={() => setSelected(new Set())}>
+            Clear selection
+          </Button>
+        </div>
+      ) : null}
+
+      <BulkAccessDialog
+        open={bulkOpen}
+        onOpenChange={setBulkOpen}
+        resource="agents"
+        ids={[...selected]}
+        onDone={() => {
+          setSelected(new Set());
+          void invalidateAgents();
+        }}
+      />
+
       {agents.isLoading ? (
         <Card className="overflow-hidden">
           {Array.from({ length: 4 }).map((_, index) => (
@@ -167,6 +205,15 @@ export default function AgentsPage() {
                 <AgentRow
                   key={agent.id}
                   agent={agent}
+                  selected={selected.has(agent.id)}
+                  onSelect={(checked) =>
+                    setSelected((current) => {
+                      const next = new Set(current);
+                      if (checked) next.add(agent.id);
+                      else next.delete(agent.id);
+                      return next;
+                    })
+                  }
                   onDelete={async (target) => {
                     const confirmed = await confirm({
                       title: `Delete ${target.name} permanently?`,

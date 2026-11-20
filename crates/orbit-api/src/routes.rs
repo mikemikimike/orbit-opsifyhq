@@ -299,6 +299,10 @@ pub fn build_router(state: AppState) -> Router {
             get(handlers::export::export_resource),
         )
         .route(
+            "/api/v1/sharing/{resource}/bulk",
+            axum::routing::patch(handlers::sharing::bulk_share),
+        )
+        .route(
             "/api/v1/sharing/{resource}/{resource_id}",
             get(handlers::sharing::get).patch(handlers::sharing::share),
         )

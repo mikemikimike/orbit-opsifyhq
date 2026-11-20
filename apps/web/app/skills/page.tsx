@@ -21,6 +21,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
 import { Card } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { BulkAccessDialog } from "@/components/bulk-access-dialog";
 import { useConfirm } from "@/components/ui/confirm";
 import {
   Dialog,
@@ -84,6 +86,8 @@ export default function SkillsPage() {
   const [editing, setEditing] = useState<Skill | null>(null);
   const [viewing, setViewing] = useState<Skill | null>(null);
   const [search, setSearch] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkOpen, setBulkOpen] = useState(false);
   const [name, setName] = useState("");
   const [slug, setSlug] = useState("");
   const [description, setDescription] = useState("");
@@ -271,6 +275,40 @@ export default function SkillsPage() {
             </div>
           ) : null}
 
+          {selected.size ? (
+            <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-subtle px-3 py-2.5">
+              <Checkbox
+                aria-label="Select all shown skills"
+                checked={shown.every((skill) => selected.has(skill.id))}
+                onChange={(event) =>
+                  setSelected(
+                    event.target.checked
+                      ? new Set([...selected, ...shown.map((skill) => skill.id)])
+                      : new Set([...selected].filter((id) => !shown.some((skill) => skill.id === id))),
+                  )
+                }
+              />
+              <span className="text-[13px] font-medium">{selected.size} selected</span>
+              <Button size="sm" variant="outline" onClick={() => setBulkOpen(true)}>
+                Change access
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => setSelected(new Set())}>
+                Clear selection
+              </Button>
+            </div>
+          ) : null}
+
+          <BulkAccessDialog
+            open={bulkOpen}
+            onOpenChange={setBulkOpen}
+            resource="skills"
+            ids={[...selected]}
+            onDone={() => {
+              setSelected(new Set());
+              void queryClient.invalidateQueries({ queryKey: ["skills"] });
+            }}
+          />
+
           {shown.length === 0 ? (
             <EmptyState
               icon={<Search />}
@@ -292,6 +330,18 @@ export default function SkillsPage() {
                     key={skill.id}
                     className="flex flex-col gap-3 border-b px-4 py-4 last:border-b-0 sm:px-5 md:flex-row md:items-center md:gap-5"
                   >
+                    <Checkbox
+                      aria-label={`Select ${skill.name}`}
+                      checked={selected.has(skill.id)}
+                      onChange={(event) =>
+                        setSelected((current) => {
+                          const next = new Set(current);
+                          if (event.target.checked) next.add(skill.id);
+                          else next.delete(skill.id);
+                          return next;
+                        })
+                      }
+                    />
                     <div className="min-w-0 flex-1 space-y-1">
                       <div className="flex flex-wrap items-center gap-2">
                         <button

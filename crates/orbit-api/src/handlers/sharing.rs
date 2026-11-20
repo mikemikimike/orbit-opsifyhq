@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::Extension;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use orbit_domain::ValidationIssue;
@@ -94,4 +95,125 @@ pub async fn get(
         visibility,
         owner_team_id: owner_team,
     }))
+}
+
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkShareRequest {
+    pub ids: Vec<Uuid>,
+    #[serde(default)]
+    pub visibility: Option<String>,
+    #[serde(default)]
+    pub owner_team_id: Option<Uuid>,
+    /// Explicitly clear the owning team when no ownerTeamId is sent.
+    #[serde(default)]
+    pub clear_owner_team: bool,
+}
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkShareFailure {
+    pub id: Uuid,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkShareResponse {
+    pub updated: Vec<Uuid>,
+    pub failed: Vec<BulkShareFailure>,
+}
+
+/// Bulk visibility/ownership update for agents, skills and other shareable resources.
+///
+/// Partial success is intentional: one resource the caller cannot manage must not block
+/// the rest, and the response says exactly which ids failed.
+#[utoipa::path(patch, path = "/api/v1/sharing/{resource}/bulk", tag = "sharing", request_body = BulkShareRequest, responses((status = 200, body = BulkShareResponse)))]
+pub async fn bulk_share(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(resource): Path<String>,
+    crate::extract::ApiJson(body): crate::extract::ApiJson<BulkShareRequest>,
+) -> Result<Json<BulkShareResponse>, ApiError> {
+    auth.require(Permission::SettingsWrite)?;
+    state.require_feature("resource_permissions")?;
+    let ids: Vec<Uuid> = body
+        .ids
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if ids.is_empty() || ids.len() > 500 {
+        return Err(ApiError::validation(vec![ValidationIssue::new(
+            "ids",
+            "select between 1 and 500 resources",
+        )]));
+    }
+    if let Some(visibility) = &body.visibility {
+        if !matches!(visibility.as_str(), "private" | "team" | "org") {
+            return Err(ApiError::validation(vec![ValidationIssue::new(
+                "visibility",
+                "must be private, team or org",
+            )]));
+        }
+    }
+    if let Some(team_id) = body.owner_team_id {
+        state.store.get_access_team(auth.org_id, team_id).await?;
+    }
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    let mut updated = Vec::new();
+    let mut failed = Vec::new();
+    for id in ids {
+        let result: Result<(), ApiError> = async {
+            let (owner_user, owner_team, current_visibility) = state
+                .store
+                .resource_ownership(auth.org_id, &resource, id)
+                .await?;
+            access.require_manage(&resource, owner_user, owner_team, &current_visibility)?;
+            let visibility = body
+                .visibility
+                .clone()
+                .unwrap_or_else(|| current_visibility.clone());
+            let owner_team_id = if body.clear_owner_team {
+                None
+            } else {
+                body.owner_team_id.or(owner_team)
+            };
+            if visibility == "team" && owner_team_id.is_none() {
+                return Err(ApiError::validation(vec![ValidationIssue::new(
+                    "ownerTeamId",
+                    "ownerTeamId is required for team visibility",
+                )]));
+            }
+            state
+                .store
+                .set_resource_visibility(auth.org_id, &resource, id, &visibility, owner_team_id)
+                .await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => updated.push(id),
+            Err(error) => failed.push(BulkShareFailure {
+                id,
+                message: error.message,
+            }),
+        }
+    }
+    audit::record(
+        &state,
+        &auth,
+        "resource.bulk_shared",
+        Some(&resource),
+        None,
+        serde_json::json!({
+            "updated": updated.len(),
+            "failed": failed.len(),
+            "visibility": body.visibility,
+            "ownerTeamId": body.owner_team_id,
+            "clearOwnerTeam": body.clear_owner_team,
+        }),
+    )
+    .await;
+    Ok(Json(BulkShareResponse { updated, failed }))
 }
