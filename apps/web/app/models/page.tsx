@@ -48,7 +48,8 @@ import { Select } from "@/components/ui/select";
 import { exportResource } from "@/components/export-resource-button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Status, type StatusMeta } from "@/components/ui/status";
-import { api, API_BASE_URL, getAccessToken } from "@/lib/api";
+import { api } from "@/lib/api";
+import { request } from "@/lib/http";
 import { queryKeys, unwrap, useProviders } from "@/lib/queries";
 import { errorMessage } from "@orbit/api-client";
 import type { ProviderView } from "@/lib/types";
@@ -281,13 +282,16 @@ export default function ModelsPage() {
     }
     setProbingDraft(true);
     try {
-      const token = getAccessToken();
-      const response = await fetch(`${API_BASE_URL}/api/v1/providers/probe`, {
+      // `request` adds auth, handles 401 and turns non-JSON/HTML error bodies into a
+      // readable message; a probe that ran but failed comes back as `{ ok: false }`.
+      const result = await request<{
+        ok?: boolean;
+        latencyMs?: number;
+        models?: string[];
+        error?: string | { message?: string };
+        message?: string;
+      }>("/api/v1/providers/probe", {
         method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(token ? { authorization: `Bearer ${token}` } : {}),
-        },
         body: JSON.stringify({
           kind: form.kind,
           config: {
@@ -307,19 +311,9 @@ export default function ModelsPage() {
           credential: form.credential.trim() || undefined,
         }),
       });
-      const result = (await response.json()) as {
-        ok?: boolean;
-        latencyMs?: number;
-        models?: string[];
-        error?: string | { message?: string };
-        message?: string;
-      };
       // The error may be a string (probe result) or the API's error envelope.
       const failure =
         typeof result.error === "string" ? result.error : (result.error?.message ?? result.message);
-      if (!response.ok) {
-        throw new Error(failure ?? `The server answered HTTP ${response.status}`);
-      }
       if (result.ok) {
         const models = result.models ?? [];
         setForm((current) => ({

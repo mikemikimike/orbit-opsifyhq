@@ -1,8 +1,8 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { api, API_BASE_URL, getAccessToken } from "./api";
-import { request } from "./http";
+import { api } from "./api";
+import { apiErrorFromBody, handleUnauthorized, isSessionError, request } from "./http";
 import { listEnvMappings, workerProfileEnvMappings } from "./env-mappings";
 import { listOutputs } from "./outputs";
 import type {
@@ -38,7 +38,11 @@ export function unwrap<T>(result: {
   error?: unknown;
   response: Response;
 }): T {
-  if (result.error) throw result.error;
+  if (result.error) {
+    // Throw an ApiError so callers keep the HTTP status (401/403 vs 5xx) and the message.
+    if (result.response.status === 401) handleUnauthorized();
+    throw apiErrorFromBody(result.response.status, result.error, result.response.statusText);
+  }
   // DELETE and other no-content endpoints legitimately return no JSON body.
   // Treat a successful 204 as a resolved void instead of an error.
   if (result.response.status === 204) return undefined as T;
@@ -128,16 +132,7 @@ export function useWorkerProfileEnvMappings(profileId?: string) {
 export function useLicense() {
   return useQuery<LicenseOverview>({
     queryKey: ["license"],
-    queryFn: async () => {
-      const token = getAccessToken();
-      const response = await fetch(`${API_BASE_URL}/api/v1/license`, {
-        headers: token ? { authorization: `Bearer ${token}` } : undefined,
-      });
-      if (!response.ok) {
-        throw new Error(`license status failed: HTTP ${response.status}`);
-      }
-      return (await response.json()) as LicenseOverview;
-    },
+    queryFn: () => request<LicenseOverview>("/api/v1/license"),
     staleTime: 60_000,
   });
 }
@@ -147,6 +142,9 @@ export function useMe() {
     queryKey: queryKeys.me,
     queryFn: async () => unwrap(await api.GET("/api/v1/me")),
     staleTime: 60_000,
+    // 401/403 will not heal by retrying. Transient failures (5xx, network) back off
+    // exponentially (TanStack default: 1 s, 2 s, 4 s) before the shell shows a retry state.
+    retry: (failureCount, error) => !isSessionError(error) && failureCount < 3,
   });
 }
 
