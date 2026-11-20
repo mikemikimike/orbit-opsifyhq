@@ -128,7 +128,7 @@ and harnesses in `worker_heartbeats`; `GET /api/v1/workers` exposes them.
 
 Production adapters must run in a container/Job with: non-root user, read-only root
 filesystem where possible, CPU/memory limits, `no_new_privileges`, a per-execution
-writable workspace, allowlisted outbound network, secret injection via env or tmpfs
+writable workspace, outbound network restriction (target state; the per-agent `network` policy is not yet enforced, use a Kubernetes NetworkPolicy), secret injection via env or tmpfs
 files, and forced teardown on timeout/cancel.
 
 ## Implementation status

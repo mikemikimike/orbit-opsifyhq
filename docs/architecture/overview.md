@@ -87,7 +87,7 @@ live in PostgreSQL (`processed_events`, unique `idempotency_key`), not in memory
 
 - Agent tasks are **never** executed inside `orbit-api`.
 - Adapters receive a constrained `HarnessExecutionContext` (timeout, CPU/memory,
-  network policy, filesystem policy, injected secret handles — never raw secrets in
+  network policy (recorded, not yet enforced), filesystem policy, injected secret handles — never raw secrets in
   prompts or logs).
 - Autonomy is enforced by the platform before dispatch and at capability invocation
   time: connector capabilities are checked against per-agent allowlists and autonomy

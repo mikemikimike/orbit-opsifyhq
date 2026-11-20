@@ -1294,7 +1294,7 @@ export function AgentForm({
             <Field
               label="Approval mode"
               htmlFor="agent-approval"
-              hint="Approvals appear in the Approvals queue before the action runs."
+              hint="Approvals appear in the Approvals queue before the action runs. Levels 1 and 2 deny writes outright; raise to level 3 for approval-gated writes."
             >
               <Select
                 id="agent-approval"

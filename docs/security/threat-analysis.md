@@ -76,7 +76,7 @@ for AI agents. It identifies assets, threat actors, attack vectors, and mitigati
 - Per-execution containers (K8s Jobs mode) provide isolation
 - Read-only root filesystem where possible
 - CPU/memory limits enforced
-- Network egress allowlisted
+- Network egress: not enforced by ORBIT (agent `spec.resources.network` is recorded only); restrict with Kubernetes NetworkPolicy
 - No database access from workers (token-only API)
 
 ### 6. Supply chain compromise

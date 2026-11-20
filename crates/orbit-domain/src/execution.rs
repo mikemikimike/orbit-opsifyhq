@@ -134,6 +134,11 @@ impl TriggerSource {
     }
 }
 
+/// Requested network egress mode.
+///
+/// **Not yet enforced by the platform.** The value is validated and recorded on the
+/// agent spec only; no ORBIT component restricts outbound traffic. Enforce egress at
+/// the network layer (for example a Kubernetes NetworkPolicy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressMode {
@@ -145,11 +150,18 @@ pub enum EgressMode {
     Denied,
 }
 
+/// Desired network egress policy for an agent.
+///
+/// **Recorded but not yet enforced by the platform.** Neither the worker nor any
+/// harness adapter reads these values; enforce egress at the network layer (for
+/// example a Kubernetes NetworkPolicy).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NetworkPolicy {
+    /// Requested egress mode. Recorded but not yet enforced.
     #[serde(default)]
     pub mode: Option<EgressMode>,
+    /// Hostnames or `*.suffix` patterns. A bare `*` is rejected. Recorded but not yet enforced.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
 }
@@ -226,21 +238,45 @@ impl ResourceLimits {
                 );
             }
             for host in &network.allowed_hosts {
-                let valid = !host.is_empty()
-                    && host.len() <= 253
-                    && host
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '*'));
-                if !valid {
-                    report.push(
-                        "spec.resources.network.allowedHosts",
-                        format!("invalid host pattern: {host}"),
-                    );
+                if let Some(message) = invalid_host_reason(host) {
+                    report.push("spec.resources.network.allowedHosts", message);
                 }
             }
         }
         report
     }
+}
+
+/// Why an egress host pattern is invalid, or `None` when acceptable.
+/// Accepts `example.com`, `api.example.com` or `*.example.com`; never a bare `*`.
+fn invalid_host_reason(host: &str) -> Option<String> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Some("host must not be empty or whitespace".into());
+    }
+    if trimmed != host {
+        return Some(format!(
+            "host must not have surrounding whitespace: '{host}'"
+        ));
+    }
+    if host == "*" {
+        return Some("'*' is not allowed; list explicit hosts or a '*.domain' pattern".into());
+    }
+    if host.len() > 253 {
+        return Some(format!("host is too long: {host}"));
+    }
+    let body = host.strip_prefix("*.").unwrap_or(host);
+    let labels_ok = body.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    });
+    if !labels_ok {
+        return Some(format!("invalid host pattern: {host}"));
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -421,5 +457,50 @@ mod tests {
             allowed_hosts: vec![],
         });
         assert!(!limits.validate().is_valid());
+    }
+
+    fn network_report(mode: Option<EgressMode>, hosts: &[&str]) -> ValidationReport {
+        let limits = ResourceLimits {
+            network: Some(NetworkPolicy {
+                mode,
+                allowed_hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            }),
+            ..ResourceLimits::default()
+        };
+        limits.validate()
+    }
+
+    #[test]
+    fn egress_hosts_reject_wildcard_empty_and_invalid() {
+        for bad in [
+            "*",
+            "",
+            "   ",
+            " example.com",
+            "exa mple.com",
+            "-a.com",
+            "a..com",
+            "*.",
+            "a.*.com",
+            "**.com",
+            "http://x.com",
+        ] {
+            let report = network_report(Some(EgressMode::Allowlist), &[bad]);
+            assert!(!report.is_valid(), "expected '{bad}' to be rejected");
+        }
+    }
+
+    #[test]
+    fn egress_hosts_accept_hostnames_and_suffix_patterns() {
+        let report = network_report(
+            Some(EgressMode::Allowlist),
+            &[
+                "example.com",
+                "api.example.com",
+                "*.example.com",
+                "localhost",
+            ],
+        );
+        assert!(report.is_valid());
     }
 }
