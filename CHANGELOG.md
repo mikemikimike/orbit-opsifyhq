@@ -10,6 +10,8 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ### Fixed
 
+- Production example values no longer pin `0.7.0` image tags (they follow `Chart.appVersion`); docs use `<version>` placeholders, and `scripts/check-versions.sh` now fails when a shipped values file pins an image tag that differs from `appVersion` (#198).
+
 - Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval
   mode when no tool-policy rule matches. L4/Auto no longer asks for every call; L3/Auto
   still requires approval and L1/L2 still deny writes. Explicit rules can only tighten

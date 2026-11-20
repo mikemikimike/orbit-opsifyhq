@@ -9,7 +9,7 @@ fullnameOverride: ""
 
 # Registry prefix for the ORBIT images. The value must include the repository
 # segment: the published images are ghcr.io/<owner>/<repo>/orbit-<component>, so with
-# `ghcr.io/opsifyhq/orbit` the chart renders `ghcr.io/opsifyhq/orbit/orbit-api:0.7.0`.
+# `ghcr.io/opsifyhq/orbit` the chart renders `ghcr.io/opsifyhq/orbit/orbit-api:<appVersion>`.
 # Set this to your own mirror (e.g. `registry.example.com:5000`) when not using GHCR.
 imageRegistry: ghcr.io/opsifyhq/orbit
 imagePullPolicy: IfNotPresent

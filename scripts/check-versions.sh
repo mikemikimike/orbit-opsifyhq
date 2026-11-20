@@ -38,3 +38,19 @@ if len(unique) != 1:
     print("ERROR: versions are not aligned", file=sys.stderr)
     sys.exit(1)
 PY
+
+# Shipped values files must not pin an image tag that differs from Chart.appVersion
+# (an empty tag follows appVersion). Plain grep/awk, no extra dependencies.
+app_version="$(awk -F'"' '/^appVersion:/ {print $2; exit}' deploy/helm/orbit/Chart.yaml)"
+status=0
+for values in deploy/helm/orbit/values*.yaml; do
+  while IFS= read -r hit; do
+    line="${hit%%:*}"
+    tag="$(printf '%s' "${hit#*:}" | sed -E "s/^[[:space:]]*tag:[[:space:]]*//; s/[[:space:]]*(#.*)?\$//; s/^[\"'](.*)[\"']\$/\\1/")"
+    if [[ -n "${tag}" && "${tag}" != "${app_version}" ]]; then
+      echo "ERROR: ${values}:${line} pins image tag '${tag}' (appVersion is ${app_version}); leave tag empty" >&2
+      status=1
+    fi
+  done < <(grep -nE '^[[:space:]]*tag:' "${values}" || true)
+done
+exit "${status}"
