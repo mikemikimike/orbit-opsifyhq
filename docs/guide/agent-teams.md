@@ -57,3 +57,15 @@ Team connections are validated against visibility and merged into every step's g
 environment mappings are resolved into the execution environment for every step. This
 avoids duplicating the same GitLab/cloud integration on each step agent; credentials stay
 in the broker and are never passed to the harness.
+
+## Auto-approve
+
+Starting a run with `autoApprove: true` (the "Auto-approve writes" checkbox) requires the
+`approvals:decide` permission; without it the API returns 403. The API then marks each
+step execution with a server-set `approvalOverride: "auto"`. The worker applies it only to
+step agents whose own autonomy level is Prepare (L3) or higher, and only by switching the
+approval mode to `Auto`. It never raises the level: Observe (L1) and Recommend (L2) agents
+still deny every write. Note that at L3 `Auto` mode still requires approval for writes
+(only L4 runs them unattended), so in practice the override lifts `Always`/`Writes`
+approval modes on L4 agents. The legacy numeric `autonomyOverride` is ignored. Rerunning a
+step execution drops the override unless the rerunning user also holds `approvals:decide`.

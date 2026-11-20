@@ -45,7 +45,7 @@ for AI agents. It identifies assets, threat actors, attack vectors, and mitigati
 - Autonomy is platform-enforced (`evaluate_capability`), not prompt-based
 - Capability allowlists are enforced by the tool broker, not the harness
 - External content is marked as untrusted in the execution input
-- Write actions require approval (autonomy L3) or are auto-approved only at L4
+- Write actions require approval (autonomy L3) or are auto-approved only at L4 (team-run `autoApprove` never raises the level; it needs `approvals:decide`)
 
 ### 3. Agent privilege escalation
 
