@@ -6,6 +6,26 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Changed
+
+- In-app documentation is organised like the app sidebar: Get started, Build, Connect,
+  Infrastructure and Admin, followed by deploy, security, architecture, contributing and
+  decision records. `docs/navigation.yaml` sets the sections, order and short sidebar
+  labels; files and URLs are unchanged. A test fails when a page is missing from it.
+- The documentation sidebar distinguishes sections from pages: section headers carry the
+  app's icons and small caps and can be folded (reference sections start folded), pages
+  sit on an indented rail with an accent bar for the current one.
+
+### Fixed
+
+- Tables in the documentation render as tables again. Blank lines inside the access matrix
+  (`security/idor-matrix.md`) split it into a header and a paragraph of pipes; a test now
+  rejects table rows separated by a blank line. Wide tables wrap long tokens and keep
+  their last column visible, and on phones they scroll inside their frame.
+- Markdown tables no longer drop the bottom border of their last column.
+
 ## [0.23.0] - 2026-11-20
 
 ### Changed
