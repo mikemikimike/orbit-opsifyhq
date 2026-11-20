@@ -35,6 +35,9 @@ jobs:
   rust:
     name: Rust (fmt, clippy, test)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write  # rustsec/audit-check publishes its result as a check run
     services:
       postgres:
         image: postgres:17-alpine
