@@ -100,3 +100,41 @@ worker Pod/Job at `/etc/ssl/certs/ca-bundle.crt` and sets `SSL_CERT_FILE`,
 store (Rust workers) and Node/Bun-based harnesses (OpenCode).
 
 The worker pod needs read access to the Secret; the launcher itself does not read it.
+
+## Launch status and lifecycle
+
+Status is mapped by pure functions in `services/launcher/src/mapping.rs` from
+`kubectl get deployments,jobs,pods -l orbit.launch-id=<id> -o json` (Kubernetes) or
+`docker inspect` (Docker).
+
+| Observed | Status | Message |
+|---|---|---|
+| Container terminated with `reason: OOMKilled` (Docker: `State.OOMKilled`) | `failed` | OOMKilled + memory limit |
+| Exit code 137 without `OOMKilled` | `failed` | SIGKILL, explicitly not OOM |
+| Deployment pod running after an earlier OOM restart | `running` | hint: OOMKilled earlier, restart count |
+| CrashLoopBackOff, ImagePullBackOff, ErrImagePull, InvalidImageName, CreateContainerConfigError, CreateContainerError, RunContainerError | `failed` | reason, restart count, last termination |
+| ContainerCreating / pending / not ready | `starting` | none |
+| Job `Complete` | `stopped` | none |
+| Job `Failed` condition (e.g. DeadlineExceeded, BackoffLimitExceeded) | `failed` | condition reason + message, container cause |
+| Workload not found (stopped, or Job removed by TTL) | `stopped` | none |
+| `kubectl get` itself fails | `starting` | read error (never terminal) |
+| Docker `exited` code 0 / non-zero | `stopped` / `failed` | exit code |
+
+The API only refreshes launches that are `pending`, `starting` or `running`, so a terminal
+status it has already stored (for example `failed`) is never overwritten by a later
+"not found" `stopped` after the Job TTL (300s) removes the Job. A Job that fails and
+expires before the API polls it is still reported `stopped`; the API polls on every
+launch read, and the TTL leaves a five-minute window.
+
+Lifecycle:
+
+- Single-execution Jobs set `activeDeadlineSeconds` to the execution timeout plus 300s
+  (the API sends `timeoutSeconds`); without it the launcher uses
+  `ORBIT_LAUNCHER_JOB_DEADLINE_SECONDS` (default 7200).
+- Single-execution Docker containers are not started with `--rm`, because status
+  (exit code, `OOMKilled`) and logs are read after exit. They are labelled
+  `orbit.single-execution=true` and exited ones older than `ORBIT_LAUNCHER_DOCKER_RETENTION`
+  (default `1h`) are pruned on the next single-execution launch; `stop` still removes them.
+- The launcher image runs as UID 10001. Under Compose the socket needs a group: set
+  `DOCKER_GID` (`stat -c %g /var/run/docker.sock`) on Linux; the default `0` suits Docker Desktop.
+- Worker pods have no health endpoint, so no probes are set on them.

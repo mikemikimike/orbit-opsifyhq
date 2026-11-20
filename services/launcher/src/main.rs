@@ -4,6 +4,8 @@
 //! containers or Kubernetes Pods. It is the only component with Docker socket or
 //! Kubernetes Workload RBAC; the API never receives those privileges.
 
+mod mapping;
+
 use std::collections::BTreeMap;
 use std::process::Stdio;
 
@@ -56,6 +58,29 @@ struct LaunchRequest {
     ca_secret_key: String,
     #[serde(default)]
     single_execution_id: Option<Uuid>,
+    /// Execution timeout for single-execution launches; bounds the Job's
+    /// `activeDeadlineSeconds`.
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
+/// Deadline for single-execution Jobs whose request carries no timeout (older API).
+fn default_job_deadline_seconds() -> u64 {
+    std::env::var("ORBIT_LAUNCHER_JOB_DEADLINE_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(7200)
+}
+
+/// Exited single-execution Docker containers are kept this long (logs and OOM state stay
+/// inspectable) and then pruned on the next single-execution launch.
+fn docker_retention() -> String {
+    std::env::var("ORBIT_LAUNCHER_DOCKER_RETENTION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "1h".into())
 }
 
 fn default_ca_key() -> String {
@@ -236,6 +261,26 @@ async fn launch_docker(state: &AppState, request: &LaunchRequest) -> anyhow::Res
         "--add-host".into(),
         "host.docker.internal:host-gateway".into(),
     ];
+    if request.single_execution_id.is_some() {
+        // Not `--rm`: status (exit code, OOMKilled) and logs are read after the container
+        // exits. Instead label it and prune exited ones past the retention window.
+        args.push("--label".into());
+        args.push("orbit.single-execution=true".into());
+        let _ = Command::new(&state.docker)
+            .args([
+                "container",
+                "prune",
+                "-f",
+                "--filter",
+                "label=orbit.single-execution=true",
+                "--filter",
+                &format!("until={}", docker_retention()),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
     let resources = worker_resources(&request.resources);
     if let Some(cpu) = resources
         .limits
@@ -357,7 +402,7 @@ async fn docker_status(state: &AppState, name: &str) -> LaunchStatus {
         .args([
             "inspect",
             "-f",
-            "{{.State.Status}}|{{.State.OOMKilled}}|{{if .State.Error}}{{.State.Error}}{{end}}",
+            "{{.State.Status}}|{{.State.OOMKilled}}|{{.State.ExitCode}}|{{if .State.Error}}{{.State.Error}}{{end}}",
             name,
         ])
         .output()
@@ -382,33 +427,21 @@ async fn docker_status(state: &AppState, name: &str) -> LaunchStatus {
         };
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut parts = stdout.trim().splitn(3, '|');
+    let mut parts = stdout.trim().splitn(4, '|');
     let state_value = parts.next().unwrap_or_default();
+    // OOM comes from Docker's own flag, never from exit code 137 (which is any SIGKILL).
     let oom_killed = parts.next().unwrap_or_default() == "true";
+    let exit_code = parts
+        .next()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
     let error = parts.next().unwrap_or_default();
-    if oom_killed {
-        return LaunchStatus {
-            status: "failed".into(),
-            runtime_id: Some(name.into()),
-            worker_id: None,
-            error: Some(
-                "worker container was OOMKilled (Docker memory limit); increase the worker profile memory limit"
-                    .into(),
-            ),
-        };
-    }
-    let status = match state_value {
-        "running" => "running",
-        "created" | "restarting" => "starting",
-        "exited" | "removing" => "stopped",
-        "dead" | "paused" => "failed",
-        _ => "starting",
-    };
+    let mapped = mapping::map_docker(state_value, oom_killed, exit_code, error);
     LaunchStatus {
-        status: status.into(),
+        status: mapped.status.into(),
         runtime_id: Some(name.into()),
         worker_id: None,
-        error: (!error.is_empty()).then(|| error.to_string()),
+        error: mapped.error,
     }
 }
 
@@ -602,6 +635,10 @@ async fn launch_kubernetes(
             "spec": {
                 "ttlSecondsAfterFinished": 300,
                 "backoffLimit": 0,
+                "activeDeadlineSeconds": mapping::job_deadline_seconds(
+                    request.timeout_seconds,
+                    default_job_deadline_seconds(),
+                ),
                 "template": {
                     "metadata": { "labels": labels },
                     "spec": pod_spec
@@ -668,162 +705,19 @@ async fn launch_kubernetes(
     })
 }
 
-async fn kubernetes_oom(state: &AppState, launch_id: Uuid) -> Option<String> {
-    let output = Command::new(&state.kubectl)
-        .args([
-            "-n",
-            &state.namespace,
-            "get",
-            "pods",
-            "-l",
-            &format!("orbit.launch-id={launch_id}"),
-            "-o",
-            "json",
-        ])
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let pods: Value = serde_json::from_slice(&output.stdout).ok()?;
-    for pod in pods
-        .get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let memory_limit = pod
-            .pointer("/spec/containers/0/resources/limits/memory")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let statuses = ["/status/containerStatuses", "/status/initContainerStatuses"]
-            .into_iter()
-            .flat_map(|pointer| {
-                pod.pointer(pointer)
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-            });
-        for status in statuses {
-            for pointer in ["/state/terminated", "/lastState/terminated"] {
-                let Some(terminated) = status.pointer(pointer) else {
-                    continue;
-                };
-                let reason = terminated
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let exit_code = terminated.get("exitCode").and_then(Value::as_i64);
-                if reason == "OOMKilled" || exit_code == Some(137) {
-                    return Some(format!(
-                        "worker container was OOMKilled (memory limit {memory_limit}); increase the worker profile memory limit"
-                    ));
-                }
-            }
-        }
-    }
-    None
-}
-
 async fn kubernetes_status(state: &AppState, name: &str, launch_id: Uuid) -> LaunchStatus {
-    if let Some(error) = kubernetes_oom(state, launch_id).await {
-        return LaunchStatus {
-            status: "failed".into(),
-            runtime_id: Some(name.into()),
-            worker_id: None,
-            error: Some(error),
-        };
-    }
-
-    // Long-lived workers run as Deployments (0.9.1+); older launches used Pods.
-    let deployment = Command::new(&state.kubectl)
-        .args([
-            "-n",
-            &state.namespace,
-            "get",
-            "deployment",
-            name,
-            "-o",
-            "jsonpath={.status.readyReplicas}|{.status.replicas}|{.status.unavailableReplicas}",
-        ])
-        .output()
-        .await;
-    if let Ok(output) = deployment {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let parts: Vec<&str> = stdout.trim().split('|').collect();
-            let ready = parts
-                .first()
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(0);
-            let status = if ready > 0 { "running" } else { "starting" };
-            return LaunchStatus {
-                status: status.into(),
-                runtime_id: Some(name.into()),
-                worker_id: None,
-                error: None,
-            };
-        }
-    }
-
-    // Single-execution launches are Jobs.
-    let job = Command::new(&state.kubectl)
-        .args([
-            "-n",
-            &state.namespace,
-            "get",
-            "job",
-            name,
-            "-o",
-            "jsonpath={.status.succeeded}|{.status.failed}|{.status.active}",
-        ])
-        .output()
-        .await;
-    if let Ok(output) = job {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let parts: Vec<&str> = stdout.trim().split('|').collect();
-            let succeeded = parts
-                .first()
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(0);
-            let failed = parts
-                .get(1)
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(0);
-            let active = parts
-                .get(2)
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(0);
-            let status = if succeeded > 0 {
-                "stopped"
-            } else if failed > 0 {
-                "failed"
-            } else if active > 0 {
-                "running"
-            } else {
-                "starting"
-            };
-            return LaunchStatus {
-                status: status.into(),
-                runtime_id: Some(name.into()),
-                worker_id: None,
-                error: None,
-            };
-        }
-    }
-
-    // Legacy Pod launches.
+    // One label query returns the Deployment/Job and its pods (legacy bare Pods carry the
+    // same label); the mapping itself is a pure function in `mapping.rs`.
     let output = match Command::new(&state.kubectl)
         .args([
             "-n",
             &state.namespace,
             "get",
-            "pod",
-            name,
+            "deployments,jobs,pods",
+            "-l",
+            &format!("orbit.launch-id={launch_id}"),
             "-o",
-            "jsonpath={.status.phase}",
+            "json",
         ])
         .output()
         .await
@@ -838,27 +732,34 @@ async fn kubernetes_status(state: &AppState, name: &str, launch_id: Uuid) -> Lau
             }
         }
     };
-    if !output.status.success() {
+    // A transient kubectl/API error must not be reported as a terminal state.
+    let parsed = output
+        .status
+        .success()
+        .then(|| serde_json::from_slice::<Value>(&output.stdout).ok())
+        .flatten();
+    let Some(list) = parsed else {
         return LaunchStatus {
-            status: "stopped".into(),
+            status: "starting".into(),
             runtime_id: Some(name.into()),
             worker_id: None,
-            error: None,
+            error: Some(format!(
+                "could not read workload state: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
         };
-    }
-    let phase = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let status = match phase.as_str() {
-        "Running" => "running",
-        "Pending" | "ContainerCreating" => "starting",
-        "Succeeded" => "stopped",
-        "Failed" => "failed",
-        _ => "starting",
     };
+    let items = list
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mapped = mapping::map_kubernetes(items);
     LaunchStatus {
-        status: status.into(),
+        status: mapped.status.into(),
         runtime_id: Some(name.into()),
         worker_id: None,
-        error: None,
+        error: mapped.error,
     }
 }
 
