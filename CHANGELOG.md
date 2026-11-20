@@ -8,6 +8,14 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ## [Unreleased]
 
+### Changed
+
+- Execution detail pages can approve or reject a pending tool call inline, with the exact
+  action details, instead of navigating to Approvals first.
+- Approvals are one click: the card's Approve/Reject buttons decide immediately and show a
+  per-button loading state. The redundant confirmation dialog was removed.
+
+
 ### Fixed
 
 - Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval
