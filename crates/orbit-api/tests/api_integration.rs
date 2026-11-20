@@ -4519,7 +4519,9 @@ async fn docs_index_lists_categories_and_excludes_planning() {
     let categories = body["categories"].as_array().expect("categories");
     assert!(categories.len() >= 4);
     let ids: Vec<&str> = categories.iter().filter_map(|c| c["id"].as_str()).collect();
-    assert!(ids.contains(&"guide") && ids.contains(&"architecture"));
+    // Section ids come from docs/navigation.yaml when present, else from folder names;
+    // "architecture" exists under both schemes.
+    assert!(ids.contains(&"architecture"), "{ids:?}");
     let slugs: Vec<&str> = categories
         .iter()
         .flat_map(|c| c["pages"].as_array().unwrap())
