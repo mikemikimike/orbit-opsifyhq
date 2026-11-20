@@ -1,27 +1,35 @@
 # ORBIT Documentation
 
-## For users
+ORBIT is a self-hosted control plane for persistent AI agents: it stores agent
+definitions, connects them to models and tools, runs them on workers you control and
+enforces who may do what. This handbook is served by your own installation, so it works
+offline.
 
-- **[User guide](guide/README.md)** — agents, providers, skills, teams, access and policies
+The sections follow the app's sidebar. Each one documents the screens of the same name.
 
-- **[Getting started](development/local.md)** — run ORBIT locally in 5 minutes
-- **[Deployment](development/deployment.md)** — Docker Compose and Kubernetes
-- **[Releasing](development/releasing.md)** — version bump, tag, images, chart
-- **[OIDC / SSO](development/oidc.md)** — configure single sign-on
+## Get started
 
-## For developers
+- **[How ORBIT fits together](guide/README.md)**: the main concepts and where each is documented.
+- **[Run ORBIT locally](development/local.md)**: a working installation in a few minutes.
 
-- **[Architecture overview](architecture/overview.md)** — what ORBIT is and how it's built
-- **[Runtime contract](architecture/runtime-contract.md)** — harness adapter interface
-- **[Provider & connector contract](architecture/provider-connector-contract.md)** — adding providers and connectors
-- **[Agent Teams](architecture/agent-teams.md)** — multi-agent orchestration
-- **[Diagram](architecture/diagram.md)** — system context, sequence, and deployment diagrams
+## Use ORBIT
 
-## Reference
+| Section | What it covers |
+|---|---|
+| **Build** | [Agents](guide/agents.md), [agent teams](guide/agent-teams.md), [skills](guide/skills.md), [tool policies](guide/tool-policies.md) and [export and import](guide/portable-export-import.md) |
+| **Connect** | [Model providers](guide/providers.md), [outputs](guide/outputs.md), [CLI tools](guide/cli-tools.md) and the [Kubernetes connector](guide/kubernetes-connector.md) |
+| **Infrastructure** | [Workers and profiles](guide/worker-profiles.md) and the [Kubernetes launcher](development/kubernetes-launcher.md) |
+| **Admin** | [Access teams](guide/access-teams.md), [roles and permissions](guide/rbac.md), [single sign-on](development/oidc.md) and [licensing](guide/licensing.md) |
 
-- **[Web design system](development/design-system.md)** — tokens, components and UI patterns for `apps/web`
-- **[UI test plan](development/ui-test-plan.md)** — repeatable manual flows for the web experience
-- **[Testing](development/testing.md)** — test expectations per change type
-- **[Kubernetes launcher](development/kubernetes-launcher.md)** — worker launch RBAC
-- **[Threat analysis](security/threat-analysis.md)** — security model
-- **[Decisions (ADRs)](decisions/README.md)** — architecture decision records
+## Run ORBIT in production
+
+- **[Deployment](development/deployment.md)**: Docker Compose and Kubernetes (Helm).
+- **[Installing a license](development/licensing.md)**: offline license install.
+- **[Releasing](development/releasing.md)**: version bump, tag, images and chart.
+- **[Security](security/threat-analysis.md)**: threat model and the [access matrix](security/idor-matrix.md).
+
+## Understand and extend ORBIT
+
+- **[Architecture](architecture/overview.md)**: components, contracts and [diagrams](architecture/diagram.md).
+- **[Contributing](development/testing.md)**: testing, the [UI test plan](development/ui-test-plan.md) and the [design system](development/design-system.md).
+- **[Decision records](decisions/README.md)**: why ORBIT is built the way it is.

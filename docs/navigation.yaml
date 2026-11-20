@@ -1,0 +1,152 @@
+# Sidebar of the in-app documentation (Documentation in the web app, /api/v1/docs).
+#
+# Sections follow the app's own sidebar — Build, Connect, Infrastructure, Admin — so a
+# page sits where the matching screen lives, followed by the operator and contributor
+# material. Files stay where they are; this file only decides grouping, order and the
+# short label shown in the sidebar (`title`, defaulting to the page's first heading).
+#
+# Every Markdown page under docs/ must be listed here (planning/ is not served). A test in
+# crates/orbit-api/src/docs.rs fails when a page is missing or a listed path does not exist.
+
+sections:
+  - id: start
+    title: Get started
+    pages:
+      - path: README.md
+        title: Introduction
+      - path: guide/README.md
+        title: How ORBIT fits together
+      - path: development/local.md
+        title: Run ORBIT locally
+
+  - id: build
+    title: Build
+    pages:
+      - path: guide/agents.md
+        title: Agents
+      - path: guide/agent-teams.md
+        title: Agent teams
+      - path: guide/skills.md
+        title: Skills
+      - path: examples/skills/github-issue-loop/SKILL.md
+        title: "Example skill: GitHub issue loop"
+      - path: guide/tool-policies.md
+        title: Tool policies
+      - path: guide/portable-export-import.md
+        title: Export and import
+
+  - id: connect
+    title: Connect
+    pages:
+      - path: guide/providers.md
+        title: Model providers
+      - path: guide/outputs.md
+        title: Outputs
+      - path: guide/cli-tools.md
+        title: CLI tools (gh, glab)
+      - path: guide/kubernetes-connector.md
+        title: Kubernetes connector
+
+  - id: infrastructure
+    title: Infrastructure
+    pages:
+      - path: guide/worker-profiles.md
+        title: Workers and profiles
+      - path: development/kubernetes-launcher.md
+        title: Kubernetes launcher
+
+  - id: admin
+    title: Admin
+    pages:
+      - path: guide/access-teams.md
+        title: Access teams and sharing
+      - path: guide/rbac.md
+        title: Roles and permissions
+      - path: development/oidc.md
+        title: Single sign-on (OIDC)
+      - path: development/oidc-team-sync.md
+        title: OIDC group to team sync
+      - path: guide/licensing.md
+        title: Licensing
+
+  - id: operate
+    title: Deploy and operate
+    pages:
+      - path: development/deployment.md
+        title: Deployment
+      - path: development/licensing.md
+        title: Installing a license
+      - path: development/releasing.md
+        title: Releasing
+
+  - id: security
+    title: Security
+    pages:
+      - path: security/threat-analysis.md
+        title: Threat analysis
+      - path: security/idor-matrix.md
+        title: Access matrix
+
+  - id: architecture
+    title: Architecture
+    pages:
+      - path: architecture/overview.md
+        title: Overview
+      - path: architecture/diagram.md
+        title: Diagrams
+      - path: architecture/domain-model.md
+        title: Domain model
+      - path: architecture/api.md
+        title: API design
+      - path: architecture/events.md
+        title: Events and triggers
+      - path: architecture/runtime-contract.md
+        title: Harness adapter contract
+      - path: architecture/provider-connector-contract.md
+        title: Provider and connector contracts
+      - path: architecture/agent-teams.md
+        title: Agent teams internals
+      - path: development/rbac.md
+        title: Permission model
+
+  - id: contribute
+    title: Contributing
+    pages:
+      - path: development/testing.md
+        title: Testing
+      - path: development/ui-test-plan.md
+        title: UI test plan
+      - path: development/design-system.md
+        title: Design system
+      - path: assets/brand/README.md
+        title: Brand assets
+
+  - id: decisions
+    title: Decision records
+    pages:
+      - path: decisions/README.md
+        title: About the records
+      - path: decisions/0001-monorepo-modular-monolith.md
+        title: 0001 Modular monolith
+      - path: decisions/0002-runtime-boundary.md
+        title: 0002 Runtime boundary
+      - path: decisions/0003-provider-configuration.md
+        title: 0003 Provider configuration
+      - path: decisions/0004-secrets.md
+        title: 0004 Secrets
+      - path: decisions/0005-events.md
+        title: 0005 Event bus
+      - path: decisions/0006-auth-and-streaming.md
+        title: 0006 Auth and streaming
+      - path: decisions/0007-agent-spec-versioning.md
+        title: 0007 Agent spec versioning
+      - path: decisions/0008-harness-provider-worker-terms.md
+        title: 0008 Terminology
+      - path: decisions/0009-agent-teams-and-connector-capabilities.md
+        title: 0009 Agent teams and capabilities
+      - path: decisions/0010-offline-licensing.md
+        title: 0010 Offline licensing
+      - path: decisions/0011-multi-team-access-model.md
+        title: 0011 Multi-team access
+      - path: decisions/0012-decouple-agent-and-harness.md
+        title: 0012 Decouple agent and harness

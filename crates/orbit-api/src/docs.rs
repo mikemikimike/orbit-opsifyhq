@@ -5,7 +5,8 @@
 //! Nothing is ever read from the filesystem at request time: only files that were
 //! embedded, and that appear in the manifest built here, can be served.
 //!
-//! `docs/planning` (internal drafts) is excluded.
+//! `docs/planning` (internal drafts) is excluded. `docs/navigation.yaml` decides the
+//! sidebar: section grouping, order and the short label of each page.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
@@ -13,7 +14,7 @@ use std::sync::OnceLock;
 
 use pulldown_cmark::{html, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use rust_embed::RustEmbed;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 #[derive(RustEmbed)]
@@ -25,7 +26,11 @@ struct Embedded;
 pub const DOCS_URL: &str = "/api/v1/docs";
 const ASSETS_PREFIX: &str = "assets/";
 
-/// Directory name → (display title, sort rank). Unknown directories sort last by name.
+/// Sidebar manifest inside `docs/`: sections, page order and sidebar labels.
+const NAVIGATION_PATH: &str = "navigation.yaml";
+
+/// Directory name → (display title, sort rank) for pages that `navigation.yaml` does not
+/// list. They sort after every listed section; unknown directories sort last by name.
 const CATEGORIES: &[(&str, &str)] = &[
     ("overview", "Overview"),
     ("guide", "User guide"),
@@ -44,6 +49,8 @@ pub struct DocPage {
     /// Path inside `docs/`, for example `architecture/overview.md`.
     pub path: String,
     pub title: String,
+    /// Short label in the sidebar (`navigation.yaml`), defaulting to `title`.
+    pub nav_title: String,
     pub description: String,
     pub category: String,
     pub order: i32,
@@ -63,6 +70,8 @@ pub struct DocAsset {
 #[derive(Debug)]
 pub struct DocsBundle {
     pages: Vec<DocPage>,
+    /// Section id → title, from `navigation.yaml`.
+    section_titles: HashMap<String, String>,
     by_slug: HashMap<String, usize>,
     by_path: HashMap<String, usize>,
     assets: BTreeMap<String, DocAsset>,
@@ -86,6 +95,55 @@ pub enum LinkTarget {
     },
     /// A relative link that does not resolve inside the bundle.
     Broken(String),
+}
+
+// ------------------------------------------------------------------ navigation
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Navigation {
+    #[serde(default)]
+    sections: Vec<NavSection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NavSection {
+    id: String,
+    title: String,
+    #[serde(default)]
+    pages: Vec<NavEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NavEntry {
+    path: String,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+impl Navigation {
+    fn parse(source: &str) -> Result<Self, String> {
+        serde_yaml::from_str(source).map_err(|e| e.to_string())
+    }
+
+    fn load() -> Self {
+        let Some(file) = Embedded::get(NAVIGATION_PATH) else {
+            tracing::warn!("docs/{NAVIGATION_PATH} is missing; grouping pages by folder");
+            return Self::default();
+        };
+        match std::str::from_utf8(&file.data)
+            .map_err(|e| e.to_string())
+            .and_then(Self::parse)
+        {
+            Ok(navigation) => navigation,
+            Err(error) => {
+                tracing::warn!(%error, "docs/{NAVIGATION_PATH} is invalid; grouping pages by folder");
+                Self::default()
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ serialisation
@@ -328,7 +386,7 @@ impl DocsBundle {
         let mut assets = BTreeMap::new();
         for path in Embedded::iter() {
             let path = path.to_string();
-            if is_excluded(&path) {
+            if is_excluded(&path) || path == NAVIGATION_PATH {
                 continue;
             }
             let Some(file) = Embedded::get(&path) else {
@@ -350,12 +408,50 @@ impl DocsBundle {
                 );
             }
         }
+        let navigation = Navigation::load();
+        let mut placement: HashMap<&str, (&NavSection, i32, Option<&str>)> = HashMap::new();
+        for section in &navigation.sections {
+            for (position, entry) in section.pages.iter().enumerate() {
+                placement.insert(
+                    entry.path.as_str(),
+                    (section, position as i32, entry.title.as_deref()),
+                );
+            }
+        }
+        for page in &mut pages {
+            if let Some((section, position, title)) = placement.get(page.path.as_str()) {
+                page.category = section.id.clone();
+                page.order = *position;
+                if let Some(title) = title.filter(|t| !t.trim().is_empty()) {
+                    page.nav_title = title.to_string();
+                }
+            }
+        }
+        let section_rank: HashMap<&str, usize> = navigation
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(i, section)| (section.id.as_str(), i))
+            .collect();
+        // Listed sections first, in manifest order; unlisted folders after them.
+        let rank = |category: &str| match section_rank.get(category) {
+            Some(i) => (*i, String::new()),
+            None => {
+                let (fallback, name) = category_rank(category);
+                (navigation.sections.len() + fallback, name)
+            }
+        };
         pages.sort_by(|a, b| {
-            category_rank(&a.category)
-                .cmp(&category_rank(&b.category))
+            rank(&a.category)
+                .cmp(&rank(&b.category))
                 .then(a.order.cmp(&b.order))
                 .then(a.path.cmp(&b.path))
         });
+        let section_titles = navigation
+            .sections
+            .iter()
+            .map(|section| (section.id.clone(), section.title.clone()))
+            .collect();
         let by_slug = pages
             .iter()
             .enumerate()
@@ -368,6 +464,7 @@ impl DocsBundle {
             .collect();
         Self {
             pages,
+            section_titles,
             by_slug,
             by_path,
             assets,
@@ -396,14 +493,18 @@ impl DocsBundle {
             if categories.last().map(|c| c.id.as_str()) != Some(page.category.as_str()) {
                 categories.push(DocCategory {
                     id: page.category.clone(),
-                    title: category_title(&page.category),
+                    title: self
+                        .section_titles
+                        .get(&page.category)
+                        .cloned()
+                        .unwrap_or_else(|| category_title(&page.category)),
                     pages: Vec::new(),
                 });
             }
             if let Some(category) = categories.last_mut() {
                 category.pages.push(DocSummary {
                     slug: page.slug.clone(),
-                    title: page.title.clone(),
+                    title: page.nav_title.clone(),
                     description: page.description.clone(),
                     url: page_url(&page.slug),
                 });
@@ -677,6 +778,7 @@ fn build_page(path: &str, source: &str) -> DocPage {
         category: category_for(path),
         slug,
         path: path.to_string(),
+        nav_title: title.clone(),
         title,
         description,
         order,
@@ -857,6 +959,7 @@ mod tests {
             slug: "x".into(),
             path: "README.md".into(),
             title: "x".into(),
+            nav_title: "x".into(),
             description: String::new(),
             category: "overview".into(),
             order: 0,
@@ -883,6 +986,7 @@ mod tests {
             slug: "x".into(),
             path: "README.md".into(),
             title: "x".into(),
+            nav_title: "x".into(),
             description: String::new(),
             category: "overview".into(),
             order: 0,
@@ -904,6 +1008,124 @@ mod tests {
         assert!(
             problems.is_empty(),
             "broken documentation links:\n{}",
+            problems.join("\n")
+        );
+    }
+
+    /// `navigation.yaml` must list every served page exactly once and nothing else, so a
+    /// new page cannot silently land at the bottom of the sidebar.
+    #[test]
+    fn navigation_lists_every_page_exactly_once() {
+        let file = Embedded::get(NAVIGATION_PATH).expect("docs/navigation.yaml is embedded");
+        let navigation =
+            Navigation::parse(std::str::from_utf8(&file.data).unwrap()).expect("valid YAML");
+        let mut listed = HashSet::new();
+        let mut problems = Vec::new();
+        let mut section_ids = HashSet::new();
+        for section in &navigation.sections {
+            if !section_ids.insert(section.id.as_str()) {
+                problems.push(format!("duplicate section id `{}`", section.id));
+            }
+            for entry in &section.pages {
+                if !listed.insert(entry.path.as_str()) {
+                    problems.push(format!("`{}` is listed twice", entry.path));
+                }
+            }
+        }
+        let pages: HashSet<&str> = bundle().pages().iter().map(|p| p.path.as_str()).collect();
+        for path in &listed {
+            if !pages.contains(path) {
+                problems.push(format!("`{path}` is listed but is not a served page"));
+            }
+        }
+        for path in &pages {
+            if !listed.contains(path) {
+                problems.push(format!("`{path}` is not listed in docs/{NAVIGATION_PATH}"));
+            }
+        }
+        problems.sort();
+        assert!(
+            problems.is_empty(),
+            "navigation problems:\n{}",
+            problems.join("\n")
+        );
+    }
+
+    #[test]
+    fn index_follows_the_navigation_manifest() {
+        let index = bundle().index();
+        let first = &index.categories[0];
+        assert_eq!(first.id, "start");
+        assert_eq!(first.title, "Get started");
+        assert_eq!(first.pages[0].slug, "index");
+        assert_eq!(first.pages[0].title, "Introduction");
+        let ids: Vec<&str> = index.categories.iter().map(|c| c.id.as_str()).collect();
+        let unique: HashSet<&str> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "each section appears once: {ids:?}"
+        );
+        // The page itself keeps its own heading; only the sidebar label is shortened.
+        let matrix = bundle().page("security/idor-matrix").unwrap();
+        assert_eq!(matrix.title, "IDOR / access matrix");
+        assert_eq!(matrix.nav_title, "Access matrix");
+        assert_eq!(matrix.category, "security");
+    }
+
+    #[test]
+    fn invalid_navigation_is_rejected() {
+        assert!(Navigation::parse("sections:\n  - id: a\n    title: A\n    pages:\n      - path: x.md\n        label: nope\n").is_err());
+        assert!(Navigation::parse("sections: []\n")
+            .unwrap()
+            .sections
+            .is_empty());
+    }
+
+    /// A blank line inside a Markdown table ends it: the rows after it render as a
+    /// paragraph of pipes. Merges have introduced this before (`security/idor-matrix.md`).
+    #[test]
+    fn no_table_is_split_by_a_blank_line() {
+        let mut problems = Vec::new();
+        for page in bundle().pages() {
+            let mut in_fence = false;
+            let mut previous_row = false;
+            let mut blank_after_row = false;
+            let lines: Vec<&str> = page.markdown.lines().collect();
+            for (number, line) in lines.iter().enumerate() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                    in_fence = !in_fence;
+                    previous_row = false;
+                    blank_after_row = false;
+                    continue;
+                }
+                if in_fence {
+                    continue;
+                }
+                let is_row = trimmed.starts_with('|');
+                // A row followed by a `|---|` delimiter starts a new table, which is fine.
+                let starts_table = lines
+                    .get(number + 1)
+                    .map(|next| {
+                        let next = next.trim();
+                        next.starts_with('|') && next.contains("---")
+                    })
+                    .unwrap_or(false);
+                if is_row && blank_after_row && !starts_table {
+                    problems.push(format!("{}:{}", page.path, number + 1));
+                }
+                if trimmed.is_empty() {
+                    blank_after_row = previous_row || blank_after_row;
+                } else {
+                    blank_after_row = false;
+                    previous_row = is_row;
+                }
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "table rows separated from their table by a blank line:\n{}",
             problems.join("\n")
         );
     }
