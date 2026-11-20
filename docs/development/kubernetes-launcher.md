@@ -105,8 +105,6 @@ The launcher adds `imagePullSecrets` to every pod it creates.
   ingress to the launcher (port 8090) only from the ORBIT API pods. It needs a CNI that
   enforces NetworkPolicy and is off by default. Egress is not restricted.
 - The launcher never exposes kubectl or the Docker socket to the API or web app.
-EOF
-echo done
 
 ## Custom CA certificates
 

@@ -4,9 +4,9 @@
 
 | Image | Dockerfile | Notes |
 |---|---|---|
-| `ghcr.io/orbit-platform/orbit-api` | `deploy/docker/api.Dockerfile` | multi-stage, non-root, embedded migrations |
-| `ghcr.io/orbit-platform/orbit-worker` | `deploy/docker/worker.Dockerfile` | non-root, harness adapters |
-| `ghcr.io/orbit-platform/orbit-web` | `deploy/docker/web.Dockerfile` | Next.js standalone output, non-root |
+| `ghcr.io/opsifyhq/orbit/orbit-api` | `deploy/docker/api.Dockerfile` | multi-stage, non-root, embedded migrations |
+| `ghcr.io/opsifyhq/orbit/orbit-worker` | `deploy/docker/worker.Dockerfile` | non-root, harness adapters |
+| `ghcr.io/opsifyhq/orbit/orbit-web` | `deploy/docker/web.Dockerfile` | Next.js standalone output, non-root |
 
 ```bash
 docker build -f deploy/docker/api.Dockerfile -t orbit-api:dev .
@@ -69,7 +69,7 @@ profile's worker token: long-lived profiles run as a Deployment (Kubernetes recr
 maintenance/eviction), single-execution launches run as a Job with a TTL for cleanup. Harness auth is mounted from a Secret when configured.
 
 Ingress routes: `/docs`, `/healthz`, `/readyz` → `orbit-api`; `/api` → `orbit-web`
-(the web container proxies `/api/*` to the API at harness, injecting the dev token
+(the web container proxies `/api/*` to the API at runtime, injecting the dev token
 server-side when dev auth is enabled and forwarding OIDC/API bearer headers otherwise);
 `/` → `orbit-web`.
 The chart sets SSE-friendly nginx annotations (`proxy-buffering: off`, long

@@ -154,7 +154,7 @@ files, and forced teardown on timeout/cancel.
     cancellation/timeout and trusted `--append-system-prompt`
   - platform-enforced read-only tool allowlist (`read,grep,find,ls`) at autonomy L1/L2
   - **platform providers supported**: endpoint and leased credential injected as
-    `OPENAI_API_KEY` / `OPENAI_BASE_URL`, with `--provider openai` when a platform model
+    `OPENAI_API_KEY` / `OPENAI_BASE_URL`, with `--provider orbit-platform` when a platform model
     is selected (`supports_platform_providers=true`)
   - writes the execution-scoped `.pi/mcp.json` broker bridge and accepts `--skill` paths
   - ships as its own worker image (`deploy/docker/worker-pi.Dockerfile`)
