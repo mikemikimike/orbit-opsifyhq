@@ -7,7 +7,7 @@ import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
 import { Disclosure } from "@/components/ui/disclosure";
-import { ResourceAccessFields } from "@/components/resource-access-fields";
+import { ResourceAccessFields, type ResourceAccessHandle } from "@/components/resource-access-fields";
 import { SkillPicker } from "@/components/skill-picker";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/ui/callout";
@@ -45,7 +45,7 @@ const SECTION_TITLES: Record<SectionId, string> = {
   access: "Connectors and skills",
   triggers: "Triggers",
   autonomy: "Autonomy and limits",
-  sharing: "Sharing",
+  sharing: "Access control",
 };
 
 const SECTION_ORDER: SectionId[] = [
@@ -359,6 +359,8 @@ export function AgentForm({
     return candidate;
   }
 
+  const accessRef = useRef<ResourceAccessHandle>(null);
+
   // Once a submit has failed, keep the error list honest while the person fixes things.
   useEffect(() => {
     if (!failedSubmits || issues.length === 0) return;
@@ -382,6 +384,7 @@ export function AgentForm({
       return;
     }
     setIssues([]);
+    if ((await accessRef.current?.save()) === false) return;
     await onSubmit(parsed.data as unknown as AgentDefinition);
   }
 
@@ -1400,10 +1403,10 @@ export function AgentForm({
 
           <FormSection
             id="sharing"
-            title="Sharing"
-            description="Who can see and use this agent. Saved on its own, separately from the version."
+            title="Access control (RBAC)"
+            description="Who can see and use this agent. Saved together with the agent."
           >
-            <ResourceAccessFields resource="agents" resourceId={resourceId} />
+            <ResourceAccessFields ref={accessRef} resource="agents" resourceId={resourceId} />
           </FormSection>
         </div>
       </div>
