@@ -95,6 +95,21 @@ pub async fn create_trigger(
         return Err(ApiError::validation(issues));
     }
 
+    // A trigger makes its owner run the target agent, so creation needs use rights on the
+    // agent and on every connection/provider its current spec references. Without this an
+    // Operator could attach a trigger to a private agent and execute it via the scheduler.
+    let agent = state.store.get_agent(auth.org_id, body.agent_id).await?;
+    let access = crate::access::AccessScope::load(&state, &auth).await?;
+    access.require_use(
+        "agent",
+        agent.owner_user_id,
+        agent.owner_team_id,
+        &agent.visibility,
+    )?;
+    let version = state.store.get_current_version(auth.org_id, &agent).await?;
+    let spec = crate::handlers::parse_spec(&version)?;
+    crate::preflight::require_spec_references_use(&state, auth.org_id, &access, &spec).await?;
+
     let trigger = state
         .store
         .create_trigger(

@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- Creating a trigger now requires **use** on the target agent and use of every connection
+  and provider its current spec references, closing an IDOR that let an Operator attach a
+  trigger to a private agent (#135).
+
 ## [0.22.1] - 2026-11-20
 
 ### Fixed
