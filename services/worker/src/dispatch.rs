@@ -45,6 +45,7 @@ fn rewrite_host(url: &str) -> String {
 pub async fn run(
     state: &WorkerState,
     context: &crate::client::WorkerExecutionContext,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     let execution = &context.execution;
     let Some(image) = image_for(&execution.harness_kind) else {
@@ -161,7 +162,27 @@ pub async fn run(
     // The container enforces the real timeout (pausing for approvals); this is only a
     // backstop, so it allows for one full approval window on top.
     let timeout = Duration::from_secs(execution.timeout_seconds.max(1) as u64 + 180 + 900);
-    let status = match tokio::time::timeout(timeout, wait).await {
+    // Only worker shutdown cancels this token (user cancellation is delivered to the
+    // container's own watcher). The container is stopped, then the run is reported as
+    // failed by `supervise`'s caller path below.
+    let status = tokio::select! {
+        _ = cancel.cancelled() => {
+            let _ = Command::new(&docker)
+                .args(["rm", "-f", &container_name])
+                .status()
+                .await;
+            crate::runner::fail_execution(
+                state,
+                execution,
+                HarnessError::new(
+                    HarnessErrorKind::ExecutionFailed,
+                    "worker shutdown: the per-execution container was stopped",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        waited = tokio::time::timeout(timeout, wait) => match waited {
         Ok(result) => result?,
         Err(_) => {
             let _ = Command::new(&docker)
@@ -175,6 +196,7 @@ pub async fn run(
             )
             .await?;
             return Ok(());
+        }
         }
     };
 

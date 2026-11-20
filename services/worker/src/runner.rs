@@ -36,12 +36,68 @@ pub struct WorkerState {
     /// Environment variables resolved from worker-profile connection mappings. Applied
     /// to each harness process instead of mutating the worker's global environment.
     pub extra_env: Arc<std::collections::BTreeMap<String, String>>,
-    pub active: Arc<
-        tokio::sync::Mutex<std::collections::BTreeMap<Uuid, tokio_util::sync::CancellationToken>>,
-    >,
+    /// Executions this worker currently owns (claimed and not yet reported terminal),
+    /// each with its cancellation token. Entries are removed by [`ActiveGuard`].
+    pub active: ActiveMap,
+    /// Cancelled when the worker is shutting down. Every execution token is a child of
+    /// it, so cancelling it interrupts all in-flight runs.
+    pub shutdown: tokio_util::sync::CancellationToken,
+    /// Backoff for the calls that move an execution's lifecycle.
+    pub retry: crate::retry::RetryPolicy,
+}
+
+pub type ActiveMap =
+    Arc<std::sync::Mutex<std::collections::BTreeMap<Uuid, tokio_util::sync::CancellationToken>>>;
+
+/// Removes an execution from [`WorkerState::active`] when dropped, on every exit path
+/// including error returns and panics.
+pub struct ActiveGuard {
+    active: ActiveMap,
+    id: Uuid,
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// Register a claimed execution as active. Do this before spawning its task so a
+/// shutdown that begins right after the claim still sees (and reports) it.
+pub fn track(state: &WorkerState, id: Uuid) -> (ActiveGuard, tokio_util::sync::CancellationToken) {
+    let cancel = state.shutdown.child_token();
+    state
+        .active
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(id, cancel.clone());
+    (
+        ActiveGuard {
+            active: state.active.clone(),
+            id,
+        },
+        cancel,
+    )
+}
+
+fn active_ids(state: &WorkerState) -> Vec<Uuid> {
+    state
+        .active
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .keys()
+        .copied()
+        .collect()
 }
 
 /// Poll the durable queue and dispatch executions, respecting a concurrency limit.
+///
+/// Once shutdown starts no new claim is issued, but a claim request already in flight is
+/// never dropped: it completes and its execution is reported as failed ("worker
+/// shutdown") instead of waiting for the unstarted-execution reaper.
 pub async fn claim_and_dispatch(
     state: &WorkerState,
     semaphore: &Arc<Semaphore>,
@@ -49,6 +105,9 @@ pub async fn claim_and_dispatch(
 ) -> anyhow::Result<()> {
     let mut dispatched = 0usize;
     loop {
+        if state.shutdown.is_cancelled() {
+            return Ok(());
+        }
         let permit = match semaphore.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => break,
@@ -72,14 +131,30 @@ pub async fn claim_and_dispatch(
         };
         dispatched += 1;
         let state = state.clone();
+        let execution_id = claimed.execution.id;
+        let (guard, cancel) = track(&state, execution_id);
         tokio::spawn(async move {
             let _permit = permit;
             let driver = state.execution_driver.clone();
-            let result = if driver == "docker" {
-                crate::dispatch::run(&state, &claimed).await
-            } else {
-                run_execution(state, claimed).await
-            };
+            let task_state = state.clone();
+            let result = supervise(&state, execution_id, guard, async move {
+                if cancel.is_cancelled() {
+                    // Claimed just as shutdown began: do not start it.
+                    return report_unfinished(
+                        &task_state,
+                        execution_id,
+                        SHUTDOWN_CODE,
+                        SHUTDOWN_MESSAGE,
+                    )
+                    .await;
+                }
+                if driver == "docker" {
+                    crate::dispatch::run(&task_state, &claimed, cancel).await
+                } else {
+                    run_execution(task_state, claimed, cancel).await
+                }
+            })
+            .await;
             if let Err(err) = result {
                 tracing::error!(error = %err, "execution runner failed");
             }
@@ -87,16 +162,135 @@ pub async fn claim_and_dispatch(
     }
 
     if dispatched == 0 {
-        tokio::time::sleep(poll_interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval) => {}
+            _ = state.shutdown.cancelled() => {}
+        }
     }
     Ok(())
+}
+
+const SHUTDOWN_CODE: &str = "worker_shutdown";
+const SHUTDOWN_MESSAGE: &str = "worker shutdown: the worker stopped before this execution finished";
+
+/// Run an execution future so that it always reaches a terminal state.
+///
+/// The future runs in its own task: an `Err` or a panic is reported as `failed` with a
+/// clear error, and `guard` (the `active` entry) is released when this returns. Returns
+/// `Err` when the runner failed, after reporting it.
+pub async fn supervise<F>(
+    state: &WorkerState,
+    execution_id: Uuid,
+    guard: ActiveGuard,
+    fut: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let _guard = guard;
+    let failure = match tokio::spawn(fut).await {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(error)) => format!("execution runner failed: {error:#}"),
+        Err(join) if join.is_panic() => {
+            let payload = join.into_panic();
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            format!("execution runner panicked: {detail}")
+        }
+        Err(join) => format!("execution runner task was aborted: {join}"),
+    };
+    // A no-op when the runner already reported a terminal state before failing.
+    if let Err(error) =
+        report_unfinished(state, execution_id, "worker_runner_failed", &failure).await
+    {
+        tracing::error!(%execution_id, %error, "could not report failed execution; control-plane reaper will end it");
+    }
+    Err(anyhow::anyhow!(failure))
+}
+
+/// Report an execution as `failed` unless it already reached a terminal state. Only
+/// records an error event when this call actually ended it.
+async fn report_unfinished(
+    state: &WorkerState,
+    execution_id: Uuid,
+    code: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    let error = serde_json::json!({ "code": code, "message": message, "retryable": true });
+    let updated = complete_with_retry(
+        state,
+        execution_id,
+        &crate::client::CompleteRequest {
+            status: ExecutionStatus::Failed.as_str(),
+            output: None,
+            error: Some(error.clone()),
+            usage: None,
+            session_ref: None,
+        },
+    )
+    .await?;
+    if updated {
+        let event = crate::client::EventRequest {
+            kind: ExecutionEventKind::Error.as_str(),
+            level: LogLevel::Error.as_str(),
+            message,
+            data: serde_json::json!({ "error": error }),
+        };
+        if let Err(error) = state.client.event(execution_id, &event).await {
+            tracing::warn!(%execution_id, %error, "failed to persist failure event");
+        }
+    }
+    Ok(())
+}
+
+async fn complete_with_retry(
+    state: &WorkerState,
+    execution_id: Uuid,
+    request: &crate::client::CompleteRequest<'_>,
+) -> anyhow::Result<bool> {
+    let policy = state.retry;
+    policy
+        .run("complete", || state.client.complete(execution_id, request))
+        .await
+}
+
+/// Graceful shutdown: interrupt in-flight executions, wait up to `grace` for them to
+/// report, then report anything still active as failed ("worker shutdown").
+pub async fn shutdown(state: &WorkerState, grace: Duration) {
+    state.shutdown.cancel();
+    let deadline = tokio::time::Instant::now() + grace;
+    while !active_ids(state).is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let remaining = active_ids(state);
+    if !remaining.is_empty() {
+        tracing::warn!(
+            count = remaining.len(),
+            "executions still active after shutdown grace; reporting them failed"
+        );
+    }
+    for execution_id in remaining {
+        if let Err(error) =
+            report_unfinished(state, execution_id, SHUTDOWN_CODE, SHUTDOWN_MESSAGE).await
+        {
+            tracing::error!(%execution_id, %error, "could not report execution at shutdown; control-plane reaper will end it");
+        }
+    }
 }
 
 /// Single-execution container mode: bind one dispatched execution to this worker and run
 /// it, without entering the claim loop or scheduler.
 pub async fn run_single(state: WorkerState, execution_id: uuid::Uuid) -> anyhow::Result<()> {
     let context = state.client.context(execution_id).await?;
-    run_execution(state, context).await
+    let (guard, cancel) = track(&state, execution_id);
+    let task_state = state.clone();
+    supervise(&state, execution_id, guard, async move {
+        run_execution(task_state, context, cancel).await
+    })
+    .await
 }
 
 /// Execute one claimed execution and persist its lifecycle.
@@ -121,6 +315,7 @@ fn worker_model_selector(model: &crate::client::WorkerModel) -> Option<String> {
 pub async fn run_execution(
     state: WorkerState,
     context: crate::client::WorkerExecutionContext,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     let execution = context.execution.clone();
     let execution_id = execution.id;
@@ -356,17 +551,31 @@ pub async fn run_execution(
     }
 
     let (event_tx, mut event_rx) = mpsc::channel::<HarnessEvent>(256);
-    let cancel = tokio_util::sync::CancellationToken::new();
-    state
-        .active
-        .lock()
-        .await
-        .insert(execution_id, cancel.clone());
 
-    state
-        .client
-        .running(execution_id, execution.session_ref.as_deref())
-        .await?;
+    let running = state
+        .retry
+        .run("report running", || {
+            state
+                .client
+                .running(execution_id, execution.session_ref.as_deref())
+        })
+        .await;
+    if let Err(error) = running {
+        if crate::retry::status_of(&error) == Some(409) {
+            // The platform already ended this run (cancelled, or reaped as unstarted).
+            tracing::warn!(%execution_id, %error, "execution already ended; not starting harness");
+            return Ok(());
+        }
+        return fail_execution(
+            &state,
+            &execution,
+            HarnessError::new(
+                HarnessErrorKind::ExecutionFailed,
+                format!("could not report execution start to the control plane: {error}"),
+            ),
+        )
+        .await;
+    }
     append_event(
         &state,
         &execution,
@@ -398,12 +607,15 @@ pub async fn run_execution(
     let watcher_cancel = cancel.clone();
     let done = Arc::new(AtomicBool::new(false));
     let watcher_done = done.clone();
+    let user_cancelled = Arc::new(AtomicBool::new(false));
+    let watcher_user_cancelled = user_cancelled.clone();
     let watcher = tokio::spawn(async move {
         while !watcher_done.load(Ordering::Relaxed) {
             tokio::time::sleep(Duration::from_millis(1000)).await;
             match watcher_client.cancel_requested(execution_id).await {
                 Ok(true) => {
                     tracing::info!(%execution_id, "cancellation requested; cancelling harness");
+                    watcher_user_cancelled.store(true, Ordering::Relaxed);
                     watcher_cancel.cancel();
                     break;
                 }
@@ -521,12 +733,23 @@ pub async fn run_execution(
     // Stop the cancellation watcher before finishing.
     done.store(true, Ordering::Relaxed);
     watcher.abort();
-    state.active.lock().await.remove(&execution_id);
 
     // Drain the event channel: drop the sender by ending the adapter future, then wait.
     let _ = tokio::time::timeout(Duration::from_secs(2), event_task).await;
 
     let mut outcome = outcome;
+    if outcome.status == ExecutionStatus::Cancelled
+        && !user_cancelled.load(Ordering::Relaxed)
+        && state.shutdown.is_cancelled()
+    {
+        // Interrupted by worker shutdown rather than by a person: report it as a failed
+        // run with a clear reason, not as a user cancellation.
+        outcome = ExecutionOutcome::failed(HarnessError::new(
+            HarnessErrorKind::ExecutionFailed,
+            SHUTDOWN_MESSAGE,
+        ));
+        outcome.status = ExecutionStatus::Failed;
+    }
     if outcome.usage.wall_time_ms.is_none() {
         outcome.usage.wall_time_ms = Some(started.elapsed().as_millis() as i64);
     }
@@ -565,19 +788,18 @@ pub async fn run_execution(
     )
     .await;
 
-    let updated = state
-        .client
-        .complete(
-            execution_id,
-            &crate::client::CompleteRequest {
-                status: status.as_str(),
-                output: outcome.output.clone(),
-                error: error_json,
-                usage: serde_json::to_value(&outcome.usage).ok(),
-                session_ref: outcome.session_ref.as_deref(),
-            },
-        )
-        .await?;
+    let updated = complete_with_retry(
+        &state,
+        execution_id,
+        &crate::client::CompleteRequest {
+            status: status.as_str(),
+            output: outcome.output.clone(),
+            error: error_json,
+            usage: serde_json::to_value(&outcome.usage).ok(),
+            session_ref: outcome.session_ref.as_deref(),
+        },
+    )
+    .await?;
     if updated && status == ExecutionStatus::Succeeded {
         // Store execution output as short-term memory for the agent.
         if spec.memory.enabled {
@@ -646,19 +868,18 @@ pub(crate) async fn fail_execution(
         .error
         .as_ref()
         .and_then(|error| serde_json::to_value(error).ok());
-    let _ = state
-        .client
-        .complete(
-            execution.id,
-            &crate::client::CompleteRequest {
-                status: outcome.status.as_str(),
-                output: None,
-                error: error_json,
-                usage: None,
-                session_ref: None,
-            },
-        )
-        .await;
+    complete_with_retry(
+        state,
+        execution.id,
+        &crate::client::CompleteRequest {
+            status: outcome.status.as_str(),
+            output: None,
+            error: error_json,
+            usage: None,
+            session_ref: None,
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -699,4 +920,215 @@ fn map_harness_event(
         HarnessEventKind::Error => ExecutionEventKind::Error,
     };
     (kind, event.level, event.message, event.data)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
+
+    use super::*;
+    use crate::retry::RetryPolicy;
+
+    /// Minimal stand-in for the worker-facing control-plane API.
+    #[derive(Clone, Default)]
+    struct FakeApi {
+        /// Number of initial `/complete` calls answered with 503.
+        fail_complete: usize,
+        complete_calls: Arc<AtomicUsize>,
+        completes: Arc<Mutex<Vec<serde_json::Value>>>,
+        events: Arc<Mutex<Vec<serde_json::Value>>>,
+    }
+
+    async fn complete(
+        State(api): State<FakeApi>,
+        Path(_id): Path<Uuid>,
+        Json(body): Json<serde_json::Value>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let call = api.complete_calls.fetch_add(1, Ordering::SeqCst);
+        if call < api.fail_complete {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": { "message": "unavailable" } })),
+            );
+        }
+        api.completes.lock().unwrap().push(body);
+        (StatusCode::OK, Json(serde_json::json!({ "updated": true })))
+    }
+
+    async fn event(
+        State(api): State<FakeApi>,
+        Path(_id): Path<Uuid>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        api.events.lock().unwrap().push(body);
+        Json(serde_json::json!({}))
+    }
+
+    async fn conflict(Path(_id): Path<Uuid>) -> (StatusCode, Json<serde_json::Value>) {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": { "message": "already ended" } })),
+        )
+    }
+
+    async fn serve(api: FakeApi) -> WorkerState {
+        let app = Router::new()
+            .route("/api/v1/worker/executions/{id}/complete", post(complete))
+            .route("/api/v1/worker/executions/{id}/events", post(event))
+            .route("/api/v1/worker/executions/{id}/running", post(conflict))
+            .with_state(api);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        WorkerState {
+            worker_id: "test-worker".into(),
+            client: crate::client::WorkerClient::new(format!("http://{addr}"), "token").unwrap(),
+            registry: Arc::new(orbit_harness::HarnessRegistry::builtin()),
+            workspace_root: std::env::temp_dir(),
+            harnesses: vec!["mock".into()],
+            execution_driver: "process".into(),
+            target: "local".into(),
+            profile_agent_ids: vec![],
+            profile_skill_slugs: vec![],
+            allow_web_search: false,
+            allow_web_fetch: false,
+            native_tool_permissions: serde_json::Value::Null,
+            extra_env: Arc::new(Default::default()),
+            active: Default::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            retry: RetryPolicy {
+                attempts: 4,
+                base: Duration::from_millis(5),
+                max_delay: Duration::from_millis(20),
+            },
+        }
+    }
+
+    fn succeeded_request() -> crate::client::CompleteRequest<'static> {
+        crate::client::CompleteRequest {
+            status: "succeeded",
+            output: None,
+            error: None,
+            usage: None,
+            session_ref: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_is_retried_after_a_503_and_reaches_terminal() {
+        let api = FakeApi {
+            fail_complete: 1,
+            ..Default::default()
+        };
+        let state = serve(api.clone()).await;
+        let updated = complete_with_retry(&state, Uuid::now_v7(), &succeeded_request())
+            .await
+            .expect("retry should outlast a single 503");
+        assert!(updated);
+        assert_eq!(api.complete_calls.load(Ordering::SeqCst), 2);
+        let completes = api.completes.lock().unwrap();
+        assert_eq!(completes.len(), 1);
+        assert_eq!(completes[0]["status"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn complete_gives_up_after_bounded_attempts() {
+        let api = FakeApi {
+            fail_complete: usize::MAX,
+            ..Default::default()
+        };
+        let state = serve(api.clone()).await;
+        let result = complete_with_retry(&state, Uuid::now_v7(), &succeeded_request()).await;
+        assert!(result.is_err());
+        assert_eq!(api.complete_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn definitive_4xx_answers_are_not_retried() {
+        let state = serve(FakeApi::default()).await;
+        let calls = AtomicUsize::new(0);
+        let error = state
+            .retry
+            .run("running", || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                state.client.running(Uuid::now_v7(), None)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(crate::retry::status_of(&error), Some(409));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runner_panic_reports_failed_and_cleans_up_active() {
+        let api = FakeApi::default();
+        let state = serve(api.clone()).await;
+        let id = Uuid::now_v7();
+        let (guard, _cancel) = track(&state, id);
+        assert_eq!(active_ids(&state), vec![id]);
+
+        let result = supervise(&state, id, guard, async {
+            if true {
+                panic!("boom");
+            }
+            Ok(())
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            active_ids(&state).is_empty(),
+            "active entry must be removed"
+        );
+        let completes = api.completes.lock().unwrap();
+        assert_eq!(completes.len(), 1);
+        assert_eq!(completes[0]["status"], "failed");
+        assert!(completes[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("panicked: boom"));
+        assert_eq!(api.events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn runner_error_reports_failed_and_cleans_up_active() {
+        let api = FakeApi::default();
+        let state = serve(api.clone()).await;
+        let id = Uuid::now_v7();
+        let (guard, _cancel) = track(&state, id);
+
+        let result = supervise(&state, id, guard, async { Err(anyhow::anyhow!("lost it")) }).await;
+
+        assert!(result.is_err());
+        assert!(active_ids(&state).is_empty());
+        let completes = api.completes.lock().unwrap();
+        assert_eq!(completes[0]["status"], "failed");
+        assert!(completes[0]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("lost it"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_executions_still_running_after_grace() {
+        let api = FakeApi::default();
+        let state = serve(api.clone()).await;
+        let id = Uuid::now_v7();
+        let (guard, cancel) = track(&state, id);
+
+        shutdown(&state, Duration::from_millis(150)).await;
+
+        assert!(cancel.is_cancelled(), "in-flight execution is signalled");
+        let completes = api.completes.lock().unwrap();
+        assert_eq!(completes.len(), 1);
+        assert_eq!(completes[0]["status"], "failed");
+        assert_eq!(completes[0]["error"]["code"], "worker_shutdown");
+        drop(guard);
+    }
 }

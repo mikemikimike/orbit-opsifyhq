@@ -720,6 +720,112 @@ async fn unstarted_executions_on_a_live_worker_are_ended() {
 }
 
 #[tokio::test]
+async fn running_executions_past_timeout_and_grace_are_ended_on_a_live_worker() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, user) = seed_org(&store).await;
+    let (agent, version) = store
+        .create_agent(org, Some(user), &definition("Timeout Reaper Agent"))
+        .await
+        .unwrap();
+    store
+        .upsert_worker_heartbeat("worker-timeout", &["mock".into()], "local", Some("test"))
+        .await
+        .unwrap();
+
+    let started = |key: &'static str| {
+        let store = &store;
+        let agent = &agent;
+        async move {
+            let execution = store
+                .create_execution(NewExecution {
+                    org_id: org,
+                    agent_id: agent.id,
+                    agent_version_id: version.id,
+                    agent_name: &agent.name,
+                    harness_kind: HarnessKind::Mock,
+                    trigger_source: TriggerSource::Manual,
+                    placement: "auto",
+                    trigger_id: None,
+                    input: serde_json::json!({ "task": "x", "payload": {}, "provenance": { "source": "test", "trusted": true, "receivedAt": chrono::Utc::now() } }),
+                    session_ref: None,
+                    skills: &[],
+                    timeout_seconds: 30,
+                    requested_by: Some(user),
+                    idempotency_key: Some(key),
+                    team_run_id: None,
+                    team_step_index: None,
+                })
+                .await
+                .unwrap();
+            store
+                .claim_execution(execution.id, "worker-timeout")
+                .await
+                .unwrap();
+            store
+                .mark_execution_running(execution.id, Some("s"))
+                .await
+                .unwrap();
+            execution
+        }
+    };
+    let age = |id: uuid::Uuid, interval: &'static str| {
+        let store = &store;
+        async move {
+            sqlx::query(&format!(
+                "UPDATE executions SET started_at = now() - interval '{interval}' WHERE id = $1"
+            ))
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+    };
+
+    // timeout 30s + grace 300s = 330s. Ten minutes old: stuck.
+    let stuck = started("timeout-stuck").await;
+    age(stuck.id, "10 minutes").await;
+    // Past its timeout but still inside the grace window: left alone.
+    let in_grace = started("timeout-grace").await;
+    age(in_grace.id, "2 minutes").await;
+    // Fresh.
+    let fresh = started("timeout-fresh").await;
+
+    let reaped = store
+        .reap_timed_out_executions(Some(org), 300)
+        .await
+        .unwrap();
+    assert_eq!(reaped.len(), 1, "only the stuck run is ended");
+    assert_eq!(reaped[0].id, stuck.id);
+    assert_eq!(reaped[0].status, "timed_out");
+    assert_eq!(
+        reaped[0].error.as_ref().unwrap()["code"],
+        "execution_timeout"
+    );
+    for (id, name) in [(in_grace.id, "grace"), (fresh.id, "fresh")] {
+        assert_eq!(
+            store.get_execution(org, id).await.unwrap().status,
+            "running",
+            "{name} run must survive"
+        );
+    }
+
+    // A second sweep (another replica) finds nothing, and a late worker report cannot
+    // overwrite the terminal state.
+    assert!(store
+        .reap_timed_out_executions(Some(org), 300)
+        .await
+        .unwrap()
+        .is_empty());
+    let late = store
+        .finish_execution(stuck.id, ExecutionStatus::Succeeded, None, None, None, None)
+        .await
+        .unwrap();
+    assert!(late.is_none());
+}
+
+#[tokio::test]
 async fn single_execution_mode_can_take_a_dispatched_execution() {
     let Some(store) = test_store().await else {
         return;

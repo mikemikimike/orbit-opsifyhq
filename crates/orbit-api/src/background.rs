@@ -324,6 +324,17 @@ const HEARTBEAT_STALE_SECONDS: i64 = 90;
 const UNSTARTED_SILENT_SECONDS: i64 = 600;
 /// How long a claimed, never-started run may ignore a cancel request.
 const UNSTARTED_CANCEL_SECONDS: i64 = 60;
+/// Default slack added to `timeout_seconds` before a still-`running` run is ended by the
+/// platform. Override with `ORBIT_EXECUTION_TIMEOUT_GRACE_SECONDS`.
+const DEFAULT_TIMEOUT_GRACE_SECONDS: i64 = 300;
+
+fn timeout_grace_seconds() -> i64 {
+    std::env::var("ORBIT_EXECUTION_TIMEOUT_GRACE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(DEFAULT_TIMEOUT_GRACE_SECONDS)
+}
 
 async fn reap(state: &AppState) {
     match state
@@ -376,6 +387,31 @@ async fn reap(state: &AppState) {
             }
         }
         Err(error) => tracing::warn!(%error, "unstarted execution reaper failed"),
+    }
+
+    match state
+        .store
+        .reap_timed_out_executions(None, timeout_grace_seconds())
+        .await
+    {
+        Ok(rows) => {
+            for execution in rows {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    worker_id = ?execution.worker_id,
+                    "ended execution that outlived its timeout"
+                );
+                let message = format!(
+                    "execution outlived its {}s timeout (plus grace) without being reported finished; marked timed out",
+                    execution.timeout_seconds
+                );
+                let data = execution.error.clone().unwrap_or_else(
+                    || serde_json::json!({ "code": "execution_timeout", "retryable": true }),
+                );
+                report_reaped(state, &execution, &message, &data).await;
+            }
+        }
+        Err(error) => tracing::warn!(%error, "timed-out execution reaper failed"),
     }
 }
 
