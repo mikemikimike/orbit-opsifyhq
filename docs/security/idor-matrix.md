@@ -5,7 +5,11 @@ Enforced by `crates/orbit-api/src/access.rs` (`AccessScope`). Invisible resource
 
 | Resource | List filter | Get | Write | Execution/approval |
 |---|---|---|---|---|
-| Agents | yes | yes | yes (author must be able to **use** every referenced connection and provider) | parent visibility; run needs **use** |
+
+| Agents | yes | yes | yes | parent visibility |
+| Agent versions (`/agents/{id}/versions`) | — | parent visibility (404) | — | — |
+| Agent export / agent executions list | — | parent visibility (404) | — | — |
+| Agent runtime / activate / pause | — | manage (404 if invisible) | manage | — |
 | Skills | yes | yes | yes | — |
 | Connections | yes | yes | yes | **use** required on every run path (see preflight) |
 | Providers | yes | yes | yes | **use** required when an agent binds it (platform-managed models) |

@@ -793,6 +793,39 @@ async fn private_agents_are_hidden_from_other_users() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // Version history exposes full specs: same visibility rule as the detail route (#134).
+    let (status, body) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/agents/{alice_agent}/versions"),
+            &bob_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.get("spec").is_none() && !body.is_array());
+
+    let (status, _) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/agents/{alice_agent}/executions"),
+            &bob_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = send(
+        &app.router,
+        auth_get(
+            &format!("/api/v1/agents/{alice_agent}/versions"),
+            &alice_token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.as_array().unwrap().is_empty());
+
     let (status, _) = send(
         &app.router,
         auth_post(

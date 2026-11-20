@@ -14,7 +14,7 @@ use crate::dto::{
     UpdateAgentRequest,
 };
 use crate::error::ApiError;
-use crate::handlers::{limit, load_agent_detail};
+use crate::handlers::{limit, load_agent_detail, load_visible_agent, parse_spec};
 use crate::state::AppState;
 
 async fn require_agent_manage(
@@ -324,6 +324,7 @@ pub async fn list_versions(
     Path(agent_id): Path<Uuid>,
 ) -> Result<Json<Vec<AgentVersionView>>, ApiError> {
     auth.require(Permission::AgentsRead)?;
+    load_visible_agent(&state, &auth, agent_id).await?;
     let versions = state
         .store
         .list_agent_versions(auth.org_id, agent_id)
