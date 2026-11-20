@@ -6,7 +6,7 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
-## [Unreleased]
+## [0.22.0] - 2026-11-20
 
 ### Added
 
@@ -21,7 +21,6 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
   repair stuck `next_run_at` values (#111).
 - CI runs `cargo audit` directly so the result fails only on real advisories, not on a
   check-run permissions error (#127).
-
 - Embedded in-app documentation with working links (#44).
 - Portable YAML/Markdown export and import for agents, skills, triggers, connections,
   providers, worker profiles, agent teams and tool policies (#80).
