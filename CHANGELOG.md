@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [0.22.1] - 2026-11-20
+
+### Fixed
+
+- OIDC/SSO redirect loop: the app shell no longer queries `/me` on public pages
+  (login/callback), which cached a 401 and cleared the fresh token after sign-in.
+- Team-output delivery enqueue no longer fails with "no unique or exclusion constraint
+  matching the ON CONFLICT specification": the conflict target now names the partial
+  unique index predicate.
+- The signed-in navigation no longer flashes before OIDC redirects to the IdP; protected
+  pages wait for auth metadata and `/me` instead of rendering the shell first.
+
 ## [0.22.0] - 2026-11-20
 
 ### Added
