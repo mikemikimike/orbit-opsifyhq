@@ -133,7 +133,7 @@ export const agentDefinitionSchema = z.object({
 });
 export type AgentDefinition = z.infer<typeof agentDefinitionSchema>;
 
-export const providerKindSchema = z.enum(["openai_compatible", "harness_managed"]);
+export const providerKindSchema = z.enum(["openai_compatible", "anthropic", "harness_managed"]);
 
 export const providerConfigSchema = z
   .object({

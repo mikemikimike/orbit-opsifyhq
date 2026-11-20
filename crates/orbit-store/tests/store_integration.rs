@@ -1241,7 +1241,7 @@ async fn env_mappings_and_outputs_round_trip() {
         )
         .await
         .expect("env mapping");
-    assert_eq!(store.list_env_mappings(org).await.unwrap().len(), 1);
+    assert_eq!(store.list_env_mappings(org, None).await.unwrap().len(), 1);
     assert_eq!(mapping.name, "Shared tokens");
     store.delete_env_mapping(org, mapping.id).await.unwrap();
 
@@ -2432,4 +2432,40 @@ async fn secret_resolution_is_org_scoped() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn stale_worker_heartbeats_are_pruned_after_retention() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let worker_id = format!("stale-retention-{}", uuid::Uuid::now_v7());
+    store
+        .upsert_worker_heartbeat(
+            org,
+            uuid::Uuid::now_v7(),
+            &worker_id,
+            &["mock".into()],
+            "local",
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE worker_heartbeats SET last_heartbeat_at = now() - interval '25 hours' WHERE worker_id = $1",
+    )
+    .bind(&worker_id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    assert!(store.delete_stale_worker_heartbeats(24).await.unwrap() >= 1);
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM worker_heartbeats WHERE worker_id = $1")
+            .bind(&worker_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0);
 }

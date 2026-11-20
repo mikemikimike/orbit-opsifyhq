@@ -2,15 +2,35 @@
 
 use uuid::Uuid;
 
+use crate::access::{binds, ResourceAccess};
 use crate::models::EnvMapping;
 use crate::{Store, StoreError, StoreResult};
 
 impl Store {
-    pub async fn list_env_mappings(&self, org_id: Uuid) -> StoreResult<Vec<EnvMapping>> {
+    pub async fn list_env_mappings(
+        &self,
+        org_id: Uuid,
+        access: Option<&ResourceAccess>,
+    ) -> StoreResult<Vec<EnvMapping>> {
+        let (privileged, user_id, team_ids, isolation) = binds(access);
         Ok(sqlx::query_as::<_, EnvMapping>(
-            "SELECT * FROM env_mappings WHERE org_id = $1 ORDER BY name ASC",
+            r#"
+            SELECT * FROM env_mappings m
+            WHERE m.org_id = $1
+              AND ($2::bool
+                   OR m.owner_user_id = $3
+                   OR CASE WHEN $5::bool AND m.owner_team_id IS NOT NULL
+                           THEN m.owner_team_id = ANY($4)
+                           ELSE m.visibility = 'org'
+                                OR (m.visibility = 'team' AND m.owner_team_id = ANY($4)) END)
+            ORDER BY m.name ASC
+            "#,
         )
         .bind(org_id)
+        .bind(privileged)
+        .bind(user_id)
+        .bind(&team_ids)
+        .bind(isolation)
         .fetch_all(&self.pool)
         .await?)
     }
