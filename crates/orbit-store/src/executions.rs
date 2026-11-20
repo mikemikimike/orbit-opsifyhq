@@ -533,7 +533,8 @@ impl Store {
             RETURNING *
             "#
         );
-        let mut query = sqlx::query_as::<_, ExecutionRecord>(&sql)
+        // Safe: `team_filter` is one of two static strings; all values are bound.
+        let mut query = sqlx::query_as::<_, ExecutionRecord>(sqlx::AssertSqlSafe(sql))
             .bind(org_id)
             .bind(worker_id)
             .bind(harnesses)

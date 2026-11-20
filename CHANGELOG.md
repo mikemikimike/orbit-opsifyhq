@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
+## [Unreleased]
+
+### Security
+
+- Cleared the RustSec advisories that the `cargo audit` gate (#127) reports:
+  `utoipa` 5 → 6 and `utoipa-swagger-ui` 9 → 10 (drops `zip` 3.0.0, six advisories, a
+  build-time dependency), and `sqlx` 0.8 → 0.9 (drops `rsa`, RUSTSEC-2023-0071, and moves
+  the lockfile-only `libsqlite3-sys` to 0.40.0, RUSTSEC-2026-0459; neither was compiled).
+  Generated OpenAPI is unchanged apart from ordering.
+
+### Changed
+
+- Minimum supported Rust version is now 1.94 (required by `sqlx` 0.9).
+- Dynamic SQL is wrapped in `sqlx::AssertSqlSafe` with the reason it is safe, as `sqlx`
+  0.9 requires.
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

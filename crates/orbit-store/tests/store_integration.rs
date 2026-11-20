@@ -631,18 +631,18 @@ async fn unstarted_executions_on_a_live_worker_are_ended() {
     let age = |id: uuid::Uuid, interval: &'static str| {
         let store = &store;
         async move {
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE executions SET created_at = now() - interval '{interval}', \
                  started_at = now() - interval '{interval}', updated_at = now() - interval '{interval}' \
                  WHERE id = $1"
-            ))
+            )))
             .bind(id)
             .execute(store.pool())
             .await
             .unwrap();
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE execution_events SET created_at = now() - interval '{interval}' WHERE execution_id = $1"
-            ))
+            )))
             .bind(id)
             .execute(store.pool())
             .await
