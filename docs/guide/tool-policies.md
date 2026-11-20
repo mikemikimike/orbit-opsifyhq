@@ -74,12 +74,18 @@ The broker does not trust the caller's metadata. The effect is derived from the 
 | Effect | Tools |
 |---|---|
 | `read` | `read`, `grep`, `glob`, `list`, `ls`, `find` |
-| `external_side_effect` | `bash`, `shell`, `webfetch`, `websearch`, `task`, `subagent` |
+| `external_side_effect` | `bash`, `shell`, `webfetch`, `websearch` |
+| `read` | `read`, `grep`, `glob`, `list`, `ls`, `find`, `task`, `subagent` |
 | `write` | `edit`, `write`, `patch`, `multiedit`, `apply_patch` and **any unknown tool** |
 
 The platform decision comes from `evaluate_capability` with the agent's autonomy level and
 approval mode, so `allow` rules cannot bypass approval at the lower autonomy levels or with
 `approval_mode=always|writes`. Relative paths resolve against the execution workspace.
+
+`task`/`subagent` are the harness's internal dispatch tools, not external actions. They are
+classified as `read` so native Agent Teams can start subagents at Observe/Recommend. The
+subagent's own `bash`/`edit`/`write` calls are evaluated separately by the same hook and
+remain subject to autonomy, approval mode and tool policies.
 
 **Approval binding.** Every `/policy` response carries `argumentsHash`
 (SHA-256 of the tool name plus canonical JSON arguments, keys sorted), and the approval

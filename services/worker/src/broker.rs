@@ -912,14 +912,17 @@ struct PolicyCheck {
 /// | effect | tools |
 /// |---|---|
 /// | read | `read`, `grep`, `glob`, `list`, `ls`, `find` |
-/// | external_side_effect | `bash`, `shell`, `webfetch`, `websearch`, `task`, `subagent` |
+/// | external_side_effect | `bash`, `shell`, `webfetch`, `websearch` |
 /// | write | `edit`, `write`, `patch`, `multiedit`, `apply_patch`, and anything unknown |
+///
+/// `task`/`subagent` only dispatch an internal subagent; the subagent's own tool calls
+/// are checked by the same policy hook. Treating the dispatch as an external side effect
+/// blocked native Agent Teams at Observe/Recommend before any work could start.
 fn native_tool_effect(tool: &str) -> CapabilityEffect {
     match tool.trim().to_ascii_lowercase().as_str() {
         "read" | "grep" | "glob" | "list" | "ls" | "find" => CapabilityEffect::Read,
-        "bash" | "shell" | "webfetch" | "websearch" | "task" | "subagent" => {
-            CapabilityEffect::ExternalSideEffect
-        }
+        "bash" | "shell" | "webfetch" | "websearch" => CapabilityEffect::ExternalSideEffect,
+        "task" | "subagent" => CapabilityEffect::Read,
         _ => CapabilityEffect::Write,
     }
 }
@@ -1502,6 +1505,19 @@ mod tests {
         assert_eq!(
             decide(4, ApprovalMode::Auto, &rules, &spoofed),
             PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn subagent_dispatch_is_internal_not_an_external_side_effect() {
+        assert_eq!(native_tool_effect("task"), CapabilityEffect::Read);
+        assert_eq!(native_tool_effect("subagent"), CapabilityEffect::Read);
+        // The subagent itself still cannot write at low autonomy: its own tool calls are
+        // evaluated separately by the same policy hook.
+        let req = request("task", None, json!({ "description": "delegate" }));
+        assert_eq!(
+            decide(2, ApprovalMode::Auto, &[], &req),
+            PolicyDecision::Allow
         );
     }
 
