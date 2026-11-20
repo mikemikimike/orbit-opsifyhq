@@ -104,6 +104,31 @@ impl Permission {
     }
 }
 
+/// Whether a permission set (which may contain the `*` wildcard) grants `scope`.
+/// A requested `*` is only granted by a set that itself holds `*`.
+pub fn scope_granted(held: &[String], scope: &str) -> bool {
+    held.iter().any(|h| h == "*" || h == scope)
+}
+
+/// Intersect a token's scopes with the owner's current permissions, handling the `*`
+/// wildcard on either side. The result never grants more than `held`.
+pub fn intersect_scopes(token_scopes: &[String], held: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for scope in token_scopes {
+        if scope == "*" {
+            // Wildcard token: the owner's current set applies in full.
+            for h in held {
+                if !out.contains(h) {
+                    out.push(h.clone());
+                }
+            }
+        } else if scope_granted(held, scope) && !out.contains(scope) {
+            out.push(scope.clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +156,35 @@ mod tests {
             UserRole::Owner,
             Permission::SettingsWrite
         ));
+    }
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn intersection_drops_scopes_the_owner_lost() {
+        let held = v(&["agents:read", "settings:read"]);
+        let token = v(&["agents:read", "settings:write"]);
+        assert_eq!(intersect_scopes(&token, &held), v(&["agents:read"]));
+    }
+
+    #[test]
+    fn intersection_handles_wildcards_both_ways() {
+        let held = v(&["agents:read"]);
+        assert_eq!(intersect_scopes(&v(&["*"]), &held), held);
+        assert_eq!(
+            intersect_scopes(&v(&["agents:read", "audit:read"]), &v(&["*"])),
+            v(&["agents:read", "audit:read"])
+        );
+        assert_eq!(intersect_scopes(&v(&["*"]), &v(&["*"])), v(&["*"]));
+        assert!(intersect_scopes(&v(&["audit:read"]), &held).is_empty());
+    }
+
+    #[test]
+    fn wildcard_scope_requires_wildcard_holder() {
+        assert!(!scope_granted(&v(&["agents:read"]), "*"));
+        assert!(scope_granted(&v(&["*"]), "*"));
+        assert!(scope_granted(&v(&["agents:read"]), "agents:read"));
     }
 }

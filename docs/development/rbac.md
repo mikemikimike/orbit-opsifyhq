@@ -43,12 +43,19 @@ Custom roles currently apply to organization-level actions only. Roles are visib
 `GET /api/v1/me` via the effective `permissions` list.
 
 
-## Approvals
+## API tokens
 
-Deciding an approval requires `approvals:decide` **and** use/manage access to the agent
-the execution belongs to (see `docs/security/idor-matrix.md`). With
-`approvalsRequireDifferentApprover` enabled (`GET/PUT /api/v1/settings/approvals`,
-default off, API only) the user who requested the execution cannot decide its approvals.
+Tokens are always bounded by their owner's **current** role:
+
+- Effective permissions = token scopes ∩ the owner's current permissions (the `*`
+  wildcard is honoured on either side). Demoting a user, or editing their custom role,
+  takes effect on their existing tokens immediately; no revocation is needed.
+- A token whose scopes no longer overlap with the owner's role is rejected with `403`.
+- An empty stored scope list means "the owner's role permissions".
+- `POST /api/v1/api-tokens` rejects (`422`, offending scopes in `error.details`) any explicit
+  scope the caller does not currently hold (`*` is allowed and resolves to the caller's
+  current permissions); omitting `scopes` defaults to the caller's own
+  permissions. Disabled users' tokens are rejected.
 
 ## Not implemented yet (issue #15)
 
