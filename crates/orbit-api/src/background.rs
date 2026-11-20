@@ -386,7 +386,7 @@ async fn report_reaped(
     message: &str,
     data: &serde_json::Value,
 ) {
-    let _ = state
+    if let Err(err) = state
         .store
         .append_execution_event(
             execution.org_id,
@@ -396,7 +396,10 @@ async fn report_reaped(
             message,
             data,
         )
-        .await;
+        .await
+    {
+        tracing::warn!(execution_id = %execution.id, error = %err, "failed to append execution event");
+    }
     let event = OrbitEvent::new(
         subjects::EXECUTION_UPDATED,
         "orbit-api-reaper",
