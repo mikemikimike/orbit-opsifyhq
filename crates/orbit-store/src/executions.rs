@@ -116,8 +116,10 @@ impl Store {
         .await?)
     }
 
-    /// Keyset-paginated execution list with optional filters.
-    #[allow(clippy::type_complexity)]
+    /// Keyset-paginated execution list with optional filters. Visibility is applied in SQL
+    /// via the owning agent (`access = None` means org-wide/internal). The returned total
+    /// uses the same predicate, so it is the visible total for the filter.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub async fn list_executions(
         &self,
         org_id: Uuid,
@@ -126,6 +128,7 @@ impl Store {
         status: Option<&str>,
         agent_id: Option<Uuid>,
         archived: Option<bool>,
+        access: Option<&crate::access::ResourceAccess>,
     ) -> StoreResult<(Vec<ExecutionRecord>, Option<String>, i64)> {
         let (cursor_ts, cursor_id) = match cursor {
             Some(raw) => match decode_cursor(raw)? {
@@ -134,15 +137,22 @@ impl Store {
             },
             None => (None, None),
         };
+        let (privileged, user_id, team_ids, isolation) = crate::access::binds(access);
         let rows = sqlx::query_as::<_, ExecutionRecord>(
             r#"
-            SELECT * FROM executions
-            WHERE org_id = $1
-              AND ($2::text IS NULL OR status = $2)
-              AND ($3::uuid IS NULL OR agent_id = $3)
-              AND ($4::timestamptz IS NULL OR (created_at, id) < ($4::timestamptz, $5::uuid))
-              AND ($6::boolean IS NULL OR ($6 = FALSE AND archived_at IS NULL) OR ($6 = TRUE AND archived_at IS NOT NULL))
-            ORDER BY created_at DESC, id DESC
+            SELECT e.* FROM executions e
+            JOIN agents a ON a.id = e.agent_id
+            WHERE e.org_id = $1
+              AND ($2::text IS NULL OR e.status = $2)
+              AND ($3::uuid IS NULL OR e.agent_id = $3)
+              AND ($4::timestamptz IS NULL OR (e.created_at, e.id) < ($4::timestamptz, $5::uuid))
+              AND ($6::boolean IS NULL OR ($6 = FALSE AND e.archived_at IS NULL) OR ($6 = TRUE AND e.archived_at IS NOT NULL))
+              AND ($8::bool OR a.owner_user_id = $9
+                   OR CASE WHEN $11::bool AND a.owner_team_id IS NOT NULL
+                        THEN a.owner_team_id = ANY($10)
+                        ELSE a.visibility = 'org'
+                             OR (a.visibility = 'team' AND a.owner_team_id = ANY($10)) END)
+            ORDER BY e.created_at DESC, e.id DESC
             LIMIT $7
             "#,
         )
@@ -153,22 +163,36 @@ impl Store {
         .bind(cursor_id)
         .bind(archived)
         .bind(limit + 1)
+        .bind(privileged)
+        .bind(user_id)
+        .bind(&team_ids)
+        .bind(isolation)
         .fetch_all(&self.pool)
         .await?;
 
         let total: i64 = sqlx::query_scalar(
             r#"
-            SELECT COUNT(*) FROM executions
-            WHERE org_id = $1
-              AND ($2::text IS NULL OR status = $2)
-              AND ($3::uuid IS NULL OR agent_id = $3)
-              AND ($4::boolean IS NULL OR ($4 = FALSE AND archived_at IS NULL) OR ($4 = TRUE AND archived_at IS NOT NULL))
+            SELECT COUNT(*) FROM executions e
+            JOIN agents a ON a.id = e.agent_id
+            WHERE e.org_id = $1
+              AND ($2::text IS NULL OR e.status = $2)
+              AND ($3::uuid IS NULL OR e.agent_id = $3)
+              AND ($4::boolean IS NULL OR ($4 = FALSE AND e.archived_at IS NULL) OR ($4 = TRUE AND e.archived_at IS NOT NULL))
+              AND ($5::bool OR a.owner_user_id = $6
+                   OR CASE WHEN $8::bool AND a.owner_team_id IS NOT NULL
+                        THEN a.owner_team_id = ANY($7)
+                        ELSE a.visibility = 'org'
+                             OR (a.visibility = 'team' AND a.owner_team_id = ANY($7)) END)
             "#,
         )
         .bind(org_id)
         .bind(status)
         .bind(agent_id)
         .bind(archived)
+        .bind(privileged)
+        .bind(user_id)
+        .bind(&team_ids)
+        .bind(isolation)
         .fetch_one(&self.pool)
         .await?;
 

@@ -45,21 +45,33 @@ impl Store {
         org_id: Uuid,
         status: Option<&str>,
         limit: i64,
+        access: Option<&crate::access::ResourceAccess>,
     ) -> StoreResult<Vec<ApprovalWithExecution>> {
+        let (privileged, user_id, team_ids, isolation) = crate::access::binds(access);
         Ok(sqlx::query_as::<_, ApprovalWithExecution>(
             r#"
             SELECT ap.*, e.agent_name, e.status AS execution_status, e.agent_id
             FROM approvals ap
             JOIN executions e ON e.id = ap.execution_id
+            JOIN agents a ON a.id = e.agent_id
             WHERE ap.org_id = $1
               AND ($2::text IS NULL OR ap.status = $2)
-            ORDER BY ap.created_at DESC
+              AND ($4::bool OR a.owner_user_id = $5
+                   OR CASE WHEN $7::bool AND a.owner_team_id IS NOT NULL
+                        THEN a.owner_team_id = ANY($6)
+                        ELSE a.visibility = 'org'
+                             OR (a.visibility = 'team' AND a.owner_team_id = ANY($6)) END)
+            ORDER BY ap.created_at DESC, ap.id DESC
             LIMIT $3
             "#,
         )
         .bind(org_id)
         .bind(status)
         .bind(limit)
+        .bind(privileged)
+        .bind(user_id)
+        .bind(&team_ids)
+        .bind(isolation)
         .fetch_all(&self.pool)
         .await?)
     }
