@@ -12,7 +12,7 @@ Enforced by `crates/orbit-api/src/access.rs` (`AccessScope`). Invisible resource
 | Agent runtime / activate / pause | — | manage (404 if invisible) | manage | — |
 | Skills | yes | yes | yes | — |
 | Connections | yes | yes | yes | **use** required on every run path (see preflight) |
-| Providers | yes | yes | yes | **use** required when an agent binds it (platform-managed models) |
+| Providers | yes | yes | yes | **use** required when an agent binds it, in both platform- and harness-managed models (incl. team subagents); the worker context re-checks the run principal before returning the credential |
 | Worker profiles | yes | yes | yes | claims scoped by owning team |
 
 | Triggers | yes | yes | yes | create needs **use** on the target agent and its spec references; fire re-checks the owner |

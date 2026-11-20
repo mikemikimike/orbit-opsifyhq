@@ -3119,3 +3119,297 @@ async fn team_queue_requires_team_view_and_use() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+// ---- issue #193: provider use is checked in both management modes ----
+
+fn provider_definition(management: &str, provider: &str) -> Value {
+    let mut definition = definition();
+    definition["spec"]["model"] = json!({ "management": management, "provider": provider });
+    if management == "platform" {
+        definition["spec"]["model"]["model"] = json!("test-model");
+    }
+    definition
+}
+
+struct ProviderFixture {
+    app: TestApp,
+    owner: orbit_store::User,
+    operator: orbit_store::User,
+    operator_token: String,
+    provider_name: String,
+}
+
+/// A private provider with a credential owned by `owner`, plus an Operator who cannot
+/// view it.
+async fn provider_fixture() -> Option<ProviderFixture> {
+    let app = test_app(true).await?;
+    let owner = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "victim@test.local",
+            "Victim",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let operator = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "attacker@test.local",
+            "Attacker",
+            UserRole::Operator,
+        )
+        .await
+        .unwrap();
+    let provider_name = format!("provider-b-{}", Uuid::now_v7());
+    let reference = format!("provider/{}", Uuid::now_v7());
+    app.store
+        .put_secret(
+            Some(app.org_id),
+            &reference,
+            &orbit_security::SecretValue::new("sk-victim-secret"),
+            "test",
+        )
+        .await
+        .unwrap();
+    let provider = app
+        .store
+        .create_provider(
+            app.org_id,
+            &provider_name,
+            "openai_compatible",
+            &json!({ "baseUrl": "http://127.0.0.1:9/v1", "model": "m" }),
+            Some(&reference),
+        )
+        .await
+        .unwrap();
+    make_private(&app.store, app.org_id, "providers", provider.id, owner.id).await;
+    let operator_token = token_for(&app.store, app.org_id, operator.id, "attacker").await;
+    Some(ProviderFixture {
+        app,
+        owner,
+        operator,
+        operator_token,
+        provider_name,
+    })
+}
+
+#[tokio::test]
+async fn operator_cannot_bind_unviewable_provider() {
+    let Some(f) = provider_fixture().await else {
+        return;
+    };
+    for management in ["harness", "platform"] {
+        // Create.
+        let (status, body) = send(
+            &f.app.router,
+            auth_post(
+                "/api/v1/agents",
+                &f.operator_token,
+                provider_definition(management, &f.provider_name),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{management}: {body}");
+        assert_eq!(body["error"]["details"][0]["path"], "spec.model.provider");
+
+        // Update of an agent the operator owns.
+        let own = create_demo_agent(&f.app.store, f.app.org_id, f.operator.id).await;
+        let (status, body) = send(
+            &f.app.router,
+            auth_patch(
+                &format!("/api/v1/agents/{own}"),
+                &f.operator_token,
+                json!({ "definition": provider_definition(management, &f.provider_name) }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{management}: {body}");
+
+        // Execute preflight: an agent that already names the provider (stored before the
+        // fix, or written directly) cannot be run by the operator.
+        let definition: orbit_domain::AgentDefinition =
+            serde_json::from_value(provider_definition(management, &f.provider_name)).unwrap();
+        let (agent, _) = f
+            .app
+            .store
+            .create_agent(f.app.org_id, Some(f.operator.id), &definition)
+            .await
+            .unwrap();
+        f.app
+            .store
+            .set_agent_status(f.app.org_id, agent.id, orbit_domain::AgentStatus::Active)
+            .await
+            .unwrap();
+        let (status, body) = send(
+            &f.app.router,
+            auth_post(
+                &format!("/api/v1/agents/{}/executions", agent.id),
+                &f.operator_token,
+                json!({ "task": "steal" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{management}: {body}");
+    }
+
+    // The owner can bind it in harness mode.
+    let owner_token = token_for(&f.app.store, f.app.org_id, f.owner.id, "victim").await;
+    let (status, body) = send(
+        &f.app.router,
+        auth_post(
+            "/api/v1/agents",
+            &owner_token,
+            provider_definition("harness", &f.provider_name),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+async fn queued_execution(
+    f: &ProviderFixture,
+    agent_id: Uuid,
+    requested_by: Option<Uuid>,
+    input: Value,
+    token_id: Uuid,
+) -> Uuid {
+    let agent = f.app.store.get_agent(f.app.org_id, agent_id).await.unwrap();
+    let version = f
+        .app
+        .store
+        .get_current_version(f.app.org_id, &agent)
+        .await
+        .unwrap();
+    let execution = f
+        .app
+        .store
+        .create_execution(orbit_store::executions::NewExecution {
+            org_id: f.app.org_id,
+            agent_id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: orbit_domain::HarnessKind::Mock,
+            trigger_source: orbit_domain::TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input,
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by,
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+    f.app
+        .store
+        .claim_execution(execution.id, "provider-test-worker")
+        .await
+        .unwrap()
+        .expect("queued");
+    f.app
+        .store
+        .bind_execution_worker_token(execution.id, token_id)
+        .await
+        .unwrap();
+    execution.id
+}
+
+#[tokio::test]
+async fn worker_context_withholds_credential_from_unauthorized_principal() {
+    let Some(f) = provider_fixture().await else {
+        return;
+    };
+    let issued = orbit_security::issue_worker_token();
+    let token = f
+        .app
+        .store
+        .create_worker_token(
+            f.app.org_id,
+            None,
+            "provider-test",
+            &issued.prefix,
+            &issued.hash,
+            &[],
+        )
+        .await
+        .unwrap();
+    let context_path = |id: Uuid| format!("/api/v1/worker/executions/{id}/context");
+
+    for management in ["harness", "platform"] {
+        let definition: orbit_domain::AgentDefinition =
+            serde_json::from_value(provider_definition(management, &f.provider_name)).unwrap();
+        // Agent owned by the victim, so only the requester differs between the cases.
+        let (agent, _) = f
+            .app
+            .store
+            .create_agent(f.app.org_id, Some(f.owner.id), &definition)
+            .await
+            .unwrap();
+
+        // Allowed: requested by the provider owner. Credential present.
+        let allowed = queued_execution(&f, agent.id, Some(f.owner.id), json!({}), token.id).await;
+        let (status, body) = send(
+            &f.app.router,
+            worker_request("GET", &context_path(allowed), &issued.token, None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{management}: {body}");
+        assert_eq!(
+            body["model"]["credential"]["value"], "sk-victim-secret",
+            "{management}"
+        );
+
+        // Denied: requested by an operator who cannot view the provider.
+        let denied = queued_execution(&f, agent.id, Some(f.operator.id), json!({}), token.id).await;
+        let (status, body) = send(
+            &f.app.router,
+            worker_request("GET", &context_path(denied), &issued.token, None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{management}: {body}");
+        assert!(!body.to_string().contains("sk-victim-secret"));
+    }
+
+    // Subagent model: the lead agent is harmless, the team subagent names the provider.
+    let sub_definition: orbit_domain::AgentDefinition =
+        serde_json::from_value(provider_definition("harness", &f.provider_name)).unwrap();
+    let (sub_agent, _) = f
+        .app
+        .store
+        .create_agent(f.app.org_id, Some(f.owner.id), &sub_definition)
+        .await
+        .unwrap();
+    let input = json!({ "team": { "subagents": [{ "agentId": sub_agent.id, "name": "sub" }] } });
+    let denied = queued_execution(
+        &f,
+        f.app.agent_id,
+        Some(f.operator.id),
+        input.clone(),
+        token.id,
+    )
+    .await;
+    let (status, body) = send(
+        &f.app.router,
+        worker_request("GET", &context_path(denied), &issued.token, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(!body.to_string().contains("sk-victim-secret"));
+    let allowed = queued_execution(&f, f.app.agent_id, Some(f.owner.id), input, token.id).await;
+    let (status, body) = send(
+        &f.app.router,
+        worker_request("GET", &context_path(allowed), &issued.token, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["subagentModels"][0]["model"]["credential"]["value"],
+        "sk-victim-secret"
+    );
+}

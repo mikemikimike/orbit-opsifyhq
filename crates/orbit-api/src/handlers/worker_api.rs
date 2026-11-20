@@ -24,6 +24,7 @@ use orbit_store::{
     Approval, Connection, ConnectorRecord, ExecutionRecord, Skill, Store, WorkerProfile,
 };
 
+use crate::access::AccessScope;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::worker_auth::WorkerAuth;
@@ -434,7 +435,27 @@ async fn build_context(
             )));
         }
     }
-    let model = resolve_model(&state.store, org_id, &spec).await?;
+    // Defence in depth (#193): the credential is only handed out when the execution's
+    // principal can use the provider. The principal is the requester; background runs
+    // (triggers, system) have none, so the agent's owner stands in, the same
+    // stored-identity approach as the #140 preflight. Legacy unowned agents keep
+    // platform authority. Re-evaluated on every context build, so lost access fails
+    // the run closed instead of leaking the credential.
+    let principal_id = match execution.requested_by {
+        Some(user_id) => Some(user_id),
+        None => {
+            state
+                .store
+                .get_agent(org_id, execution.agent_id)
+                .await?
+                .owner_user_id
+        }
+    };
+    let access = match principal_id {
+        Some(user_id) => Some(AccessScope::load_for_user(state, org_id, user_id).await?),
+        None => None,
+    };
+    let model = resolve_model(&state.store, org_id, &spec, access.as_ref()).await?;
     let mut subagent_models = Vec::new();
     for (agent_id, name) in team_subagents(execution) {
         let agent = state
@@ -450,7 +471,7 @@ async fn build_context(
         let sub_spec: AgentSpec = serde_json::from_value(version.spec).map_err(|error| {
             ApiError::internal(format!("subagent '{name}' spec is invalid: {error}"))
         })?;
-        let resolved = resolve_model(&state.store, org_id, &sub_spec).await?;
+        let resolved = resolve_model(&state.store, org_id, &sub_spec, access.as_ref()).await?;
         subagent_models.push(WorkerSubagentModel {
             agent_id,
             model: resolved,
@@ -1028,10 +1049,27 @@ async fn publish_status(state: &AppState, execution: &ExecutionRecord) {
     let _ = state.bus.publish(event).await;
 }
 
+/// Fail closed when the execution's principal may not use the provider.
+fn require_principal_can_use(
+    access: Option<&AccessScope>,
+    provider: &orbit_store::Provider,
+) -> Result<(), ApiError> {
+    match access {
+        Some(access) => access.require_use(
+            "provider",
+            provider.owner_user_id,
+            provider.owner_team_id,
+            &provider.visibility,
+        ),
+        None => Ok(()),
+    }
+}
+
 async fn resolve_model(
     store: &Store,
     org_id: Uuid,
     spec: &AgentSpec,
+    access: Option<&AccessScope>,
 ) -> Result<Option<WorkerModel>, ApiError> {
     let provider_name = spec.model.provider.clone();
     let model = spec.model.model.clone();
@@ -1047,6 +1085,7 @@ async fn resolve_model(
         };
         if let Some(name) = &provider_name {
             if let Some(provider) = store.get_provider_by_name(org_id, name).await? {
+                require_principal_can_use(access, &provider)?;
                 if let Some(reference) = &provider.secret_ref {
                     let value = store.get_secret_value(reference).await?.ok_or_else(|| {
                         ApiError::conflict(format!(
@@ -1070,6 +1109,7 @@ async fn resolve_model(
         .get_provider_by_name(org_id, &name)
         .await?
         .ok_or_else(|| ApiError::conflict(format!("provider '{name}' does not exist")))?;
+    require_principal_can_use(access, &provider)?;
     let kind = ProviderKind::parse(&provider.kind)
         .ok_or_else(|| ApiError::internal("provider has an unknown kind"))?;
     if kind != ProviderKind::OpenAiCompatible {

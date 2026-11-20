@@ -18,6 +18,10 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ### Security
 
+- Binding `model.provider` now requires **use** on that provider in both `platform` and
+  `harness` management modes (agent create, update, import and every execute preflight,
+  incl. team subagents). The worker context also re-checks the run principal (requester,
+  else agent owner) and refuses to return a provider credential it cannot use (#193).
 - Creating a trigger now requires **use** on the target agent and use of every connection
   and provider its current spec references, closing an IDOR that let an Operator attach a
   trigger to a private agent (#135).
