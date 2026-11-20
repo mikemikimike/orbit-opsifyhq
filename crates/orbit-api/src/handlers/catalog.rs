@@ -844,6 +844,27 @@ async fn probe_connection(
             }
             (url.to_string(), client.head(url))
         }
+        "kubernetes" => {
+            let config = match orbit_kubernetes::KubernetesClientConfig::from_connection(
+                config,
+                credential.map(str::to_string),
+            ) {
+                Ok(config) => config,
+                Err(error) => return (false, None, error),
+            };
+            return match config.test_connection().await {
+                Ok(result) => (
+                    true,
+                    Some(200),
+                    result
+                        .get("message")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("Kubernetes reachable")
+                        .to_string(),
+                ),
+                Err(error) => (false, None, error),
+            };
+        }
         other => {
             return (
                 false,

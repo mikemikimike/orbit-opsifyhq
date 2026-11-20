@@ -14,6 +14,7 @@ orbit-store.workspace = true
 orbit-security.workspace = true
 orbit-events.workspace = true
 orbit-harness.workspace = true
+orbit-kubernetes.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true

@@ -11,6 +11,7 @@ pub struct KubernetesClientConfig {
     api_server: String,
     token: Option<String>,
     ca_pem: Option<Vec<u8>>,
+    identity_pem: Option<Vec<u8>>,
     namespaces: Vec<String>,
     default_namespace: Option<String>,
     allowed_resources: Vec<String>,
@@ -31,6 +32,7 @@ impl KubernetesClientConfig {
             .trim_end_matches('/')
             .to_string();
         let mut token = None;
+        let mut identity_pem = None;
         let mut ca_pem = config
             .get("caCert")
             .and_then(Value::as_str)
@@ -106,11 +108,18 @@ impl KubernetesClientConfig {
                         user.get("client-certificate-data").and_then(Value::as_str),
                         user.get("client-key-data").and_then(Value::as_str),
                     ) {
-                        let _ = (cert, key);
-                        return Err(
-                            "kubeconfig client-certificate authentication is not supported yet; use a token"
-                                .into(),
-                        );
+                        let cert = base64::engine::general_purpose::STANDARD
+                            .decode(cert)
+                            .map_err(|error| format!("invalid client-certificate-data: {error}"))?;
+                        let key = base64::engine::general_purpose::STANDARD
+                            .decode(key)
+                            .map_err(|error| format!("invalid client-key-data: {error}"))?;
+                        let mut pem = cert;
+                        if !pem.ends_with(b"\n") {
+                            pem.push(b'\n');
+                        }
+                        pem.extend(key);
+                        identity_pem = Some(pem);
                     } else {
                         return Err("kubeconfig user has no static token".into());
                     }
@@ -138,6 +147,7 @@ impl KubernetesClientConfig {
             api_server,
             token,
             ca_pem,
+            identity_pem,
             namespaces,
             default_namespace: config
                 .get("defaultNamespace")
@@ -179,6 +189,11 @@ impl KubernetesClientConfig {
                 .map_err(|error| format!("invalid caCert: {error}"))?;
             builder = builder.add_root_certificate(certificate);
         }
+        if let Some(pem) = &self.identity_pem {
+            let identity = reqwest::Identity::from_pem(pem)
+                .map_err(|error| format!("invalid client certificate/key: {error}"))?;
+            builder = builder.identity(identity);
+        }
         builder.build().map_err(|error| error.to_string())
     }
 
@@ -191,6 +206,37 @@ impl KubernetesClientConfig {
             request = request.query(query);
         }
         request.send().await.map_err(|error| error.to_string())
+    }
+
+    /// Parse and connect, then list the namespaces visible to this credential. Used by the
+    /// connection Test button; RBAC errors surface as a readable message.
+    pub async fn test_connection(&self) -> Result<Value, String> {
+        let data = self.invoke("namespaces.list", &json!({})).await?;
+        let names: Vec<&str> = data
+            .get("items")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.pointer("/metadata/name").and_then(Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let shown = names
+            .iter()
+            .take(10)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(json!({
+            "namespaces": names,
+            "count": names.len(),
+            "message": if shown.is_empty() {
+                "Kubernetes reachable; no namespaces visible".to_string()
+            } else {
+                format!("Kubernetes reachable; {} namespace(s): {shown}", names.len())
+            },
+        }))
     }
 
     pub async fn invoke(&self, capability: &str, args: &Value) -> Result<Value, String> {
@@ -402,6 +448,38 @@ users:
             Some(insecure)
         )
         .is_err());
+    }
+
+    #[test]
+    fn kubeconfig_accepts_client_certificate_data() {
+        use base64::Engine;
+        let b64 = |value: &[u8]| base64::engine::general_purpose::STANDARD.encode(value);
+        // The parser only validates the PEM structure when building the HTTP client, so a
+        // dummy cert/key is enough to prove the auth mode is accepted.
+        let kubeconfig = format!(
+            r#"
+current-context: c
+contexts:
+  - name: c
+    context: {{ cluster: k, user: u }}
+clusters:
+  - name: k
+    cluster: {{ server: https://cluster }}
+users:
+  - name: u
+    user:
+      client-certificate-data: {}
+      client-key-data: {}
+"#,
+            b64(b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+            b64(b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"),
+        );
+        let parsed = KubernetesClientConfig::from_connection(
+            &json!({ "authMode": "kubeconfig" }),
+            Some(kubeconfig),
+        )
+        .expect("client-cert kubeconfig is accepted");
+        assert!(parsed.identity_pem.is_some());
     }
 
     #[test]
