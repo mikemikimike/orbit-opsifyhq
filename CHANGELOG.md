@@ -8,13 +8,50 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ## [Unreleased]
 
-### Tests
+### Added
 
-- Restored 41 regression tests that were dropped while integrating PRs #145-#183: team run
-  and queue transitions (#113), output delivery (#112), worker scoping (#139), embedded docs
-  (#44), execution preflight (#140), error envelope (#123), SQL list visibility (#122),
-  runtime continue-after-failure (#150), credential exposure (#142), org-scoped secret
-  resolution (#144) and launcher pod naming (#106) (#191).
+- Provider quick-start presets for OpenRouter, DeepSeek, Google Gemini and Azure OpenAI,
+  plus native Anthropic provider support (Messages protocol for OpenCode/Pi and model
+  discovery) (#232).
+- Bulk **Access control** for agents and skills: multi-select, filtered Select all, one
+  dialog for visibility/owning team, and a server-side bulk sharing endpoint with
+  per-resource failures (#238).
+- Kubernetes connector Test connection, shared client and client-certificate kubeconfig
+  auth, with live kind tests for namespaces, pods, events and logs (#45).
+- Embedded docs now follow the app navigation and render tables correctly (#234).
+
+### Changed
+
+- Agent Team screens follow the rest of the app: list, team page, Team Studio, run page,
+  queue and run dialog (#241).
+- Skill picker has Select all / Select none; resource forms flush access edits before the
+  resource save, and Sharing is labelled Access control (RBAC) (#236, #237).
+- Worker profiles show team-scoped claims and explain that profile visibility is not claim
+  scope (#245).
+
+### Fixed
+
+- OIDC logins can no longer bind an email to a user already linked to another identity
+  (#192), and saving sign-in settings preserves mappings and surfaces failures (#197,
+  #230).
+- Team-run autoApprove is capped at the agent's own autonomy, so Observe/Recommend agents
+  cannot be raised to level 4 (#194, #227).
+- Harness-managed models now require use of the provider, closing a cross-team credential
+  path (#193, #226).
+- Approval waits are counted in Job/container deadlines, so runs waiting for a human are
+  not killed (#196, #229).
+- Native OpenCode `task`/`subagent` dispatch is an internal action; subagents start at
+  lower autonomy while their own tool calls remain individually policy-checked (#246).
+- Stale worker heartbeat rows are pruned after 24 hours, and production/example values no
+  longer pin stale image tags (#198, #239).
+- Environment mappings now have ownership/visibility, filtered lists and manage/use checks
+  (#240).
+- Restored 41 regression tests lost while integrating the earlier PR backlog (#191, #224).
+
+### Security
+
+- Worker-side git ignores repository hooks, filters, textconv and global/system config and
+  runs with a cleared allowlisted environment (#195, #228).
 
 ## [0.23.0] - 2026-11-20
 
@@ -27,8 +64,6 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ### Fixed
 
-- Production example values no longer pin `0.7.0` image tags (they follow `Chart.appVersion`); docs use `<version>` placeholders, and `scripts/check-versions.sh` now fails when a shipped values file pins an image tag that differs from `appVersion` (#198).
-
 - Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval
   mode when no tool-policy rule matches. L4/Auto no longer asks for every call; L3/Auto
   still requires approval and L1/L2 still deny writes. Explicit rules can only tighten
@@ -36,10 +71,6 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ### Security
 
-- Worker-side git (clone, stage, commit, push) now runs with a cleared, allowlisted
-  environment, no system/global config, hooks/fsmonitor/ssh command disabled and
-  `--no-verify`, and refuses repositories whose config defines filter, textconv or other
-  program-executing entries, so agent-planted hooks cannot run with worker secrets (#195).
 - Creating a trigger now requires **use** on the target agent and use of every connection
   and provider its current spec references, closing an IDOR that let an Operator attach a
   trigger to a private agent (#135).
