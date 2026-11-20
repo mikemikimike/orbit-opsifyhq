@@ -10,6 +10,14 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ### Fixed
 
+- **OIDC login no longer signs a new identity in as an existing user bound to another
+  subject** (issue #192): `upsert_oidc_user` refuses with `403` when the email belongs to a
+  user already linked to a different `(issuer, subject)`; invited users (no subject) are
+  still linked on first login. A token with `email_verified: false` never links by email,
+  and the new `requireVerifiedEmail` setting (`ORBIT_OIDC_REQUIRE_VERIFIED_EMAIL`, default
+  `false`) also blocks linking when the claim is absent. A concurrent first login for the
+  same identity now resolves to the same user instead of a 500.
+
 - Native harness tools (bash/edit/write/read) now follow the agent's autonomy and approval
   mode when no tool-policy rule matches. L4/Auto no longer asks for every call; L3/Auto
   still requires approval and L1/L2 still deny writes. Explicit rules can only tighten

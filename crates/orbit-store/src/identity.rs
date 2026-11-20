@@ -6,6 +6,11 @@ use orbit_domain::{new_id, OrganizationMode, UserRole};
 use crate::models::{ApiTokenRecord, ApiTokenView, Organization, User};
 use crate::{Store, StoreError, StoreResult};
 
+/// Refusal messages for OIDC email linking (surfaced to the user as a 403).
+pub const EMAIL_LINKED_ELSEWHERE: &str = "this email is already linked to another sign-in identity";
+pub const EMAIL_NOT_VERIFIED: &str =
+    "this email is not verified by the identity provider, so it cannot be linked to an existing user";
+
 impl Store {
     // ---------------------------------------------------------------- organizations
 
@@ -142,6 +147,12 @@ impl Store {
     }
 
     /// Provision or update an OIDC user in the default organization.
+    ///
+    /// An unknown `(issuer, subject)` is linked to an existing user with the same email only
+    /// when that user has no OIDC identity yet (e.g. invited by an admin) and
+    /// `link_by_email` is true. A user already bound to another identity, or a link that the
+    /// caller disallowed (unverified email), yields [`StoreError::Conflict`]; nothing changes.
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_oidc_user(
         &self,
         org_id: Uuid,
@@ -150,12 +161,10 @@ impl Store {
         email: Option<&str>,
         name: Option<&str>,
         default_role: UserRole,
+        link_by_email: bool,
     ) -> StoreResult<User> {
         if let Some(user) = self.get_user_by_oidc(issuer, subject).await? {
-            if user.status != "active" {
-                return Err(StoreError::Invalid("user is disabled".into()));
-            }
-            return Ok(user);
+            return Self::active_oidc_user(user);
         }
         let email = email
             .filter(|e| !e.trim().is_empty())
@@ -165,6 +174,12 @@ impl Store {
 
         // If a matching email already exists (e.g. invited by an admin), link the identity.
         if let Some(existing) = self.get_user_by_email(org_id, &email).await? {
+            if existing.oidc_subject.is_some() {
+                return Err(StoreError::Conflict(EMAIL_LINKED_ELSEWHERE.into()));
+            }
+            if !link_by_email {
+                return Err(StoreError::Conflict(EMAIL_NOT_VERIFIED.into()));
+            }
             let linked = sqlx::query_as::<_, User>(
                 r#"
                 UPDATE users SET oidc_issuer = $3, oidc_subject = $4, updated_at = now()
@@ -178,13 +193,17 @@ impl Store {
             .bind(subject)
             .fetch_optional(&self.pool)
             .await?;
-            if let Some(user) = linked {
-                return Ok(user);
-            }
-            return Ok(existing);
+            // No row: another login bound this user between our read and the update.
+            return match linked {
+                Some(user) => Ok(user),
+                None => match self.get_user_by_oidc(issuer, subject).await? {
+                    Some(user) => Self::active_oidc_user(user),
+                    None => Err(StoreError::Conflict(EMAIL_LINKED_ELSEWHERE.into())),
+                },
+            };
         }
 
-        let user = sqlx::query_as::<_, User>(
+        let inserted = sqlx::query_as::<_, User>(
             r#"
             INSERT INTO users (id, org_id, email, display_name, role, oidc_issuer, oidc_subject)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -199,7 +218,26 @@ impl Store {
         .bind(issuer)
         .bind(subject)
         .fetch_one(&self.pool)
-        .await?;
+        .await
+        .map_err(StoreError::from);
+        match inserted {
+            Ok(user) => Ok(user),
+            // A concurrent first login for the same identity won the race: use its row.
+            Err(err) if err.is_unique_violation() => {
+                match self.get_user_by_oidc(issuer, subject).await? {
+                    Some(user) => Self::active_oidc_user(user),
+                    // The collision was on the email (another identity or invite created it).
+                    None => Err(StoreError::Conflict(EMAIL_LINKED_ELSEWHERE.into())),
+                }
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn active_oidc_user(user: User) -> StoreResult<User> {
+        if user.status != "active" {
+            return Err(StoreError::Invalid("user is disabled".into()));
+        }
         Ok(user)
     }
 

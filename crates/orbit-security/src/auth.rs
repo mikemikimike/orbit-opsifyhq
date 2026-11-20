@@ -84,6 +84,10 @@ pub struct OidcConfig {
     /// Re-evaluate the stored role on login, only when a group mapping matches. Without this,
     /// the mapped role is only used at auto-provisioning.
     pub sync_roles: bool,
+    /// Only link an incoming identity to an existing (e.g. invited) user by email when the
+    /// token carries `email_verified: true`. A missing claim then also blocks linking.
+    /// An explicit `email_verified: false` always blocks linking, regardless of this flag.
+    pub require_verified_email: bool,
     pub clock_skew_seconds: u64,
 }
 
@@ -162,6 +166,7 @@ impl AuthConfig {
                     auto_create_teams: env_bool("ORBIT_OIDC_AUTO_CREATE_TEAMS", false),
                     require_mapped_group: env_bool("ORBIT_OIDC_REQUIRE_MAPPED_GROUP", false),
                     sync_roles: env_bool("ORBIT_OIDC_SYNC_ROLES", false),
+                    require_verified_email: env_bool("ORBIT_OIDC_REQUIRE_VERIFIED_EMAIL", false),
                     clock_skew_seconds: env_or("ORBIT_OIDC_CLOCK_SKEW_SECONDS", "60")
                         .parse()
                         .unwrap_or(60),
@@ -330,6 +335,9 @@ pub struct OidcIdentity {
     pub email: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// The `email_verified` claim when the token carries one (`None` when absent).
+    #[serde(default)]
+    pub email_verified: Option<bool>,
     /// Values of the configured role claim (groups/roles).
     #[serde(default)]
     pub groups: Vec<String>,
@@ -345,8 +353,24 @@ struct RawClaims {
     name: Option<String>,
     #[serde(default)]
     preferred_username: Option<String>,
+    #[serde(default)]
+    email_verified: Option<serde_json::Value>,
     #[serde(flatten)]
     extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// Parse `email_verified`. Some IdPs send the string `"true"`/`"false"`; anything else
+/// (absent, null, unrecognised) counts as not asserted.
+fn parse_email_verified(value: Option<&serde_json::Value>) -> Option<bool> {
+    match value? {
+        serde_json::Value::Bool(flag) => Some(*flag),
+        serde_json::Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 enum KeySource {
@@ -437,6 +461,7 @@ impl JwtValidator {
             issuer: claims.iss,
             email,
             name: claims.name.or(claims.preferred_username),
+            email_verified: parse_email_verified(claims.email_verified.as_ref()),
             groups,
         })
     }
@@ -633,6 +658,18 @@ mod tests {
         assert!(token.starts_with("orbit_sk_"));
         assert_eq!(hash, hash_api_token(&token));
         assert_ne!(hash, hash_api_token("other"));
+    }
+
+    #[test]
+    fn parses_email_verified_claim() {
+        use serde_json::json;
+        assert_eq!(parse_email_verified(None), None);
+        assert_eq!(parse_email_verified(Some(&json!(true))), Some(true));
+        assert_eq!(parse_email_verified(Some(&json!(false))), Some(false));
+        assert_eq!(parse_email_verified(Some(&json!("False"))), Some(false));
+        assert_eq!(parse_email_verified(Some(&json!("true"))), Some(true));
+        assert_eq!(parse_email_verified(Some(&json!("maybe"))), None);
+        assert_eq!(parse_email_verified(Some(&json!(null))), None);
     }
 
     #[test]

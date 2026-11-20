@@ -218,6 +218,10 @@ auth:
     # Re-evaluate the stored role on every login when the claim maps to a role.
     # A token without the claim never downgrades an existing user.
     syncRoles: false
+    # Link a first login to an existing (invited) user by email only when the token has
+    # email_verified=true; a missing claim then also blocks linking. email_verified=false
+    # always blocks linking.
+    requireVerifiedEmail: false
 
 # ─── Secrets ─────────────────────────────────────────────────
 # For production set secrets.create=false and secrets.existingSecret to a Secret you
