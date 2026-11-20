@@ -369,7 +369,6 @@ export function AgentForm({
       ? []
       : parsed.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message }));
     if (JSON.stringify(next) !== JSON.stringify(issues)) setIssues(next);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [definition]);
 
   async function handleSubmit() {

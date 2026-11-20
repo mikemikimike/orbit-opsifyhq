@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Optional worker launcher: Docker socket or namespaced Kubernetes workload RBAC.
-FROM rust:1-bookworm AS builder
+FROM rust:1.100-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates

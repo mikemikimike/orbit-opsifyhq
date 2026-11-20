@@ -8,8 +8,7 @@
   },
   "scripts": {
     "dev": "pnpm --filter @orbit/web dev",
-    "build": "pnpm --filter @orbit/api-client build && pnpm --filter @orbit/contracts build && pnpm --filter @orbit/web build",
-    "lint": "pnpm -r lint",
+    "build": "pnpm --filter @orbit/web build",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "api:generate": "node scripts/generate-api-client.mjs"
