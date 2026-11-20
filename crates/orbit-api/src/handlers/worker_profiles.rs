@@ -772,11 +772,7 @@ pub async fn bootstrap(
         ));
     }
     let issued = issue_profile_token(&state, auth.org_id, &profile, true).await?;
-    let name = format!(
-        "orbit-worker-{}-{}",
-        profile.harness_kind.replace('_', "-"),
-        &profile.id.to_string()[..8]
-    );
+    let name = profile_workload_name(&profile.harness_kind, profile.id);
     let image_tag = if profile.image_tag.trim().is_empty() {
         crate::images::image_tag()
     } else {
@@ -945,5 +941,55 @@ impl HarnessKindExt for HarnessKind {
         value
             .parse()
             .map_err(|_| ApiError::bad_request(format!("unknown harness kind '{value}'")))
+    }
+}
+
+/// Deployment/service name for a profile bootstrap: `orbit-worker-<harness>-<profile id>`.
+/// Uses the full UUID (no hyphens) because the first 8 hex chars of a UUIDv7 are shared by
+/// profiles created within ~65 s (issue #106). The harness part is sanitised and truncated
+/// so the whole name stays a DNS-1123 label of at most 63 chars.
+pub(crate) fn profile_workload_name(harness_kind: &str, profile_id: uuid::Uuid) -> String {
+    let harness: String = harness_kind
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .take(16)
+        .collect();
+    let harness = harness.trim_matches('-');
+    format!("orbit-worker-{harness}-{}", profile_id.simple())
+}
+
+#[cfg(test)]
+mod workload_name_tests {
+    use super::profile_workload_name;
+
+    #[test]
+    fn same_harness_profiles_get_distinct_names() {
+        let a = uuid::Uuid::now_v7();
+        let b = uuid::Uuid::now_v7();
+        assert_ne!(
+            profile_workload_name("opencode", a),
+            profile_workload_name("opencode", b)
+        );
+    }
+
+    #[test]
+    fn names_are_dns_safe_for_longest_harness() {
+        let long = "x".repeat(80);
+        for kind in [
+            "claude_code",
+            "opencode",
+            "pi",
+            "generic",
+            "mock",
+            long.as_str(),
+        ] {
+            let name = profile_workload_name(kind, uuid::Uuid::now_v7());
+            assert!(name.len() <= 63, "{name}");
+            assert!(name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'));
+            assert!(name.starts_with("orbit-worker-"));
+        }
     }
 }
