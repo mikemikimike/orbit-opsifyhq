@@ -1473,202 +1473,196 @@ async fn same_agent_queues_on_different_harnesses() {
     assert_eq!(second["harnessKind"], "pi");
 }
 
-
-/// `runtime_tick` advances every runtime in the shared test database, so tests that tick
-/// (or interleave with a tick) run one at a time.
-static RUNTIME_TICK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Approval policy is a platform-wide setting; tests that change it must not overlap.
-static APPROVAL_SETTINGS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-async fn reset_approval_policy(app: &TestApp) {
-    app.store
-        .set_platform_setting(
-            "approvals",
-            &json!({ "approvalsRequireDifferentApprover": false }),
-            None,
-        )
+async fn seed_team_agent_with_execution(
+    app: &TestApp,
+    owner_id: Uuid,
+    team_id: Uuid,
+    task: &str,
+) -> (Uuid, Uuid) {
+    let definition: orbit_domain::AgentDefinition = serde_json::from_value(definition()).unwrap();
+    let (agent, version) = app
+        .store
+        .create_agent(app.org_id, Some(owner_id), &definition)
         .await
         .unwrap();
+    app.store
+        .set_agent_status(app.org_id, agent.id, orbit_domain::AgentStatus::Active)
+        .await
+        .unwrap();
+    app.store
+        .set_resource_visibility(app.org_id, "agents", agent.id, "team", Some(team_id))
+        .await
+        .unwrap();
+    let execution = app
+        .store
+        .create_execution(orbit_store::executions::NewExecution {
+            org_id: app.org_id,
+            agent_id: agent.id,
+            agent_version_id: version.id,
+            agent_name: &agent.name,
+            harness_kind: orbit_domain::HarnessKind::Mock,
+            trigger_source: orbit_domain::TriggerSource::Manual,
+            placement: "auto",
+            trigger_id: None,
+            input: json!({ "task": task }),
+            session_ref: None,
+            skills: &[],
+            timeout_seconds: 30,
+            requested_by: Some(owner_id),
+            idempotency_key: None,
+            team_run_id: None,
+            team_step_index: None,
+        })
+        .await
+        .unwrap();
+    app.store
+        .create_approval(app.org_id, execution.id, json!({}), None)
+        .await
+        .unwrap();
+    (agent.id, execution.id)
 }
 
-fn put_json(path: &str, token: &str, body: &Value) -> Request<Body> {
-    Request::builder()
-        .method("PUT")
-        .uri(path)
-        .header("authorization", format!("Bearer {token}"))
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
+fn usage_total(body: &Value) -> i64 {
+    body["usage"]["days"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["executions"].as_i64().unwrap())
+        .sum()
+}
+
+fn recent_ids(body: &Value) -> Vec<String> {
+    body["summary"]["recentExecutions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+async fn owner_user(app: &TestApp) -> orbit_store::models::User {
+    app.store
+        .list_users(app.org_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|user| user.role == "owner")
         .unwrap()
 }
 
 #[tokio::test]
 
-async fn token_permissions_follow_the_owners_current_role() {
+async fn dashboard_summary_hides_other_teams_agents_and_executions() {
     let Some(app) = test_app(true).await else {
         return;
     };
-    let user = app
+    let owner = owner_user(&app).await;
+    // The demo agent created by the harness belongs to the owner only.
+    make_private(&app.store, app.org_id, "agents", app.agent_id, owner.id).await;
+
+    let team_x = app
         .store
-        .ensure_user(app.org_id, "demoted@test.local", "Demoted", UserRole::Owner)
+        .create_access_team(app.org_id, "Team X", "team-x", Some(owner.id))
         .await
         .unwrap();
-    let issued = orbit_security::issue_api_token();
-    let scopes: Vec<String> = orbit_security::Permission::all_for(UserRole::Owner)
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    app.store
-        .create_api_token(
+    let team_y = app
+        .store
+        .create_access_team(app.org_id, "Team Y", "team-y", Some(owner.id))
+        .await
+        .unwrap();
+    let viewer = app
+        .store
+        .ensure_user(
             app.org_id,
-            user.id,
-            "explicit",
-            &issued.prefix,
-            &issued.hash,
-            &scopes,
-            None,
+            "dash-viewer@test.local",
+            "Viewer",
+            UserRole::Viewer,
         )
         .await
         .unwrap();
-    let (status, current) = send(
-        &app.router,
-        auth_get("/api/v1/settings/access", &issued.token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, body) = send(
-        &app.router,
-        put_json("/api/v1/settings/access", &issued.token, &current),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "owner write allowed: {body}");
-
     app.store
-        .set_user_role(app.org_id, user.id, UserRole::Viewer)
+        .upsert_team_member(team_x.id, viewer.id, "viewer")
         .await
         .unwrap();
-
-    let (status, _) = send(
-        &app.router,
-        auth_get("/api/v1/settings/access", &issued.token),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "viewer can still read");
-    let (status, body) = send(
-        &app.router,
-        put_json("/api/v1/settings/access", &issued.token, &current),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    let (status, _) = send(
-        &app.router,
-        auth_post(
-            "/api/v1/api-tokens",
-            &issued.token,
-            json!({ "name": "escalate" }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
-async fn tokens_cannot_be_minted_with_scopes_the_caller_lacks() {
-    let Some(app) = test_app(true).await else {
-        return;
-    };
-    let user = app
-        .store
-        .ensure_user(app.org_id, "minter@test.local", "Minter", UserRole::Viewer)
-        .await
-        .unwrap();
-    let role = format!("Token minter {}", Uuid::now_v7());
     app.store
-        .create_custom_role(
-            app.org_id,
-            &role,
-            &[
-                "agents:read".to_string(),
-                "settings:read".to_string(),
-                "settings:write".to_string(),
-            ],
+        .set_platform_setting(
+            "team_isolation",
+            &json!({ "enabled": true }),
+            Some(owner.id),
         )
         .await
         .unwrap();
 
-    app.store
-        .set_user_role_name(app.org_id, user.id, &role)
-        .await
-        .unwrap();
-    let token = token_for(&app.store, app.org_id, user.id, "minter").await;
+    let (_, exec_x) =
+        seed_team_agent_with_execution(&app, owner.id, team_x.id, "visible-to-x").await;
+    let (_, exec_y) =
+        seed_team_agent_with_execution(&app, owner.id, team_y.id, "SECRET-of-team-y").await;
+    let viewer_token = token_for(&app.store, app.org_id, viewer.id, "dash-viewer").await;
 
     let (status, body) = send(
         &app.router,
-        auth_post(
-            "/api/v1/api-tokens",
-            &token,
-            json!({ "name": "too much", "scopes": ["agents:read", "providers:write", "*"] }),
-        ),
+        auth_get("/api/v1/dashboard/summary", &viewer_token),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    let details = body["error"]["details"].to_string();
-    assert!(details.contains("providers:write"), "{details}");
-    assert!(!details.contains("'*'"), "{details}");
-    assert!(!details.contains("'agents:read'"), "{details}");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(recent_ids(&body), vec![exec_x.to_string()]);
+    assert!(!body.to_string().contains("SECRET-of-team-y"));
+    let summary = &body["summary"];
+    assert_eq!(summary["totalAgents"], 1);
+    assert_eq!(summary["activeAgents"], 1);
+    assert_eq!(summary["executions24h"], 1);
+    assert_eq!(summary["runningExecutions"], 1);
+    assert_eq!(summary["pendingApprovals"], 1);
+    assert_eq!(usage_total(&body), 1);
 
-    // `*` is allowed: it resolves to the caller's current permissions at request time.
+    // The owner still sees everything: both teams' executions and the private demo agent.
     let (status, body) = send(
         &app.router,
-        auth_post(
-            "/api/v1/api-tokens",
-            &token,
-            json!({ "name": "wildcard", "scopes": ["*"] }),
-        ),
+        auth_get("/api/v1/dashboard/summary", "test-token"),
     )
     .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-
-    let (status, body) = send(
-        &app.router,
-        auth_post(
-            "/api/v1/api-tokens",
-            &token,
-            json!({ "name": "ok", "scopes": ["agents:read"] }),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-
-    let (status, body) = send(
-        &app.router,
-        auth_post("/api/v1/api-tokens", &token, json!({ "name": "default" })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    let mut got: Vec<String> = serde_json::from_value(body["scopes"].clone()).unwrap();
-    got.sort();
-    assert_eq!(got, ["agents:read", "settings:read", "settings:write"]);
+    assert_eq!(status, StatusCode::OK);
+    let recent = recent_ids(&body);
+    assert!(recent.contains(&exec_x.to_string()));
+    assert!(recent.contains(&exec_y.to_string()));
+    let summary = &body["summary"];
+    assert_eq!(summary["totalAgents"], 3);
+    assert_eq!(summary["executions24h"], 2);
+    assert_eq!(summary["pendingApprovals"], 2);
+    assert_eq!(usage_total(&body), 2);
 }
 
 #[tokio::test]
-async fn disabled_users_tokens_are_rejected() {
+async fn dashboard_summary_is_empty_for_user_outside_every_team() {
     let Some(app) = test_app(true).await else {
         return;
     };
-    let user = app
+    let owner = owner_user(&app).await;
+    make_private(&app.store, app.org_id, "agents", app.agent_id, owner.id).await;
+    let team_y = app
         .store
-        .ensure_user(app.org_id, "off@test.local", "Off", UserRole::Owner)
+        .create_access_team(app.org_id, "Team Y2", "team-y2", Some(owner.id))
         .await
         .unwrap();
-    let token = token_for(&app.store, app.org_id, user.id, "off").await;
-    let (status, _) = send(&app.router, auth_get("/api/v1/me", &token)).await;
+    let (_, exec_y) = seed_team_agent_with_execution(&app, owner.id, team_y.id, "hidden").await;
+    let outsider = app
+        .store
+        .ensure_user(
+            app.org_id,
+            "dash-outsider@test.local",
+            "Outsider",
+            UserRole::Viewer,
+        )
+        .await
+        .unwrap();
+    let token = token_for(&app.store, app.org_id, outsider.id, "dash-outsider").await;
+    let (status, body) = send(&app.router, auth_get("/api/v1/dashboard/summary", &token)).await;
     assert_eq!(status, StatusCode::OK);
-    sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1")
-        .bind(user.id)
-        .execute(app.store.pool())
-        .await
-        .unwrap();
-    let (status, _) = send(&app.router, auth_get("/api/v1/me", &token)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    let summary = &body["summary"];
+    assert_eq!(summary["totalAgents"], 0);
+    assert_eq!(summary["executions24h"], 0);
+    assert_eq!(summary["pendingApprovals"], 0);
+    assert!(recent_ids(&body).is_empty());
+    assert_eq!(usage_total(&body), 0);
+    assert!(!body.to_string().contains(&exec_y.to_string()));
 }

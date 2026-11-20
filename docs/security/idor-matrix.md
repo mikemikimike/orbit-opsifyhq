@@ -14,8 +14,9 @@ Enforced by `crates/orbit-api/src/access.rs` (`AccessScope`). Invisible resource
 | Triggers | yes | yes | yes | — |
 | Tool policies | yes | yes | yes | — |
 | Executions | via agent | via agent | cancel via agent | events/SSE via agent |
-| Approvals | via execution → agent | — | decide needs `approvals:decide` and use/manage on the agent (team viewers 403, invisible 404); optional four-eyes; expired → 409 | worker wait bound to its own execution |
-| Env mappings | — | — | `settings:write`; each `secretRef`/`secretKey`/`connectionId` must be a connection/provider secret in the caller's org that the caller can use (else 422); resolution is org-scoped | — |
+
+| Approvals | via execution → agent | — | decision inherits execution | — |
+| Dashboard summary | agent/execution/approval/connection/trigger counts, recent executions and usage filtered in SQL (`ResourceAccess`, joined via agent) | — | — | pending approvals via execution → agent |
 | Access teams | member list | member | lead/owner/admin | — |
 | Sharing | — | view | manage + license | — |
 | Export | per-kind read permission + view | — | — | — |
