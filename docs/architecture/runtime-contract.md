@@ -176,14 +176,15 @@ harness tool call ──► worker broker /policy or /tools/call
   agent. Agents inherit org rules; agent rules are added, not replaced.
 - `evaluate_tool_call` (`crates/orbit-domain/src/tool_policy.rs`) combines the platform
   decision with matching rules. Platform denial always wins; rules can only make the
-  decision stricter, except that an explicit `allow` rule may resolve the stricter
-  **default** used for native tools.
+  decision stricter. With no matching rule the platform decision is also the default.
 - Matchers are AND-combined: tool glob, capability glob, effect, connection, path glob
   (lexically normalized, component-suffix aware) and command regex. Empty matchers match
   every call and are useful for a default `require_approval`.
 - Precedence: platform `deny` → rule `deny` → `require_approval` → `allow`.
-- Native tools default to `require_approval` when no rule matches. Brokered connector
-  tools keep their platform decision as both floor and default.
+- Native and brokered connector tools both use their platform decision as floor and
+  default. At L4/Auto an allowlisted native tool therefore runs without approval; at
+  L3/Auto writes wait for approval; L1/L2 deny writes. Add an explicit
+  `require_approval` rule to make a specific native tool ask again.
 - The worker receives the effective rules in `WorkerExecutionContext.tool_policies` and
   starts the broker when rules exist even if the agent has no connector binding.
 - `POST /policy` on the loopback broker (bearer: execution-scoped broker token) is the

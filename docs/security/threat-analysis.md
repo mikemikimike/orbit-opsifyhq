@@ -138,8 +138,10 @@ echo done
 - Argument matchers normalize paths and parse shell commands. Paths are lexically
   normalized before matching so `../` cannot bypass a `secrets/**` rule; command rules
   use regexes validated at write time.
-- Native tools with no matching rule default to `require_approval`, not allow. Approval
-  decisions are bound to the execution, expire with it, and default-deny on timeout.
+- Native tools with no matching rule follow the platform autonomy/approval decision:
+  L1/L2 deny writes, L3 requires approval and L4/Auto allows allowlisted actions. A
+  matching `deny`/`require_approval` rule can always tighten that. Approval decisions
+  are bound to the execution, expire with it, and default-deny on timeout.
 - Rule management requires `settings:write` (owner) and is audited.
 
 ### 9. Cross-team object access (IDOR)

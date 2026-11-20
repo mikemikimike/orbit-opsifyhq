@@ -945,8 +945,9 @@ fn verify_presented_hash(presented: Option<&str>, expected: &str) -> Result<(), 
 
 /// Build the platform-derived call and evaluate it: autonomy and approval mode through
 /// `evaluate_capability` (so level changes apply automatically), then tool-policy rules.
-/// Native tools default to `require_approval`; an explicit `allow` rule may resolve that
-/// but can never weaken the autonomy/approval-mode floor.
+/// The platform decision is also the default when no rule matches, so an autonomous
+/// (L4/Auto) agent can use its native tools without a blanket allow rule. Rules can only
+/// tighten that decision (deny / require approval), never weaken it.
 fn evaluate_native_call(
     autonomy: AutonomyLevel,
     approval_mode: ApprovalMode,
@@ -970,14 +971,14 @@ fn evaluate_native_call(
         arguments: request.arguments.clone(),
         cwd: Some(workspace.to_string_lossy().into_owned()),
     };
-    let outcome = evaluate_tool_call(platform, PolicyDecision::RequireApproval, rules, &call);
+    let outcome = evaluate_tool_call(platform, platform, rules, &call);
     (call, outcome)
 }
 
 /// Policy decision for native harness tools (Claude Code `PreToolUse`, OpenCode hooks).
-/// Effects are derived server-side; native tools default to `require_approval` and only
-/// explicit `allow` rules can make them run unattended. Autonomy, approval mode and
-/// platform denial always win.
+/// Effects are derived server-side. With no matching rule the platform autonomy decision
+/// applies, so reads run at every level and writes/side effects follow the autonomy level
+/// and approval mode. Rules can only make the decision stricter.
 async fn policy_check(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
@@ -1553,10 +1554,22 @@ mod tests {
             decide(4, ApprovalMode::Writes, &allow_all(), &bash),
             PolicyDecision::RequireApproval
         );
-        // Without rules native tools still default to approval.
+        // Without rules, the platform autonomy decision applies.
         assert_eq!(
             decide(4, ApprovalMode::Auto, &[], &read),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            decide(4, ApprovalMode::Auto, &[], &bash),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            decide(3, ApprovalMode::Auto, &[], &bash),
             PolicyDecision::RequireApproval
+        );
+        assert_eq!(
+            decide(1, ApprovalMode::Auto, &[], &bash),
+            PolicyDecision::Deny
         );
     }
 
