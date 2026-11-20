@@ -260,6 +260,21 @@ impl Store {
         Ok(rows)
     }
 
+    /// Remove heartbeat rows that have been stale for longer than `retention_hours`.
+    ///
+    /// Workers that are SIGKILLed, evicted or lose their node never get to call the
+    /// graceful `offline` endpoint. Keeping those rows forever makes the Workers page
+    /// accumulate ghost workers, so the control plane prunes them after a bounded window.
+    pub async fn delete_stale_worker_heartbeats(&self, retention_hours: i64) -> StoreResult<u64> {
+        let result = sqlx::query(
+            "DELETE FROM worker_heartbeats WHERE last_heartbeat_at < now() - make_interval(hours => $1::int)",
+        )
+        .bind(retention_hours)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn list_worker_heartbeats(&self, org_id: Uuid) -> StoreResult<Vec<WorkerHeartbeat>> {
         Ok(sqlx::query_as::<_, WorkerHeartbeat>(
             "SELECT * FROM worker_heartbeats WHERE org_id = $1 ORDER BY last_heartbeat_at DESC",

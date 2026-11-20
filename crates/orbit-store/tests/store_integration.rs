@@ -2399,3 +2399,39 @@ async fn agent_version_sync_keeps_api_triggers_and_stable_ids() {
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].id, api_trigger.id);
 }
+
+#[tokio::test]
+async fn stale_worker_heartbeats_are_pruned_after_retention() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let (org, _) = seed_org(&store).await;
+    let worker_id = format!("stale-retention-{}", uuid::Uuid::now_v7());
+    store
+        .upsert_worker_heartbeat(
+            org,
+            uuid::Uuid::now_v7(),
+            &worker_id,
+            &["mock".into()],
+            "local",
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE worker_heartbeats SET last_heartbeat_at = now() - interval '25 hours' WHERE worker_id = $1",
+    )
+    .bind(&worker_id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    assert!(store.delete_stale_worker_heartbeats(24).await.unwrap() >= 1);
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM worker_heartbeats WHERE worker_id = $1")
+            .bind(&worker_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(remaining, 0);
+}
