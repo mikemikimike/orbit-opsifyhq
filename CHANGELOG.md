@@ -36,6 +36,10 @@ Release process: [docs/development/releasing.md](docs/development/releasing.md).
 
 ### Security
 
+- Worker-side git (clone, stage, commit, push) now runs with a cleared, allowlisted
+  environment, no system/global config, hooks/fsmonitor/ssh command disabled and
+  `--no-verify`, and refuses repositories whose config defines filter, textconv or other
+  program-executing entries, so agent-planted hooks cannot run with worker secrets (#195).
 - Creating a trigger now requires **use** on the target agent and use of every connection
   and provider its current spec references, closing an IDOR that let an Operator attach a
   trigger to a private agent (#135).

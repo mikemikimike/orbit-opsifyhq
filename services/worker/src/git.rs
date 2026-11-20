@@ -75,6 +75,151 @@ fn which(binary: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Environment variables a worker-side git child may inherit. Everything else
+/// (notably `ORBIT_WORKER_TOKEN`, `ORBIT_API_URL`, provider keys) is dropped.
+const GIT_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "TMPDIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+];
+
+/// Overrides that beat repository-local config for keys that would otherwise execute
+/// workspace-controlled programs.
+const GIT_HARDENING_CONFIG: &[&str] = &[
+    "core.hooksPath=/dev/null",
+    "core.fsmonitor=false",
+    "core.sshCommand=",
+    "diff.external=",
+    "protocol.file.allow=never",
+    "protocol.ext.allow=never",
+    "commit.gpgsign=false",
+];
+
+fn is_git_inherited_name(name: &str) -> bool {
+    GIT_ENV_ALLOWLIST.contains(&name) || name.starts_with("LC_")
+}
+
+/// The single constructor for every worker-side git invocation.
+///
+/// The agent can write anywhere in the workspace, including `.git/`, so git must not
+/// run with the worker's environment or honour workspace-controlled execution hooks:
+/// the environment is cleared and rebuilt from an allowlist, system and global config
+/// are disabled, and hooks, fsmonitor, ssh command and external diff are overridden.
+/// Repository-local `filter.*` and similar drivers cannot be overridden by name ahead of
+/// time, so callers must run [`ensure_safe_repo_config`] before using a repository.
+fn git_command(workspace: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.env_clear();
+    for (name, value) in std::env::vars_os() {
+        if name.to_str().is_some_and(is_git_inherited_name) {
+            command.env(name, value);
+        }
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(workspace);
+    for setting in GIT_HARDENING_CONFIG {
+        command.arg("-c").arg(setting);
+    }
+    command
+}
+
+/// True when a config key can make git execute a program or load more config from a
+/// path the agent controls.
+fn is_dangerous_config_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let section = key.split('.').next().unwrap_or("");
+    if matches!(
+        section,
+        "filter" | "include" | "includeif" | "credential" | "gpg"
+    ) {
+        return true;
+    }
+    if (key.starts_with("diff.") && (key.ends_with(".textconv") || key.ends_with(".command")))
+        || (key.starts_with("merge.") && key.ends_with(".driver"))
+    {
+        return true;
+    }
+    matches!(
+        key.as_str(),
+        "core.pager"
+            | "core.editor"
+            | "core.askpass"
+            | "core.gitproxy"
+            | "core.attributesfile"
+            | "sequence.editor"
+    )
+}
+
+/// Refuse to run git when the repository config defines drivers that execute programs.
+///
+/// Refusing (rather than blanking each driver with `-c filter.<name>.clean=`) is more
+/// robust: it covers every driver kind (filter, textconv, merge, credential helper,
+/// includes) and cannot miss a name. System and global config are disabled, so any hit
+/// comes from the workspace itself; legitimate clones define none of these keys.
+async fn ensure_safe_repo_config(workspace: &Path) -> anyhow::Result<()> {
+    let output = git_command(workspace)
+        .args(["config", "--list", "--name-only", "--includes", "-z"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "could not read repository config: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    if let Some(key) = listing
+        .split('\0')
+        .map(|entry| entry.trim_end_matches('\n'))
+        .find(|key| is_dangerous_config_key(key))
+    {
+        anyhow::bail!(
+            "refusing to run git: repository config defines '{key}', which can execute programs"
+        );
+    }
+    Ok(())
+}
+
+fn commit_command(workspace: &Path, message: &str) -> Command {
+    let mut command = git_command(workspace);
+    command.args([
+        "-c",
+        "user.name=ORBIT Agent",
+        "-c",
+        "user.email=orbit@localhost",
+        "commit",
+        "--no-verify",
+        "-m",
+        message,
+    ]);
+    command
+}
+
+fn push_command(workspace: &Path, branch: &str) -> Command {
+    let mut command = git_command(workspace);
+    command.args([
+        "push",
+        "--no-verify",
+        "origin",
+        &format!("HEAD:refs/heads/{branch}"),
+    ]);
+    command
+}
+
 async fn write_askpass() -> anyhow::Result<std::path::PathBuf> {
     let path = std::env::temp_dir().join(format!(".orbit-git-askpass-{}.sh", uuid::Uuid::now_v7()));
     tokio::fs::write(
@@ -93,22 +238,20 @@ async fn write_askpass() -> anyhow::Result<std::path::PathBuf> {
 }
 
 async fn stage_workspace_changes(workspace: &Path) -> anyhow::Result<()> {
-    let head = Command::new("git")
-        .current_dir(workspace)
+    ensure_safe_repo_config(workspace).await?;
+    let head = git_command(workspace)
         .args(["rev-parse", "--verify", "HEAD"])
         .output()
         .await?;
     let unstage = if head.status.success() {
-        let mut command = Command::new("git");
+        let mut command = git_command(workspace);
         command
-            .current_dir(workspace)
             .args(["reset", "--quiet", "HEAD", "--"])
             .args(ORBIT_GENERATED_PATHS);
         command.output().await?
     } else {
-        let mut command = Command::new("git");
+        let mut command = git_command(workspace);
         command
-            .current_dir(workspace)
             .args(["rm", "--cached", "--ignore-unmatch", "-r", "--"])
             .args(ORBIT_GENERATED_PATHS);
         command.output().await?
@@ -120,10 +263,8 @@ async fn stage_workspace_changes(workspace: &Path) -> anyhow::Result<()> {
         );
     }
 
-    let mut command = Command::new("git");
-    command
-        .current_dir(workspace)
-        .args(["add", "-A", "--", "."]);
+    let mut command = git_command(workspace);
+    command.args(["add", "-A", "--", "."]);
     for path in ORBIT_GENERATED_PATHS {
         command.arg(format!(":(exclude){path}"));
     }
@@ -350,10 +491,8 @@ async fn checkout_repository(
         .trim_end_matches('/');
     let username = git_username(&connection);
     tokio::fs::create_dir_all(workspace).await?;
-    let mut command = Command::new("git");
-    command
-        .current_dir(workspace)
-        .args(["clone", "--depth", "1"]);
+    let mut command = git_command(workspace);
+    command.args(["clone", "--depth", "1"]);
     if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
         command.args(["--branch", branch]);
     }
@@ -394,16 +533,7 @@ pub async fn commit(
         .ok_or_else(|| anyhow::anyhow!("connection has no token"))?;
     stage_workspace_changes(workspace).await?;
     let askpass = write_askpass().await?;
-    let mut command = Command::new("git");
-    command.current_dir(workspace).args([
-        "-c",
-        "user.name=ORBIT Agent",
-        "-c",
-        "user.email=orbit@localhost",
-        "commit",
-        "-m",
-        message,
-    ]);
+    let mut command = commit_command(workspace, message);
     command.env("ORBIT_GIT_TOKEN", &token);
     apply_git_auth(&mut command, &askpass, &username);
     let output = command.output().await?;
@@ -445,11 +575,9 @@ pub async fn push(
         .as_ref()
         .map(|secret| secret.value.clone())
         .ok_or_else(|| anyhow::anyhow!("connection has no token"))?;
+    ensure_safe_repo_config(workspace).await?;
     let askpass = write_askpass().await?;
-    let mut command = Command::new("git");
-    command
-        .current_dir(workspace)
-        .args(["push", "origin", &format!("HEAD:refs/heads/{branch}")]);
+    let mut command = push_command(workspace, branch);
     command.env("ORBIT_GIT_TOKEN", &token);
     apply_git_auth(&mut command, &askpass, &username);
     let output = command.output().await?;
@@ -480,6 +608,162 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output
+    }
+
+    fn init_repo(name: &str) -> std::path::PathBuf {
+        let workspace =
+            std::env::temp_dir().join(format!("orbit-git-{name}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        git(&workspace, &["init", "--quiet"]);
+        workspace
+    }
+
+    #[cfg(unix)]
+    fn plant_script(path: &Path, marker: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn git_command_env_is_allowlisted_and_hardened() {
+        let command = git_command(Path::new("."));
+        let std_command = command.as_std();
+        for (name, _) in std_command.get_envs() {
+            let name = name.to_str().unwrap();
+            assert!(
+                is_git_inherited_name(name)
+                    || matches!(
+                        name,
+                        "GIT_CONFIG_NOSYSTEM"
+                            | "GIT_CONFIG_GLOBAL"
+                            | "GIT_ATTR_NOSYSTEM"
+                            | "GIT_TERMINAL_PROMPT"
+                    ),
+                "unexpected env var {name}"
+            );
+        }
+        let args: Vec<_> = std_command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"core.hooksPath=/dev/null".to_string()));
+        assert!(args.contains(&"core.fsmonitor=false".to_string()));
+        assert!(!is_git_inherited_name("ORBIT_WORKER_TOKEN"));
+        assert!(!is_git_inherited_name("ORBIT_API_URL"));
+        assert!(!is_git_inherited_name("ORBIT_GIT_TOKEN"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_child_does_not_inherit_orbit_secrets() {
+        // SAFETY: test-only; the variables are unique to this test.
+        unsafe {
+            std::env::set_var("ORBIT_WORKER_TOKEN", "worker-secret");
+            std::env::set_var("ORBIT_API_URL", "http://api.invalid");
+        }
+        let workspace = init_repo("env");
+        let output = git_command(&workspace)
+            .args(["-c", "alias.dumpenv=!env", "dumpenv"])
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        let env = String::from_utf8_lossy(&output.stdout);
+        assert!(env.contains("PATH="));
+        assert!(!env.contains("ORBIT_"), "leaked: {env}");
+        assert!(!env.contains("worker-secret"));
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planted_pre_commit_hook_does_not_run_and_commit_succeeds() {
+        let workspace = init_repo("hook");
+        let marker = workspace.join("hook-ran");
+        plant_script(&workspace.join(".git/hooks/pre-commit"), &marker);
+        plant_script(&workspace.join(".git/hooks/commit-msg"), &marker);
+        std::fs::write(workspace.join("a.txt"), "hello\n").unwrap();
+        stage_workspace_changes(&workspace).await.unwrap();
+        let output = commit_command(&workspace, "test commit")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!marker.exists(), "hook executed");
+        let log = git(&workspace, &["log", "--format=%s"]);
+        assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "test commit");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planted_fsmonitor_does_not_run() {
+        let workspace = init_repo("fsmonitor");
+        let marker = workspace.join("fsmonitor-ran");
+        let script = workspace.join("fsmonitor.sh");
+        plant_script(&script, &marker);
+        git(
+            &workspace,
+            &["config", "core.fsmonitor", &script.display().to_string()],
+        );
+        std::fs::write(workspace.join("a.txt"), "hello\n").unwrap();
+        stage_workspace_changes(&workspace).await.unwrap();
+        let output = commit_command(&workspace, "fsmonitor")
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!marker.exists(), "fsmonitor executed");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planted_clean_filter_is_refused_and_does_not_run() {
+        let workspace = init_repo("filter");
+        let marker = workspace.join("filter-ran");
+        let script = workspace.join("filter.sh");
+        plant_script(&script, &marker);
+        git(
+            &workspace,
+            &["config", "filter.evil.clean", &script.display().to_string()],
+        );
+        std::fs::write(workspace.join(".gitattributes"), "* filter=evil\n").unwrap();
+        std::fs::write(workspace.join("a.txt"), "hello\n").unwrap();
+        let err = stage_workspace_changes(&workspace).await.unwrap_err();
+        assert!(err.to_string().contains("filter.evil.clean"), "{err}");
+        assert!(!marker.exists(), "filter executed");
+        assert!(ensure_safe_repo_config(&workspace).await.is_err());
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn dangerous_config_keys_are_detected() {
+        for key in [
+            "filter.x.smudge",
+            "diff.x.textconv",
+            "merge.x.driver",
+            "include.path",
+            "includeIf.gitdir:/x.path",
+            "credential.helper",
+            "core.pager",
+            "gpg.program",
+        ] {
+            assert!(is_dangerous_config_key(key), "{key}");
+        }
+        for key in [
+            "user.name",
+            "remote.origin.url",
+            "core.bare",
+            "branch.main.remote",
+        ] {
+            assert!(!is_dangerous_config_key(key), "{key}");
+        }
     }
 
     #[tokio::test]
