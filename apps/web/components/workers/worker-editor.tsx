@@ -341,6 +341,14 @@ export function WorkerEditor({
             <FormGroup title="Agents" description="Which agents this worker may claim.">
               <AgentScopeFields form={form} agents={agents.data?.items ?? []} />
             </FormGroup>
+            <Callout tone="neutral" title="Claim scope is not the same as profile visibility">
+              A worker claims organization-visible agents plus agents owned by the worker
+              profile&apos;s access team. With <strong>Selected agents</strong>, only the
+              picked ids are claimable. Making the profile organization-visible does not
+              widen this claim scope; move the agent to the profile&apos;s team, make it
+              organization-visible, select it explicitly, or remove the profile&apos;s owning
+              team.
+            </Callout>
             <FormGroup title="Skills" description="Shared skills the worker prepares at startup.">
               <SkillFields form={form} skills={skills.data ?? []} />
             </FormGroup>

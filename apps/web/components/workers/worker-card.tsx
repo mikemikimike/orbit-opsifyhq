@@ -115,6 +115,14 @@ export function WorkerCard({
           </div>
           <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
             <Badge variant="secondary">{scoped ? `${profile.agentIds.length} agents` : "All agents"}</Badge>
+            {profile.ownerTeamId ? (
+              <Badge
+                variant="outline"
+                title="This worker claims org-visible agents plus agents owned by its access team. Profile visibility does not widen this."
+              >
+                Team-scoped claims
+              </Badge>
+            ) : null}
             <Badge variant="secondary">
               {profile.skillSlugs.length} {profile.skillSlugs.length === 1 ? "skill" : "skills"}
             </Badge>
